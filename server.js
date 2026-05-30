@@ -88,7 +88,7 @@ const server = http.createServer(function(req, res) {
 
       var thresh = parsed.threshold || 30;
       var image = parsed.image || '';
-
+console.log('Image received, length:', image.length, 'threshold:', thresh);
       // STEP 1: Vision-only call to identify the item
       var step1 = {
         model: 'claude-sonnet-4-20250514',
