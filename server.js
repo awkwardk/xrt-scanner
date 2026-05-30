@@ -43,7 +43,18 @@ const server = http.createServer(function(req, res) {
     res.end(HTML_PAGE);
     return;
   }
-
+if (req.method === 'POST' && req.url === '/api/debug') {
+    var body = '';
+    req.on('data', function(chunk) { body += chunk; });
+    req.on('end', function() {
+      try {
+        var p = JSON.parse(body);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ imageLength: (p.image || '').length, threshold: p.threshold }));
+      } catch(e) { res.writeHead(400); res.end('bad request'); }
+    });
+    return;
+  }
   if (req.method === 'POST' && req.url === '/api/analyze') {
     var body = '';
     req.on('data', function(chunk) { body += chunk; });
