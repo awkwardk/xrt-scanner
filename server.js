@@ -231,6 +231,26 @@ const server = http.createServer(function(req, res) {
           var text=extractText(r2.content);
           var result=extractResult(text,itemName);
           if(!result.item_name||result.item_name.length<3) result.item_name=itemName;
+
+          // SERVER-SIDE VERDICT ENFORCEMENT
+          // KEEP threshold is hard — if price >= threshold, always KEEP regardless of AI verdict
+          // Below threshold — trust AI on LOT vs RECYCLE since AI evaluated actual lot demand
+          var price = result.avg_sold_price || 0;
+          if(price > 0) {
+            if(price >= thresh) {
+              // Price clears threshold — force KEEP
+              result.verdict = 'KEEP';
+            } else if(price < lotThresh) {
+              // Price below lot minimum — force RECYCLE regardless of AI
+              result.verdict = 'RECYCLE';
+            }
+            // Between lotThresh and thresh — trust AI verdict (LOT or RECYCLE)
+            // AI evaluated whether actual lot demand exists on eBay
+          } else {
+            // No price found — default KEEP (err on side of value)
+            result.verdict = 'KEEP';
+          }
+
           console.log('[SCAN] Final:', JSON.stringify(result));
           sendJSON(res,200,result);
         });
