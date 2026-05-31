@@ -102,10 +102,10 @@ const server = http.createServer(function(req, res) {
       var step1={
         model:'claude-sonnet-4-5',
         max_tokens:250,
-        system:'You are an electronics identification expert. Examine this image carefully. Identify the exact brand, model number, and item type. If you can see a label or model number tag, read it precisely. Reply with ONLY one line: brand model-number item-type. Example: Cisco WS-C2960-24TT-L Network Switch',
+        system:'You are an electronics identification expert. Examine this image carefully. Identify the exact brand, model number, and item type. CRITICAL: Always include the item type category in your response even if only a label is visible - use context clues like the label format, any visible housing, or your knowledge of the brand/model to determine what kind of device it is. Never return just a model number alone. Reply with ONLY one line: brand model-number item-type-category. Examples: Cisco WS-C2960-24TT-L Network Switch | Apple A1466 MacBook Air Laptop | Tandy TRS-80 Model III Personal Computer | HP LaserJet 4250 Laser Printer',
         messages:[{role:'user',content:[
           {type:'image',source:{type:'base64',media_type:'image/jpeg',data:image}},
-          {type:'text',text:'Identify this item. Read any visible labels or model numbers. Brand, model, type only. One line.'}
+          {type:'text',text:'Identify this item including its device category/type. Even if you only see a label, use the brand and model number to determine what type of device it is. Brand, model number, device type - one line only.'}
         ]}]
       };
 
@@ -136,6 +136,8 @@ const server = http.createServer(function(req, res) {
             '- RECYCLE: avg sold < $'+lotThresh+', no meaningful market, or lot market is weak/slow',
             '- When uncertain always return KEEP - err on the side of keeping value',
             '- Vintage, specialty, or collector items often have strong markets - search carefully before returning RECYCLE',
+            '- If first search returns no results, try a broader search with just brand and item type',
+            '- Common vintage electronics (Apple, Tandy, Commodore, Atari, IBM, HP, Compaq) almost always have active eBay markets',
             '- Medical or government-regulated equipment: always RECYCLE',
             '',
             'Return ONLY this JSON, no markdown:',
