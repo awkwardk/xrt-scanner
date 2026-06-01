@@ -205,22 +205,35 @@ const server = http.createServer(function(req, res) {
           tools:[{type:'web_search_20250305',name:'web_search'}],
           system:[
             'You are an eBay resale pricing expert for an e-waste resale business.',
-            'Search eBay COMPLETED/SOLD listings for the given item and return a JSON verdict.',
+            'Base your verdict ONLY on what you actually find in eBay completed/sold search results. Never infer or assume demand.',
+            '',
+            'SEARCH STRATEGY:',
+            '1. Search eBay completed sold listings for the single unit price of the item.',
+            '2. If single unit price is below $'+thresh+': do a SECOND search specifically for completed LOT listings of this item (search "lot of [item] sold" on eBay).',
+            '3. Only assign LOT if you find real evidence of lot sales in your search results.',
             '',
             'VERDICT RULES:',
-            '- KEEP: avg sold price >= $'+thresh+' as a single unit',
-            '- LOT: avg sold price between $'+lotThresh+' and $'+(thresh-1)+' AND strong lot demand on eBay (buyers actively seeking lots of 5+) AND lots sell within 30 days',
-            '- RECYCLE: avg sold < $'+lotThresh+', no meaningful market, or lot market is weak/slow',
-            '- When uncertain always return KEEP - err on the side of keeping value',
-            '- Vintage, specialty, or collector items often have strong markets - search carefully before returning RECYCLE',
-            '- If first search returns no results, try a broader search with just brand and item type',
-            '- Common vintage electronics (Apple, Tandy, Commodore, Atari, IBM, HP, Compaq) almost always have active eBay markets',
-            '- Medical or government-regulated equipment: always RECYCLE',
+            '- KEEP: single unit avg sold price >= $'+thresh,
+            '- LOT: ALL of the following must be true based on actual search results:',
+            '    * Single unit price is between $'+lotThresh+' and $'+(thresh-1),
+            '    * You found 3 or more completed lot sales in the last 90 days on eBay',
+            '    * The lot total sale price is at least $30',
+            '    * The per-unit value within those lots is at least $10 per item (e.g. lot of 3 must sell for $30+, lot of 5 must sell for $50+)',
+            '    * Pricing is consistent — not just one outlier sale',
+            '    * Common genuine lot items: office phones, VoIP phones, network switches, keyboards, RAM sticks, power supplies',
+            '- RECYCLE: single unit avg sold < $'+lotThresh+', OR no meaningful eBay market, OR lot search found fewer than 3 completed lot sales, OR lot per-unit value is below $10',
+            '- When single unit price is uncertain return KEEP',
+            '- Vintage electronics (Apple, Tandy, Commodore, Atari, IBM, HP vintage) almost always have eBay markets — search carefully before returning RECYCLE',
+            '- Medical or regulated equipment: always RECYCLE',
+            '',
+            'CRITICAL: If your lot search found zero or fewer than 3 completed lot listings — return RECYCLE, not LOT.',
+            'CRITICAL: If the lot per-unit value is under $10 — return RECYCLE, not LOT.',
+            'Never assign LOT based on assumptions. Only assign LOT when search results prove it.',
             '',
             'Return ONLY this JSON, no markdown:',
-            '{"verdict":"KEEP","item_name":"name","avg_sold_price":45,"reason":"One plain English sentence for a warehouse employee."}'
+            '{"verdict":"KEEP","item_name":"name","avg_sold_price":45,"reason":"One plain English sentence for a warehouse employee. If LOT cite the lot evidence: how many lot sales found and typical lot price."}'
           ].join('\n'),
-          messages:[{role:'user',content:'Search eBay completed sold listings for: '+itemName+'. What does it sell for? Return JSON verdict only.'}]
+          messages:[{role:'user',content:'Search eBay completed sold listings for: '+itemName+'. First check single unit price. If below $'+thresh+', do a second search for completed lot listings of this specific item. Return JSON verdict based only on what your searches actually found — not assumptions.'}]
         };
 
         callClaude(step2,function(err2,r2){
