@@ -361,9 +361,10 @@ const server = http.createServer(function(req, res) {
       console.log('[SUBMIT] SKU', sku, 'saved with', photos.length, 'photos');
       sendJSON(res,200,{success:true, sku:sku});
 
-      // Auto-generate listing in background
+      // Auto-generate listing in background — stagger by SKU to avoid rate limit collisions
       var _itemsDir = path.join(DATA_DIR, 'items');
       var _sku = sku;
+      var _delay = ((sku % 10) * 3000) + 1000; // stagger 1-30 seconds based on SKU
       setTimeout(function(){
         var pendingDir = path.join(_itemsDir, String(_sku));
         var metaPath = path.join(pendingDir, 'meta.json');
@@ -387,6 +388,22 @@ const server = http.createServer(function(req, res) {
   }
 
   // List pending items (not yet processed into listings)
+  // Serve individual photos for XRT items
+  if(req.method==='GET' && req.url.startsWith('/api/photo/')){
+    var photoParts = req.url.split('/');
+    var photoSku = photoParts[3];
+    var photoNum = parseInt(photoParts[4])||1;
+    if(!photoSku){res.writeHead(404);res.end('Not found');return;}
+    var photoPath = path.join(DATA_DIR,'items',String(photoSku),'photo_'+photoNum+'.jpg');
+    if(fs.existsSync(photoPath)){
+      res.writeHead(200,{'Content-Type':'image/jpeg','Cache-Control':'public,max-age=3600'});
+      res.end(fs.readFileSync(photoPath));
+    } else {
+      res.writeHead(404);res.end('Photo not found');
+    }
+    return;
+  }
+
   if(req.method==='GET' && req.url==='/api/pending-items'){
     var itemsDir = path.join(DATA_DIR, 'items');
     var items = [];
@@ -437,6 +454,12 @@ const server = http.createServer(function(req, res) {
   }
 
   // Get generated listings
+  if(req.method==='POST' && req.url==='/api/clear-listings'){
+    saveListings([]);
+    sendJSON(res,200,{success:true});
+    return;
+  }
+
   if(req.method==='GET' && req.url==='/api/listings'){
     var listings = loadListings();
     if(listings.length === 0){
@@ -682,6 +705,8 @@ function generateListingsPage(listings){
     var suggest = listing.suggested_price||Math.round(price*0.9);
     var accept = listing.accept_price||Math.round(price*0.8);
     var decline = listing.decline_price||Math.round(price*0.6);
+    var skuStr = String(sku);
+    var photoCount = (r.allPhotos&&r.allPhotos.length) || meta.photoCount || 0;
 
     var conflictFlag = r.gradeConflict ?
       '<div style="background:#fff8e1;border-left:4px solid #f9a825;padding:8px 14px;font-size:13px;color:#5d4037;"><strong>&#9888; GRADE CONFLICT</strong> Processor: '+r.gradeConflict.processor+' | Claude: '+r.gradeConflict.claude+'</div>' : '';
@@ -689,7 +714,17 @@ function generateListingsPage(listings){
     var title = (listing.title) || (r.visionData&&r.visionData.item_name) || ('SKU '+sku);
     var condBox = listing.condition_box || 'See photos.';
     var descHtml = listing.description_html || '<p>'+title+'</p>';
-    var skuStr = String(sku);
+
+    // Photo thumbnails
+    var photoStrip = '';
+    if(photoCount > 0){
+      var thumbs = '';
+      for(var p=1;p<=Math.min(photoCount,8);p++){
+        thumbs += '<img src="/api/photo/'+skuStr+'/'+p+'" style="width:90px;height:90px;object-fit:cover;border-radius:6px;border:2px solid #e0e0e0;cursor:pointer;" onclick="window.open(this.src)" title="Click to view full size">';
+      }
+      photoStrip = '<div style="font-size:11px;font-weight:bold;color:#888;letter-spacing:0.08em;text-transform:uppercase;margin-top:14px;margin-bottom:6px;">Photos ('+photoCount+')</div>'
+        +'<div style="display:flex;gap:8px;flex-wrap:wrap;">'+thumbs+'</div>';
+    }
 
     return '<div style="background:#fff;border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,0.15);margin-bottom:28px;overflow:hidden;">'
       +'<div style="background:'+headerColor+';color:#fff;padding:12px 16px;display:flex;align-items:center;gap:12px;">'
@@ -703,6 +738,7 @@ function generateListingsPage(listings){
       +'<span><b>Accept:</b> $'+accept+'</span>'
       +'<span><b>Decline:</b> $'+decline+'</span>'
       +'<span><b>Shelf:</b> '+(meta.shelf||'&mdash;')+'</span>'
+      +(photoCount>0?'<span><b>Photos:</b> '+photoCount+'</span>':'')
       +'</div>'
       +'<div style="padding:14px 16px;">'
       +'<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px;">'
@@ -713,15 +749,24 @@ function generateListingsPage(listings){
       +'<textarea id="t_'+skuStr+'" style="display:none;">'+title+'</textarea>'
       +'<textarea id="c_'+skuStr+'" style="display:none;">'+condBox+'</textarea>'
       +'<textarea id="h_'+skuStr+'" style="display:none;">'+descHtml+'</textarea>'
+      +photoStrip
       +'</div></div>';
   }).join('');
 
   return '<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>XRT Listings</title>'
-    +'<style>*{box-sizing:border-box;margin:0;padding:0;}body{font-family:Arial,sans-serif;background:#f0f0f0;padding:20px;}h1{font-size:18px;color:#333;margin-bottom:4px;}.meta{font-size:12px;color:#777;margin-bottom:20px;}</style>'
-    +'<script>function cp(id){var el=document.getElementById(id);if(!el)return;var btn=document.querySelector("[id=btn_"+id+"]");navigator.clipboard.writeText(el.value.trim()).then(function(){if(btn){var o=btn.textContent;btn.textContent="Copied!";setTimeout(function(){btn.textContent=o;},1500);}});}<\/script>'
+    +'<style>*{box-sizing:border-box;margin:0;padding:0;}body{font-family:Arial,sans-serif;background:#f0f0f0;padding:20px;}.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;}h1{font-size:18px;color:#333;}.meta{font-size:12px;color:#777;margin-top:2px;}.actions{display:flex;gap:10px;}</style>'
+    +'<script>'
+    +'function cp(id){var el=document.getElementById(id);if(!el)return;var btn=document.querySelector("[id=btn_"+id+"]");navigator.clipboard.writeText(el.value.trim()).then(function(){if(btn){var o=btn.textContent;btn.textContent="Copied!";setTimeout(function(){btn.textContent=o;},1500);}});}'
+    +'function clearAll(){if(!confirm("Clear all listings? This cannot be undone."))return;fetch("/api/clear-listings",{method:"POST"}).then(function(){location.reload();});}'
+    +'<\/script>'
     +'</head><body>'
-    +'<h1>XRT eBay Listing Descriptions</h1>'
-    +'<p class="meta">'+listings.length+' items &nbsp;&middot;&nbsp; <a href="/api/listings" style="color:#1565c0;">Refresh</a></p>'
+    +'<div class="topbar">'
+    +'<div><h1>XRT eBay Listing Descriptions</h1><p class="meta">'+listings.length+' items &nbsp;&middot;&nbsp; Clovis, CA</p></div>'
+    +'<div class="actions">'
+    +'<a href="/api/listings" style="padding:8px 16px;background:#455a64;color:#fff;border-radius:4px;text-decoration:none;font-size:13px;font-weight:bold;">Refresh</a>'
+    +'<button onclick="clearAll()" style="padding:8px 16px;background:#ff1744;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:bold;">Clear All</button>'
+    +'</div>'
+    +'</div>'
     +cards
     +'</body></html>';
 }
