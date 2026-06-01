@@ -362,8 +362,10 @@ const server = http.createServer(function(req, res) {
       sendJSON(res,200,{success:true, sku:sku});
 
       // Auto-generate listing in background
+      var _itemsDir = path.join(DATA_DIR, 'items');
+      var _sku = sku;
       setTimeout(function(){
-        var pendingDir = path.join(itemsDir, String(sku));
+        var pendingDir = path.join(_itemsDir, String(_sku));
         var metaPath = path.join(pendingDir, 'meta.json');
         if(fs.existsSync(metaPath)){
           try {
