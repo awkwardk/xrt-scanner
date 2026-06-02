@@ -33,21 +33,75 @@ const PROCESSOR_HTML = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta chars
 
 
 const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
+const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY || '';
 console.log('[STARTUP] Gemini key found:', GEMINI_KEY.length > 0);
+console.log('[STARTUP] OpenRouter key found:', OPENROUTER_KEY.length > 0);
 
 function callGemini(options, body, callback) {
-  var req = https.request(options, function(res) {
+  // Route through OpenRouter to bypass Google IP restrictions
+  var geminiBody = JSON.parse(body);
+  var messages = [];
+
+  // Convert Gemini format to OpenRouter/OpenAI format
+  var parts = geminiBody.contents[0].parts;
+  var content = [];
+  parts.forEach(function(part) {
+    if(part.text) {
+      content.push({type:'text', text:part.text});
+    } else if(part.inline_data) {
+      content.push({type:'image_url', image_url:{url:'data:'+part.inline_data.mime_type+';base64,'+part.inline_data.data}});
+    }
+  });
+  messages.push({role:'user', content:content});
+
+  // Determine if this is a search-enabled request
+  var useSearch = geminiBody.tools && geminiBody.tools.some(function(t){ return t.google_search !== undefined; });
+
+  var orBody = JSON.stringify({
+    model: useSearch ? 'google/gemini-2.5-flash:online' : 'google/gemini-2.5-flash',
+    messages: messages,
+    max_tokens: geminiBody.generationConfig ? geminiBody.generationConfig.maxOutputTokens : 300,
+    temperature: geminiBody.generationConfig ? geminiBody.generationConfig.temperature : 0.1
+  });
+
+  var orOptions = {
+    hostname: 'openrouter.ai',
+    path: '/api/v1/chat/completions',
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer ' + OPENROUTER_KEY,
+      'HTTP-Referer': 'https://xrt-scanner.onrender.com',
+      'X-Title': 'XRT Scanner',
+      'Content-Length': Buffer.byteLength(orBody)
+    }
+  };
+
+  var req = https.request(orOptions, function(res) {
     var data = '';
     res.on('data', function(c) { data += c; });
     res.on('end', function() {
       console.log('[GEMINI] Status:', res.statusCode);
       if(res.statusCode !== 200) console.log('[GEMINI] Error:', data.slice(0,300));
-      try { callback(null, JSON.parse(data)); }
-      catch(e) { callback(new Error('Parse failed')); }
+      try {
+        var parsed = JSON.parse(data);
+        // Convert OpenRouter response back to Gemini format
+        var geminiResponse = {
+          candidates: [{
+            content: {
+              parts: [{
+                text: parsed.choices && parsed.choices[0] ? parsed.choices[0].message.content : ''
+              }]
+            }
+          }]
+        };
+        callback(null, geminiResponse);
+      }
+      catch(e) { callback(new Error('Parse failed: ' + e.message)); }
     });
   });
   req.on('error', function(e) { console.log('[GEMINI] Network error:', e.message); callback(e); });
-  req.write(body);
+  req.write(orBody);
   req.end();
 }
 
