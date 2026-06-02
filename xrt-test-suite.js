@@ -42,7 +42,7 @@ test('LOT requires per-unit $10',  has('Per-unit value'));
 test('KEEP default no price',      has('default KEEP') || has('default to KEEP'));
 test('Vintage items protected',    has('Vintage'));
 test('Medical equipment RECYCLE',  has('Medical'));
-test('Gemini Flash used for scan', has('gemini-2.0-flash'));
+test('Gemini Flash used for scan', has('gemini-2.5-flash'));
 test('Google Search grounding',    has('google_search'));
 test('Gemini key loaded',          has('GEMINI_KEY'));
 test('callGemini function',        has('function callGemini('));
