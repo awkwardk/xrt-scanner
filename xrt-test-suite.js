@@ -125,6 +125,58 @@ test('Identify prompt JSON shape',        has('testing_instructions'));
 test('Log action route',                  has('/api/log-action'));
 test('Camera square aspect ratio',        has('aspect-ratio:1/1'));
 
+section('NEW FEATURES v4.0 — Camera & Photos');
+test('Camera 4:3 aspectRatio',        has('aspectRatio') && has('1.333'));
+test('Camera format setting',         has('xrt_cam_format') && has('toggleCamFormat'));
+test('Camera format options labels',  has('4:3 Landscape') && has('1:1 Square'));
+test('Rotation via screen.orientation', has('screen.orientation'));
+test('Canvas rotate for portrait',    has('ctx.rotate'));
+test('Square fallback preserved',     has('var outSize=1600'));
+test('captureFrame helper',           has('function captureFrame('));
+test('Testing photo capture',         has('captureTestPhoto') && has('Capture Testing Photo'));
+test('Testing photos stored',         has('test_photo_'));
+test('Testing photos in meta',        has('testingPhotos'));
+test('Photo delete + undo',           has('function deletePhoto(') && has('Undo delete') && has('function undoDelete('));
+test('Photo reorder (drag)',          has('function movePhoto(') && has('draggable'));
+
+section('NEW FEATURES v4.0 — Weight, Shipping, Parts');
+test('Weight detection (AI scan)',    has('function detectWeightAndDims('));
+test('Weight photo index tracked',    has('weightPhotoIndex'));
+test('Output photo ordering',         has('outputPhotos'));
+test('Shipping calculator',           has('function calcShipping('));
+test('GA policy profile id',          has('272423749015'));
+test('FedEx policy profile id',       has('272434338015'));
+test('Heavy policy profile id',       has('272360974015'));
+test('Standard box sets',             has('STANDARD_GA_BOXES') && has('STANDARD_FEDEX_BOXES'));
+test('Shipping fields in listing',    has('shipping_profile_id') && has('listed_weight') && has('box_dimensions') && has('polymailer'));
+test('Category id field',             has('category_id'));
+test('Parts/repair demand field',     has('parts_repair_demand'));
+test('Parts/repair price field',      has('parts_repair_price'));
+test('Parts/repair flag',             has('parts_repair'));
+test('Parts/repair banner UI',        has('parts-banner') || has('partsBanner'));
+test('Parts/repair badge (listings)', has('PARTS/REPAIR'));
+test('5-Minute Test label',           has('5-Minute Test'));
+
+section('NEW FEATURES v4.0 — Shelf & Flow');
+test('Shelf A1/A1A format',           has('A1 or A1A'));
+test('SKU claimed after identify',    has('claimSkuAndContinue') && has("showScreen('identifyScreen')"));
+
+section('NEW FEATURES v4.0 — eBay');
+test('eBay auth route',               has('/ebay-auth'));
+test('eBay auth callback route',      has('/ebay-auth-callback'));
+test('eBay status route',             has('/ebay-status'));
+test('eBay refresh token route',      has('/api/ebay-refresh-token'));
+test('eBay deletion notification',    has('/api/ebay-deletion-notification'));
+test('Send to eBay route',            has('/api/send-to-ebay'));
+test('OAuth stores tokens',           has('writeEbayTokens') && has('grant_type=authorization_code'));
+test('getEbayToken helper',           has('function getEbayToken('));
+test('ebayStatus helper',             has('function ebayStatus('));
+test('Inventory API used',            has('/sell/inventory/v1/inventory_item/') && has('/sell/inventory/v1/offer'));
+test('Grade to eBay condition',       has('function gradeToEbayCondition(') && has('FOR_PARTS_OR_NOT_WORKING'));
+test('eBay status bar (page)',        has('eBay connected') && has('Connect eBay Account'));
+test('Send to eBay Draft button',     has('Send to eBay Draft') && has('function sendEbay') || has('sendEbay('));
+test('eBay scopes configured',        has('sell.inventory') && has('sell.fulfillment'));
+
 section('SYNTAX CHECK');
 try {
   require('child_process').execSync('node --check ' + serverFile, {stdio:'pipe'});
