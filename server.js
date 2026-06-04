@@ -84,6 +84,7 @@ const EBAY_AUTH_BASE = EBAY_ENVIRONMENT === 'sandbox' ? 'https://auth.sandbox.eb
 const EBAY_REDIRECT_URI = process.env.EBAY_REDIRECT_URI || 'https://xrt-scanner.onrender.com/ebay-auth-callback';
 const EBAY_PUBLIC_BASE = process.env.PUBLIC_BASE_URL || 'https://xrt-scanner.onrender.com';
 const EBAY_TOKENS_FILE = path.join(DATA_DIR, 'ebay-tokens.json');
+const EBAY_POLICIES_FILE = path.join(DATA_DIR, 'ebay-policies.json');
 const EBAY_SCOPES = [
   'https://api.ebay.com/oauth/api_scope',
   'https://api.ebay.com/oauth/api_scope/sell.inventory',
@@ -251,6 +252,71 @@ function ebayCall(method, urlPath, bodyObj, callback){
 // Does an eBay error response contain a given errorId?
 function ebayHasError(r, id){
   return !!(r && Array.isArray(r.errors) && r.errors.some(function(e){ return e.errorId === id; }));
+}
+
+// ── eBay BUSINESS POLICIES (Account API) ──
+function readEbayPolicies(){
+  try { if(fs.existsSync(EBAY_POLICIES_FILE)) return JSON.parse(fs.readFileSync(EBAY_POLICIES_FILE,'utf8')); } catch(e){}
+  return null;
+}
+function writeEbayPolicies(p){
+  try { fs.writeFileSync(EBAY_POLICIES_FILE, JSON.stringify(p, null, 2)); } catch(e){ console.log('[EBAY] policies write error:', e.message); }
+}
+// Map our shipping policy name (GA / FedEx / Heavy) to the best-matching fulfillment policy id
+function pickShippingPolicyId(fulfillment, shippingPolicyName){
+  if(!fulfillment || !fulfillment.length) return null;
+  var name = String(shippingPolicyName || '').toLowerCase();
+  var key = name.indexOf('fedex') >= 0 ? 'fedex'
+          : (name.indexOf('heavy') >= 0 || name.indexOf('calculated') >= 0) ? 'heav'
+          : 'ga';
+  var match = fulfillment.filter(function(p){ return String(p.name || '').toLowerCase().indexOf(key) >= 0; })[0];
+  return (match || fulfillment[0]).id;
+}
+// Fetch all three business policy types, assemble + store ebay-policies.json
+function fetchEbayPolicies(callback){
+  var mk = '?marketplace_id=EBAY_US';
+  ebayCall('GET', '/sell/account/v1/fulfillment_policy' + mk, null, function(e1, s1, r1){
+    if(e1){ callback(e1); return; }
+    ebayCall('GET', '/sell/account/v1/payment_policy' + mk, null, function(e2, s2, r2){
+      if(e2){ callback(e2); return; }
+      ebayCall('GET', '/sell/account/v1/return_policy' + mk, null, function(e3, s3, r3){
+        if(e3){ callback(e3); return; }
+        var fulfillment = ((r1 && r1.fulfillmentPolicies) || []).map(function(p){ return {id: p.fulfillmentPolicyId, name: p.name}; });
+        var payment     = ((r2 && r2.paymentPolicies)     || []).map(function(p){ return {id: p.paymentPolicyId,     name: p.name}; });
+        var ret         = ((r3 && r3.returnPolicies)      || []).map(function(p){ return {id: p.returnPolicyId,      name: p.name}; });
+        var policies = {
+          fulfillment: fulfillment, payment: payment, return: ret,
+          fulfillment_id: fulfillment[0] ? fulfillment[0].id : null,
+          payment_id: payment[0] ? payment[0].id : null,
+          return_id: ret[0] ? ret[0].id : null,
+          shipping_map: {
+            'GA 6lbs or less':    pickShippingPolicyId(fulfillment, 'GA 6lbs or less'),
+            'FedEx 6lbs or more': pickShippingPolicyId(fulfillment, 'FedEx 6lbs or more'),
+            'Heavy Calculated':   pickShippingPolicyId(fulfillment, 'Heavy Calculated')
+          },
+          fetched_at: new Date().toISOString()
+        };
+        writeEbayPolicies(policies);
+        console.log('[EBAY] policies fetched - fulfillment:', fulfillment.length, 'payment:', payment.length, 'return:', ret.length);
+        callback(null, policies);
+      });
+    });
+  });
+}
+// Create the Clovis CA merchant location (idempotent; 25803 = already exists)
+function createMerchantLocation(callback){
+  var locBody = {
+    location:{address:{addressLine1:"Clovis CA",city:"Clovis",stateOrProvince:"CA",postalCode:"93612",country:"US"}},
+    locationTypes:["WAREHOUSE"],
+    name:"XRT Electronics Clovis",
+    merchantLocationStatus:"ENABLED"
+  };
+  ebayCall('POST', '/sell/inventory/v1/location/xrt-clovis', locBody, function(e, sc, r){
+    if(e){ callback(e); return; }
+    var exists = ebayHasError(r, 25803);
+    if(sc < 400 || exists){ callback(null, {location_key:'xrt-clovis', already_existed: exists}); }
+    else { callback(new Error('location create failed (' + sc + ')')); }
+  });
 }
 // Split a string into pieces each <= limit chars, breaking at natural points
 // (commas first, then spaces; a single over-long token is hard-sliced as a last resort).
@@ -996,6 +1062,31 @@ const server = http.createServer(function(req, res) {
     sendJSON(res, 200, ebayStatus());
     return;
   }
+  // ── eBay business policies: fetch + store IDs and names ──
+  if(req.method==='GET' && (req.url.split('?')[0]==='/ebay-policies' || req.url.split('?')[0]==='/ebay-setup-policies')){
+    fetchEbayPolicies(function(err, policies){
+      if(err){ sendJSON(res,200,{success:false, error:err.message}); return; }
+      sendJSON(res,200,{success:true, fulfillment:policies.fulfillment, payment:policies.payment, return:policies.return,
+        fulfillment_id:policies.fulfillment_id, payment_id:policies.payment_id, return_id:policies.return_id,
+        shipping_map:policies.shipping_map, stored: EBAY_POLICIES_FILE});
+    });
+    return;
+  }
+  // ── eBay one-time setup: policies + merchant location ──
+  if(req.method==='GET' && req.url.split('?')[0]==='/ebay-setup-all'){
+    var summary = {};
+    fetchEbayPolicies(function(pErr, policies){
+      summary.policies = pErr ? {error:pErr.message} :
+        {fulfillment: policies.fulfillment.length, payment: policies.payment.length, return: policies.return.length,
+         fulfillment_id: policies.fulfillment_id, payment_id: policies.payment_id, return_id: policies.return_id};
+      createMerchantLocation(function(lErr, locInfo){
+        summary.location = lErr ? {error:lErr.message} : locInfo;
+        console.log('[EBAY] setup-all complete:', JSON.stringify(summary));
+        sendJSON(res,200,{success:true, summary: summary});
+      });
+    });
+    return;
+  }
   // ── eBay diagnostics (token never exposed) ──
   if(req.method==='GET' && req.url.split('?')[0]==='/ebay-debug'){
     var tokensExist = fs.existsSync(EBAY_TOKENS_FILE);
@@ -1602,6 +1693,8 @@ function xmlEscape(s){
     .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
     .replace(/"/g,'&quot;').replace(/'/g,'&apos;');
 }
+// Make a string safe to embed inside a CDATA section by breaking any "]]>" sequence
+function cdataSafe(s){ return String(s == null ? '' : s).replace(/]]>/g, ']]]]><![CDATA[>'); }
 function parseXmlTag(xml, tag){
   if(!xml) return null;
   var m = xml.match(new RegExp('<' + tag + '(?:\\s[^>]*)?>([\\s\\S]*?)<\\/' + tag + '>'));
@@ -1694,7 +1787,7 @@ function buildAddItemXml(record, opts){
   var meta = record.meta || {};
   var sku = record.sku;
   var title = String(listing.title || ('SKU ' + sku)).slice(0, 80); // truncate title to 80
-  var desc = listing.description_html || listing.condition_box || ('<p>' + xmlEscape(title) + '</p>');
+  var desc = cdataSafe(listing.description_html || listing.condition_box || ('<p>' + xmlEscape(title) + '</p>'));
   var categoryId = opts.categoryId || listing.category_id || 293;
   var price = listing.suggested_price || listing.avg_sold_price || 0;
   var condId = opts.conditionId || conditionIdForCategory(meta.grade, categoryId, listing.parts_repair);
@@ -1705,9 +1798,36 @@ function buildAddItemXml(record, opts){
   var picXml = (opts.pictureUrls && opts.pictureUrls.length)
     ? '<PictureDetails>' + opts.pictureUrls.map(function(u){ return '<PictureURL>' + xmlEscape(u) + '</PictureURL>'; }).join('') + '</PictureDetails>'
     : '';
+  // Business policies (SellerProfiles) when available — required when the seller has
+  // opted into business policies (error 21919456). Otherwise use legacy shipping/return.
+  var policies = opts.policies;
+  var shippingBlock;
+  if(policies && policies.fulfillment_id && policies.payment_id && policies.return_id){
+    var shipId = (policies.shipping_map && policies.shipping_map[listing.shipping_policy]) || policies.fulfillment_id;
+    shippingBlock = '<SellerProfiles>'
+      + '<SellerShippingProfile><ShippingProfileID>' + xmlEscape(shipId) + '</ShippingProfileID></SellerShippingProfile>'
+      + '<SellerReturnProfile><ReturnProfileID>' + xmlEscape(policies.return_id) + '</ReturnProfileID></SellerReturnProfile>'
+      + '<SellerPaymentProfile><PaymentProfileID>' + xmlEscape(policies.payment_id) + '</PaymentProfileID></SellerPaymentProfile>'
+      + '</SellerProfiles>';
+  } else {
+    shippingBlock = '<ShippingDetails>'
+      + '<ShippingType>Flat</ShippingType>'
+      + '<ShippingServiceOptions>'
+      + '<ShippingServicePriority>1</ShippingServicePriority>'
+      + '<ShippingService>USPSPriority</ShippingService>'
+      + '<ShippingServiceCost currencyID="USD">' + shipCost + '</ShippingServiceCost>'
+      + '</ShippingServiceOptions>'
+      + '</ShippingDetails>'
+      + '<ShipToLocations>US</ShipToLocations>'
+      + '<ReturnPolicy><ReturnsAcceptedOption>ReturnsNotAccepted</ReturnsAcceptedOption></ReturnPolicy>';
+  }
+  // Revise an existing listing (duplicate-SKU recovery) vs. create a new one
+  var rootTag = opts.reviseItemId ? 'ReviseFixedPriceItemRequest' : 'AddItemRequest';
+  var itemIdXml = opts.reviseItemId ? ('<ItemID>' + xmlEscape(opts.reviseItemId) + '</ItemID>') : '';
   return '<?xml version="1.0" encoding="utf-8"?>'
-    + '<AddItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">'
+    + '<' + rootTag + ' xmlns="urn:ebay:apis:eBLBaseComponents">'
     + '<Item>'
+    + itemIdXml
     + '<Title>' + xmlEscape(title) + '</Title>'
     + '<Description><![CDATA[' + desc + ']]></Description>'
     + '<PrimaryCategory><CategoryID>' + xmlEscape(categoryId) + '</CategoryID></PrimaryCategory>'
@@ -1725,45 +1845,90 @@ function buildAddItemXml(record, opts){
     + '<SKU>' + xmlEscape(customSku) + '</SKU>'
     + buildItemSpecificsXml(listing.item_specifics)
     + picXml
-    + '<ShippingDetails>'
-    +   '<ShippingType>Flat</ShippingType>'
-    +   '<ShippingServiceOptions>'
-    +     '<ShippingServicePriority>1</ShippingServicePriority>'
-    +     '<ShippingService>USPSPriority</ShippingService>'
-    +     '<ShippingServiceCost currencyID="USD">' + shipCost + '</ShippingServiceCost>'
-    +   '</ShippingServiceOptions>'
-    + '</ShippingDetails>'
-    + '<ShipToLocations>US</ShipToLocations>'
-    + '<ReturnPolicy><ReturnsAcceptedOption>ReturnsNotAccepted</ReturnsAcceptedOption></ReturnPolicy>'
+    + shippingBlock
     + '</Item>'
-    + '</AddItemRequest>';
+    + '</' + rootTag + '>';
 }
 
-// Upload one hosted photo to eBay (ExternalPictureURL) -> eBay CDN FullURL
-function uploadPhotoToEbay(externalUrl, token, callback){
-  var xml = '<?xml version="1.0" encoding="utf-8"?>'
-    + '<UploadSiteHostedPicturesRequest xmlns="urn:ebay:apis:eBLBaseComponents">'
-    + '<ExternalPictureURL>' + xmlEscape(externalUrl) + '</ExternalPictureURL>'
-    + '<PictureSet>Supersize</PictureSet>'
-    + '</UploadSiteHostedPicturesRequest>';
-  ebayTradingCall('UploadSiteHostedPictures', xml, token, function(err, sc, body){
+// POST a multipart Trading API call (XML payload + base64 image) to api.dll
+function ebayTradingMultipart(callName, xmlPayload, imageBuffer, token, callback){
+  var creds = '<RequesterCredentials><eBayAuthToken>' + xmlEscape(token) + '</eBayAuthToken></RequesterCredentials>';
+  if(xmlPayload.indexOf('<RequesterCredentials>') === -1){
+    xmlPayload = xmlPayload.replace(/(<[A-Za-z]+Request\b[^>]*>)/, '$1' + creds);
+  }
+  var boundary = 'XRTMIMEBOUNDARY' + imageBuffer.length;
+  var pre = '--' + boundary + '\r\n'
+    + 'Content-Disposition: form-data; name="XML Payload"\r\n'
+    + 'Content-Type: text/xml;charset=utf-8\r\n\r\n'
+    + xmlPayload + '\r\n'
+    + '--' + boundary + '\r\n'
+    + 'Content-Disposition: form-data; name="image"; filename="image.jpg"\r\n'
+    + 'Content-Transfer-Encoding: base64\r\n'
+    + 'Content-Type: application/octet-stream\r\n\r\n';
+  var post = '\r\n--' + boundary + '--\r\n';
+  var body = Buffer.concat([ Buffer.from(pre, 'utf8'), Buffer.from(imageBuffer.toString('base64'), 'utf8'), Buffer.from(post, 'utf8') ]);
+  var options = {
+    hostname: EBAY_BASE.replace('https://', ''),
+    path: '/ws/api.dll',
+    method: 'POST',
+    headers: {
+      'X-EBAY-API-CALL-NAME': callName,
+      'X-EBAY-API-SITEID': '0',
+      'X-EBAY-API-APP-NAME': EBAY_APP_ID,
+      'X-EBAY-API-DEV-NAME': EBAY_DEV_ID,
+      'X-EBAY-API-CERT-NAME': EBAY_CERT_ID,
+      'X-EBAY-API-COMPATIBILITY-LEVEL': '967',
+      'Content-Type': 'multipart/form-data;boundary=' + boundary,
+      'Authorization': 'Bearer ' + token,
+      'Content-Length': body.length
+    }
+  };
+  var req = https.request(options, function(res){
+    var data = ''; res.on('data', function(c){ data += c; });
+    res.on('end', function(){ callback(null, res.statusCode, data); });
+  });
+  req.on('error', function(e){ callback(e); });
+  req.write(body); req.end();
+}
+
+// Upload one photo file as base64 via UploadSiteHostedPictures -> eBay CDN FullURL
+function uploadPhotoToEbay(sku, stem, token, callback){
+  var photoPath = path.join(DATA_DIR, 'items', String(sku), String(stem).replace(/\.jpg$/i, '') + '.jpg');
+  fs.readFile(photoPath, function(err, buf){
     if(err){ callback(err); return; }
-    var full = parseXmlTag(body, 'FullURL');
-    if(full){ callback(null, full); return; }
-    callback(new Error('photo upload failed: ' + (parseEbayErrors(body).join('; ') || ('HTTP ' + sc))));
+    var xml = '<?xml version="1.0" encoding="utf-8"?>'
+      + '<UploadSiteHostedPicturesRequest xmlns="urn:ebay:apis:eBLBaseComponents">'
+      + '<PictureName>' + xmlEscape(sku + '-' + stem) + '</PictureName>'
+      + '<PictureSet>Supersize</PictureSet>'
+      + '</UploadSiteHostedPicturesRequest>';
+    ebayTradingMultipart('UploadSiteHostedPictures', xml, buf, token, function(e, sc, body){
+      if(e){ callback(e); return; }
+      var full = parseXmlTag(body, 'FullURL');
+      if(full){ callback(null, full); return; }
+      callback(new Error('photo upload failed: ' + (parseEbayErrors(body).join('; ') || ('HTTP ' + sc))));
+    });
   });
 }
 
-// Upload all output photos (weight photo already excluded) -> eBay CDN URLs
+// Upload all output photos as base64 (weight photo already excluded from outputPhotos).
+// Skips photos missing on disk; falls back to our served photo URL if an upload fails.
 function uploadAllPhotos(record, sku, token, callback){
-  var stems = (record.outputPhotos && record.outputPhotos.length) ? record.outputPhotos : ['photo_1'];
+  var dir = path.join(DATA_DIR, 'items', String(sku));
+  var stems = (record.outputPhotos && record.outputPhotos.length) ? record.outputPhotos.slice() : [];
+  if(!stems.length && fs.existsSync(path.join(dir, 'photo_1.jpg'))) stems = ['photo_1'];
+  // keep only stems that actually exist on disk (handles 0-photo case gracefully)
+  stems = stems.filter(function(s){ return fs.existsSync(path.join(dir, String(s).replace(/\.jpg$/i,'') + '.jpg')); });
   var urls = [], i = 0;
   function next(){
     if(i >= stems.length){ callback(null, urls); return; }
-    var ext = EBAY_PHOTO_BASE + '/api/photo/' + sku + '/' + stems[i];
-    uploadPhotoToEbay(ext, token, function(err, cdnUrl){
+    var stem = stems[i];
+    uploadPhotoToEbay(sku, stem, token, function(err, cdnUrl){
       if(!err && cdnUrl){ urls.push(cdnUrl); }
-      else { console.log('[EBAY] photo upload skipped for', stems[i], '-', err ? err.message : ''); }
+      else {
+        var fallback = EBAY_PHOTO_BASE + '/api/photo/' + sku + '/' + stem;
+        urls.push(fallback);
+        console.log('[EBAY] photo upload failed for', stem, '- using fallback URL', fallback, err ? ('(' + err.message + ')') : '');
+      }
       i++; next();
     });
   }
@@ -1778,7 +1943,14 @@ function createEbayListing(sku, callback){
   var record; try { record = JSON.parse(fs.readFileSync(listingPath, 'utf8')); } catch(e){ callback(new Error('Bad listing.json')); return; }
   record.sku = record.sku || Number(sku);
 
-  // Pre-flight validation (title <=80, price >0, aspect values <=65)
+  // Auto-truncate an over-long title to 80 chars up front (eBay hard limit) so it
+  // never blocks listing — the spec calls for auto-truncate, not rejection.
+  if(record.listing && record.listing.title && String(record.listing.title).length > 80){
+    record.listing.title = String(record.listing.title).slice(0, 80);
+    console.log('[EBAY] title over 80 chars — auto-truncated before listing');
+  }
+
+  // Pre-flight validation (price >0, aspect values <=65; title already truncated)
   var problems = validateForPublish(record);
   if(problems){ callback(new Error('Cannot list — fix these first: ' + problems.join(' '))); return; }
 
@@ -1786,20 +1958,28 @@ function createEbayListing(sku, callback){
     if(tErr){ callback(tErr); return; }
     // Upload photos to eBay CDN first (weight photo already excluded from outputPhotos)
     uploadAllPhotos(record, sku, token, function(upErr, cdnUrls){
-      var pictureUrls = cdnUrls || []; // photo failures are non-fatal
+      var pictureUrls = cdnUrls || []; // photo failures fell back to server URLs
       var listing = record.listing || {};
+      if(!pictureUrls.length){
+        record.photo_warning = 'No photos available — listing submitted without images (eBay requires at least 1).';
+        console.log('[EBAY] WARNING: SKU', sku, 'has 0 photos — submitting without images');
+      }
+      var policies = readEbayPolicies();
       var categoryFallbacks = [ (listing.category_id || 293), 293 ]; // invalid category -> default 293 (Consumer Electronics)
       var condFallbacks = [ 3000, 1000 ];                            // invalid condition -> 3000, then 1000
-      var catIdx = 0, condIdx = -1, titleTrunc = false, refreshed = false;
+      var catIdx = 0, condIdx = -1, titleTrunc = false, refreshed = false, triedPolicies = false, reviseId = null;
 
       function attempt(){
         var opts = {
           pictureUrls: pictureUrls,
           categoryId: categoryFallbacks[catIdx],
-          conditionId: condIdx >= 0 ? condFallbacks[condIdx] : null
+          conditionId: condIdx >= 0 ? condFallbacks[condIdx] : null,
+          policies: policies,
+          reviseItemId: reviseId
         };
         var xml = buildAddItemXml(record, opts);
-        ebayTradingCall('AddItem', xml, token, function(e, sc, body){
+        var callName = reviseId ? 'ReviseFixedPriceItem' : 'AddItem';
+        ebayTradingCall(callName, xml, token, function(e, sc, body){
           if(e){ callback(e); return; }
           // 401 -> refresh OAuth token once and retry
           if(sc === 401 && !refreshed){
@@ -1809,8 +1989,8 @@ function createEbayListing(sku, callback){
             return;
           }
           var ack = parseXmlTag(body, 'Ack') || '';
-          var itemId = parseXmlTag(body, 'ItemID');
-          console.log('[EBAY] AddItem SKU', sku, '| http', sc, '| Ack', ack, '| ItemID', itemId);
+          var itemId = parseXmlTag(body, 'ItemID') || reviseId;
+          console.log('[EBAY]', callName, 'SKU', sku, '| http', sc, '| Ack', ack, '| ItemID', itemId);
           if((ack === 'Success' || ack === 'Warning') && itemId){
             record.ebay_item_id = itemId;
             record.ebay_listing_url = 'https://www.ebay.com/itm/' + itemId;
@@ -1822,6 +2002,13 @@ function createEbayListing(sku, callback){
           }
           var msgs = parseEbayErrors(body);
           var blob = (msgs.join(' ') + ' ' + ebayErrorCodes(body).join(' ')).toLowerCase();
+          // Seller opted into business policies -> fetch policies and retry with SellerProfiles
+          if((/business polic|opted in|seller profile|21919456/.test(blob)) && !triedPolicies){
+            triedPolicies = true;
+            console.log('[EBAY] seller uses business policies — fetching policy IDs and retrying with SellerProfiles');
+            fetchEbayPolicies(function(pe, pol){ if(!pe && pol) policies = pol; attempt(); });
+            return;
+          }
           // Category invalid -> retry with parent/default 293
           if(/category/.test(blob) && catIdx < categoryFallbacks.length - 1){
             catIdx++;
@@ -1841,7 +2028,13 @@ function createEbayListing(sku, callback){
             console.log('[EBAY] title too long — truncating to 80 and retrying');
             attempt(); return;
           }
-          callback(new Error('eBay AddItem failed: ' + (msgs.join(' | ') || ('HTTP ' + sc))));
+          // Duplicate SKU / existing listing -> revise the existing ItemID instead of creating new
+          if((/duplicate|already have|already a listing|21919067|37|already exist/.test(blob)) && !reviseId && record.ebay_item_id){
+            reviseId = record.ebay_item_id;
+            console.log('[EBAY] duplicate SKU — switching to ReviseFixedPriceItem for ItemID', reviseId);
+            attempt(); return;
+          }
+          callback(new Error('eBay ' + callName + ' failed: ' + (msgs.join(' | ') || ('HTTP ' + sc))));
         });
       }
       attempt();
