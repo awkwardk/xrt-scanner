@@ -2057,79 +2057,83 @@ function getCategorySpecifics(categoryId, token, callback){
   });
 }
 
-// ── eBay Finding API (PUBLIC, AppID only) — confirm category + pricing from real
-// completed sold listings via a 3-level cascade (exact model -> brand+type -> type only).
+// ── eBay Browse API (OAuth) — confirm category from real eBay listings via a 3-level
+// cascade (exact model -> brand+type -> type only) with majority-vote category selection.
+// The legacy Finding API (svcs.ebay.com) was decommissioned by eBay; Browse is the modern
+// equivalent. Pricing stays with the existing Gemini web-search fallback for now.
 // Never throws: callback(null, null) on any failure so the caller can fall back.
 function findCompletedItemsCategory(itemName, appId, callback){
-  function qstring(o){ return Object.keys(o).map(function(k){ return k + '=' + encodeURIComponent(o[k]); }).join('&'); }
-  function search(keywords, done){
-    if(!keywords || !String(keywords).trim()){ done(null); return; }
-    var qs = qstring({
-      'OPERATION-NAME':'findCompletedItems',
-      'SERVICE-VERSION':'1.0.0',
-      'SECURITY-APPNAME': appId || '',
-      'RESPONSE-DATA-FORMAT':'JSON',
-      'keywords': keywords,
-      'itemFilter%280%29.name':'SoldItemsOnly',
-      'itemFilter%280%29.value':'true',
-      'outputSelector%280%29':'CategoryHistogram',
-      'paginationInput.entriesPerPage':'20',
-      'sortOrder':'EndTimeSoonest'
-    });
-    var options = { hostname:'svcs.ebay.com', path:'/services/search/FindingService/v1?' + qs, method:'GET', headers:{'Accept':'application/json'} };
-    var fullUrl = 'https://' + options.hostname + options.path;
-    console.log('[FINDING API] Request URL:', fullUrl);
-    var req = https.request(options, function(resp){
-      var d = ''; resp.on('data', function(c){ d += c; });
-      resp.on('end', function(){
-        try {
-          var j = JSON.parse(d);
-          var sr = j && j.findCompletedItemsResponse && j.findCompletedItemsResponse[0] && j.findCompletedItemsResponse[0].searchResult && j.findCompletedItemsResponse[0].searchResult[0];
-          done(sr && Array.isArray(sr.item) ? sr.item : []);
-        } catch(e){ console.log('[IDENTIFY] Finding API parse error:', e.message); done(null); }
-      });
-    });
-    req.on('error', function(e){ console.log('[IDENTIFY] Finding API request error:', e.message); done(null); });
-    req.end();
-  }
-  function majorityCategory(items){
-    var counts = {}, names = {};
-    items.forEach(function(it){ try { var id = it.primaryCategory[0].categoryId[0]; if(id){ counts[id] = (counts[id]||0)+1; names[id] = it.primaryCategory[0].categoryName[0]; } } catch(e){} });
-    var best = null, bestN = 0;
-    Object.keys(counts).forEach(function(id){ if(counts[id] > bestN){ bestN = counts[id]; best = id; } });
-    return best ? { id: best, name: names[best] || '' } : null;
-  }
-  function prices(items){
-    var p = [];
-    items.forEach(function(it){ try { var v = parseFloat(it.sellingStatus[0].convertedCurrentPrice[0].__value__); if(!isNaN(v) && v > 0) p.push(v); } catch(e){} });
-    return p.sort(function(a, b){ return a - b; });
-  }
-  function percentile(sorted, pct){ if(!sorted.length) return 0; var i = Math.round((pct/100) * (sorted.length - 1)); return Math.round(sorted[Math.max(0, Math.min(sorted.length - 1, i))]); }
-  function stripModel(name){ return String(name||'').split(/\s+/).filter(function(t){ return !/^[A-Za-z]{0,3}[\d][\w\-]{1,}$/.test(t); }).join(' ').trim(); }
-  function typeOnly(name){ var t = String(name||'').split(/\s+/).filter(Boolean); return t.slice(Math.max(0, t.length - 3)).join(' ').trim(); }
+  getEbayToken(function(tErr, token){
+    if(tErr || !token){ console.log('[BROWSE API] no eBay token — cannot query Browse API:', tErr ? tErr.message : 'none'); callback(null, null); return; }
 
-  var q1 = String(itemName || '').trim();
-  search(q1, function(items1){
-    console.log('[IDENTIFY] Level 1 search "' + q1 + '" returned ' + (items1 ? items1.length : 0) + ' results');
-    var cat1 = items1 && items1.length ? majorityCategory(items1) : null;
-    if(cat1){
-      var pr = prices(items1);
-      var out = { category_id: cat1.id, category_name: cat1.name, search_level: 1, price_reliable: true, sold_count: items1.length, source: 'ebay_completed' };
-      if(pr.length){ out.price_low = percentile(pr, 10); out.price_high = percentile(pr, 90); }
-      callback(null, out); return;
+    function search(keywords, done){
+      if(!keywords || !String(keywords).trim()){ done(null); return; }
+      var path = '/buy/browse/v1/item_summary/search?q=' + encodeURIComponent(keywords) + '&limit=20';
+      var options = {
+        hostname: EBAY_BASE.replace('https://', ''),
+        path: path,
+        method: 'GET',
+        headers: {
+          'Authorization': 'Bearer ' + token,
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+          'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US'
+        }
+      };
+      var fullUrl = 'https://' + options.hostname + options.path;
+      console.log('[BROWSE API] Request URL:', fullUrl);
+      var req = https.request(options, function(resp){
+        var d = ''; resp.on('data', function(c){ d += c; });
+        resp.on('end', function(){
+          try {
+            var j = JSON.parse(d);
+            done(Array.isArray(j.itemSummaries) ? j.itemSummaries : []);
+          } catch(e){
+            console.log('[BROWSE API] Parse error — HTTP', resp.statusCode, '— Content-Type:', (resp.headers && resp.headers['content-type']) || 'n/a');
+            console.log('[BROWSE API] Raw response body (first 1500 chars):', String(d).slice(0, 1500));
+            done(null);
+          }
+        });
+      });
+      req.on('error', function(e){ console.log('[BROWSE API] Request error:', e.message); done(null); });
+      req.end();
     }
-    var q2 = stripModel(q1);
-    search(q2, function(items2){
-      console.log('[IDENTIFY] Level 2 search "' + q2 + '" returned ' + (items2 ? items2.length : 0) + ' results');
-      var cat2 = items2 && items2.length ? majorityCategory(items2) : null;
-      if(cat2){ callback(null, { category_id: cat2.id, category_name: cat2.name, search_level: 2, price_reliable: false, sold_count: items2.length, source: 'ebay_completed' }); return; }
-      var q3 = typeOnly(q2);
-      search(q3, function(items3){
-        console.log('[IDENTIFY] Level 3 search "' + q3 + '" returned ' + (items3 ? items3.length : 0) + ' results');
-        var cat3 = items3 && items3.length ? majorityCategory(items3) : null;
-        if(cat3){ callback(null, { category_id: cat3.id, category_name: cat3.name, search_level: 3, price_reliable: false, sold_count: items3.length, source: 'ebay_completed' }); return; }
-        console.log('[IDENTIFY] All levels exhausted for "' + itemName + '" — no eBay completed listings found');
-        callback(null, null);
+    // Majority-vote the leaf category across the returned item summaries
+    function majorityCategory(items){
+      var counts = {}, names = {};
+      items.forEach(function(it){
+        try {
+          var cat = (it.categories && it.categories[0]) ? it.categories[0] : null;
+          var id = cat ? cat.categoryId : ((it.leafCategoryIds && it.leafCategoryIds[0]) || null);
+          var nm = cat ? cat.categoryName : '';
+          if(id){ counts[id] = (counts[id]||0) + 1; names[id] = nm || names[id] || ''; }
+        } catch(e){}
+      });
+      var best = null, bestN = 0;
+      Object.keys(counts).forEach(function(id){ if(counts[id] > bestN){ bestN = counts[id]; best = id; } });
+      return best ? { id: best, name: names[best] || '' } : null;
+    }
+    function stripModel(name){ return String(name||'').split(/\s+/).filter(function(t){ return !/^[A-Za-z]{0,3}[\d][\w\-]{1,}$/.test(t); }).join(' ').trim(); }
+    function typeOnly(name){ var t = String(name||'').split(/\s+/).filter(Boolean); return t.slice(Math.max(0, t.length - 3)).join(' ').trim(); }
+
+    var q1 = String(itemName || '').trim();
+    search(q1, function(items1){
+      console.log('[IDENTIFY] Level 1 search "' + q1 + '" returned ' + (items1 ? items1.length : 0) + ' results');
+      var cat1 = items1 && items1.length ? majorityCategory(items1) : null;
+      if(cat1){ callback(null, { category_id: cat1.id, category_name: cat1.name, search_level: 1, price_reliable: false, sold_count: items1.length, source: 'ebay_browse' }); return; }
+      var q2 = stripModel(q1);
+      search(q2, function(items2){
+        console.log('[IDENTIFY] Level 2 search "' + q2 + '" returned ' + (items2 ? items2.length : 0) + ' results');
+        var cat2 = items2 && items2.length ? majorityCategory(items2) : null;
+        if(cat2){ callback(null, { category_id: cat2.id, category_name: cat2.name, search_level: 2, price_reliable: false, sold_count: items2.length, source: 'ebay_browse' }); return; }
+        var q3 = typeOnly(q2);
+        search(q3, function(items3){
+          console.log('[IDENTIFY] Level 3 search "' + q3 + '" returned ' + (items3 ? items3.length : 0) + ' results');
+          var cat3 = items3 && items3.length ? majorityCategory(items3) : null;
+          if(cat3){ callback(null, { category_id: cat3.id, category_name: cat3.name, search_level: 3, price_reliable: false, sold_count: items3.length, source: 'ebay_browse' }); return; }
+          console.log('[IDENTIFY] All levels exhausted for "' + itemName + '" — no eBay Browse listings found');
+          callback(null, null);
+        });
       });
     });
   });
