@@ -96,6 +96,7 @@ const EBAY_SCOPES = [
 // Public base URL eBay uses to fetch our hosted photos for UploadSiteHostedPictures
 const EBAY_PHOTO_BASE = process.env.PUBLIC_BASE_URL || 'https://xrt-scanner.onrender.com';
 console.log('[STARTUP] eBay App ID found:', EBAY_APP_ID.length > 0, '| env:', EBAY_ENVIRONMENT);
+console.log('[STARTUP] EBAY_APP_ID raw value:', JSON.stringify(EBAY_APP_ID));
 
 // ── SHIPPING & DIMENSIONS CALCULATOR (Feature 3) ──
 const STANDARD_GA_BOXES   = [[12,8,6],[12,10,8],[15,12,10],[22,13,8]];
@@ -2060,7 +2061,7 @@ function getCategorySpecifics(categoryId, token, callback){
 // completed sold listings via a 3-level cascade (exact model -> brand+type -> type only).
 // Never throws: callback(null, null) on any failure so the caller can fall back.
 function findCompletedItemsCategory(itemName, appId, callback){
-  function qstring(o){ return Object.keys(o).map(function(k){ return encodeURIComponent(k) + '=' + encodeURIComponent(o[k]); }).join('&'); }
+  function qstring(o){ return Object.keys(o).map(function(k){ return k + '=' + encodeURIComponent(o[k]); }).join('&'); }
   function search(keywords, done){
     if(!keywords || !String(keywords).trim()){ done(null); return; }
     var qs = qstring({
@@ -2069,9 +2070,9 @@ function findCompletedItemsCategory(itemName, appId, callback){
       'SECURITY-APPNAME': appId || '',
       'RESPONSE-DATA-FORMAT':'JSON',
       'keywords': keywords,
-      'itemFilter(0).name':'SoldItemsOnly',
-      'itemFilter(0).value':'true',
-      'outputSelector(0)':'CategoryHistogram',
+      'itemFilter%280%29.name':'SoldItemsOnly',
+      'itemFilter%280%29.value':'true',
+      'outputSelector%280%29':'CategoryHistogram',
       'paginationInput.entriesPerPage':'20',
       'sortOrder':'EndTimeSoonest'
     });
