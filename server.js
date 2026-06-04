@@ -2068,7 +2068,7 @@ function findCompletedItemsCategory(itemName, appId, callback){
 
     function search(keywords, done){
       if(!keywords || !String(keywords).trim()){ done(null); return; }
-      var path = '/buy/browse/v1/item_summary/search?q=' + encodeURIComponent(keywords) + '&limit=20';
+      var path = '/buy/browse/v1/item_summary/search?q=' + encodeURIComponent(keywords) + '&limit=20&fieldgroups=EXTENDED';
       var options = {
         hostname: EBAY_BASE.replace('https://', ''),
         path: path,
@@ -2087,7 +2087,9 @@ function findCompletedItemsCategory(itemName, appId, callback){
         resp.on('end', function(){
           try {
             var j = JSON.parse(d);
-            done(Array.isArray(j.itemSummaries) ? j.itemSummaries : []);
+            var itemSummaries = Array.isArray(j.itemSummaries) ? j.itemSummaries : [];
+            if(itemSummaries.length){ console.log('[BROWSE RAW ITEM]', JSON.stringify(itemSummaries[0], null, 2)); }
+            done(itemSummaries);
           } catch(e){
             console.log('[BROWSE API] Parse error — HTTP', resp.statusCode, '— Content-Type:', (resp.headers && resp.headers['content-type']) || 'n/a');
             console.log('[BROWSE API] Raw response body (first 1500 chars):', String(d).slice(0, 1500));
