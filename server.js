@@ -938,6 +938,22 @@ const server = http.createServer(function(req, res) {
     res.writeHead(200); res.end('OK');
     return;
   }
+  // ── eBay diagnostics: list offers eBay has stored (Inventory API getOffers) ──
+  // UNPUBLISHED offers live ONLY here — they are NOT shown in Seller Hub until published.
+  // Optional ?sku=<custom_sku> filters to one SKU (eBay's getOffers requires a sku filter).
+  if(req.method==='GET' && req.url.split('?')[0]==='/ebay-offers'){
+    var offersQuery = require('url').parse(req.url, true).query;
+    getEbayToken(function(tErr, token){
+      if(tErr){ sendJSON(res,200,{success:false, error:tErr.message}); return; }
+      var qp = offersQuery.sku ? ('?sku=' + encodeURIComponent(offersQuery.sku)) : '';
+      ebayApi('GET', '/sell/inventory/v1/offer' + qp, token, null, function(e, sc, r){
+        if(e){ sendJSON(res,200,{success:false, error:e.message}); return; }
+        console.log('[EBAY] getOffers' + qp + ' | status', sc, '| response:', JSON.stringify(r).slice(0,800));
+        sendJSON(res,200,{success: sc < 400, status: sc, note: 'UNPUBLISHED offers appear here via API only, not in Seller Hub until publishOffer is called.', response: r});
+      });
+    });
+    return;
+  }
   // ── eBay one-time setup: create the Clovis CA merchant location ──
   if(req.method==='GET' && req.url.split('?')[0]==='/ebay-setup-location'){
     getEbayToken(function(tErr, token){
@@ -971,6 +987,18 @@ const server = http.createServer(function(req, res) {
       createEbayDraft(parsed.sku, function(dErr, info){
         if(dErr){ sendJSON(res,200,{success:false, error:dErr.message}); return; }
         sendJSON(res,200,{success:true, item_id:info.item_id, offer_id:info.offer_id, draft_url:info.draft_url});
+      });
+    });
+    return;
+  }
+  // ── eBay publish: make the draft offer a live listing (Seller Hub Active) ──
+  if(req.method==='POST' && req.url==='/api/publish-ebay'){
+    parseBody(req, function(err, parsed){
+      if(err || !parsed || !parsed.sku){ sendJSON(res,400,{success:false, error:'Bad request'}); return; }
+      if(!ebayStatus().connected){ sendJSON(res,200,{success:false, error:'Connect eBay first'}); return; }
+      publishEbayOffer(parsed.sku, function(pErr, info){
+        if(pErr){ sendJSON(res,200,{success:false, error:pErr.message}); return; }
+        sendJSON(res,200,{success:true, listing_id:info.listing_id, listing_url:info.listing_url});
       });
     });
     return;
@@ -1431,8 +1459,11 @@ function createEbayDraft(sku, callback){
     // Step 1 — create/update inventory item
     ebayApi('PUT', '/sell/inventory/v1/inventory_item/' + encodeURIComponent(customSku), token, inventoryBody, function(e1, sc1, r1){
       if(e1){ callback(e1); return; }
+      console.log('[EBAY] inventory_item PUT SKU', customSku, '| status', sc1, '| response:', JSON.stringify(r1));
       if(sc1 >= 400){ callback(new Error('inventory_item failed ('+sc1+'): '+JSON.stringify(r1).slice(0,300))); return; }
-      // Step 2 — create offer (UNPUBLISHED draft)
+      // Step 2 — create offer (UNPUBLISHED draft). NOTE: an UNPUBLISHED offer does NOT
+      // appear in Seller Hub (Drafts/Active/etc). It exists only via the Inventory API
+      // (GET /sell/inventory/v1/offer) until publishOffer is called.
       var offerBody = {
         sku: customSku,
         marketplaceId: 'EBAY_US',
@@ -1446,15 +1477,44 @@ function createEbayDraft(sku, callback){
       };
       ebayApi('POST', '/sell/inventory/v1/offer', token, offerBody, function(e2, sc2, r2){
         if(e2){ callback(e2); return; }
+        console.log('[EBAY] create offer SKU', customSku, '| status', sc2, '| FULL response:', JSON.stringify(r2));
         if(sc2 >= 400){ callback(new Error('offer failed ('+sc2+'): '+JSON.stringify(r2).slice(0,300))); return; }
         var offerId = (r2 && r2.offerId) ? r2.offerId : null;
+        console.log('[EBAY] offerId returned for SKU', sku, '->', offerId, '(status UNPUBLISHED — visible only via GET /ebay-offers, NOT Seller Hub until published)');
         record.ebay_offer_id = offerId;
         record.ebay_item_id = offerId;
+        record.ebay_offer_status = 'UNPUBLISHED';
         record.ebay_draft_url = offerId ? ('https://www.ebay.com/sh/lst/drafts') : '';
         record.sent_at = new Date().toISOString();
         try { fs.writeFileSync(listingPath, JSON.stringify(record, null, 2)); } catch(e){}
-        callback(null, {item_id: offerId, offer_id: offerId, draft_url: record.ebay_draft_url});
+        callback(null, {item_id: offerId, offer_id: offerId, status: 'UNPUBLISHED', draft_url: record.ebay_draft_url});
       });
+    });
+  });
+}
+
+// ── eBay PUBLISH (turns an UNPUBLISHED offer into a live Active listing) ──
+function publishEbayOffer(sku, callback){
+  var itemDir = path.join(DATA_DIR, 'items', String(sku));
+  var listingPath = path.join(itemDir, 'listing.json');
+  if(!fs.existsSync(listingPath)){ callback(new Error('Listing not found for SKU '+sku)); return; }
+  var record; try { record = JSON.parse(fs.readFileSync(listingPath,'utf8')); } catch(e){ callback(new Error('Bad listing.json')); return; }
+  var offerId = record.ebay_offer_id;
+  if(!offerId){ callback(new Error('No eBay draft offer for this SKU — create the draft first')); return; }
+  getEbayToken(function(tErr, token){
+    if(tErr){ callback(tErr); return; }
+    ebayApi('POST', '/sell/inventory/v1/offer/' + encodeURIComponent(offerId) + '/publish', token, {}, function(e, sc, r){
+      if(e){ callback(e); return; }
+      console.log('[EBAY] publish offer', offerId, '| status', sc, '| response:', JSON.stringify(r));
+      if(sc >= 400){ callback(new Error('publish failed ('+sc+'): '+JSON.stringify(r).slice(0,300))); return; }
+      var listingId = (r && r.listingId) ? r.listingId : null;
+      record.ebay_listing_id = listingId;
+      record.ebay_listing_url = listingId ? ('https://www.ebay.com/itm/' + listingId) : '';
+      record.ebay_offer_status = 'PUBLISHED';
+      record.published_at = new Date().toISOString();
+      try { fs.writeFileSync(listingPath, JSON.stringify(record, null, 2)); } catch(e){}
+      console.log('[EBAY] SKU', sku, 'published -> listingId', listingId);
+      callback(null, {listing_id: listingId, listing_url: record.ebay_listing_url});
     });
   });
 }
@@ -1562,10 +1622,12 @@ function generateListingsPage(listings, ebayStat){
     // eBay draft button (only when connected — Feature 8)
     var ebayBtn = '';
     if(ebayStat.connected){
-      if(r.ebay_offer_id){
-        ebayBtn = '<a href="'+(r.ebay_draft_url||'https://www.ebay.com/sh/lst/drafts')+'" target="_blank" id="ebaybtn_'+skuStr+'" style="padding:8px 16px;border-radius:4px;font-size:13px;font-weight:bold;background:#00838f;color:#fff;text-decoration:none;">Draft Created &#10003;</a>';
+      if(r.ebay_listing_id){
+        ebayBtn = '<a href="'+(r.ebay_listing_url||'#')+'" target="_blank" id="ebaybtn_'+skuStr+'" style="padding:8px 16px;border-radius:4px;font-size:13px;font-weight:bold;background:#2e7d32;color:#fff;text-decoration:none;">Listed on eBay &#10003;</a>';
+      } else if(r.ebay_offer_id){
+        ebayBtn = '<button id="ebaybtn_'+skuStr+'" onclick="publishEbay(\''+skuStr+'\')" style="padding:8px 16px;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:bold;background:#e65100;color:#fff;">Publish to eBay</button>';
       } else {
-        ebayBtn = '<button id="ebaybtn_'+skuStr+'" onclick="sendEbay(\''+skuStr+'\')" style="padding:8px 16px;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:bold;background:#0064d2;color:#fff;">Send to eBay Draft</button>';
+        ebayBtn = '<button id="ebaybtn_'+skuStr+'" onclick="sendEbay(\''+skuStr+'\')" style="padding:8px 16px;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:bold;background:#0064d2;color:#fff;">Create eBay Draft</button>';
       }
     }
 
@@ -1622,7 +1684,8 @@ function generateListingsPage(listings, ebayStat){
     +'function cp(id){var el=document.getElementById(id);if(!el)return;var btn=document.querySelector("[id=btn_"+id+"]");navigator.clipboard.writeText(el.value.trim()).then(function(){if(btn){var o=btn.textContent;btn.textContent="Copied!";setTimeout(function(){btn.textContent=o;},1500);}});}'
     +'function clearAll(){if(!confirm("Clear all listings? This cannot be undone."))return;fetch("/api/clear-listings",{method:"POST"}).then(function(){location.reload();});}'
     +'function dlAll(sku,stems,safe){for(var i=0;i<stems.length;i++){(function(n){setTimeout(function(){var a=document.createElement("a");a.href="/api/photo/"+sku+"/"+stems[n];a.download=sku+"-"+safe+"-photo"+(n+1)+".jpg";document.body.appendChild(a);a.click();document.body.removeChild(a);},n*500);})(i);}}'
-    +'function sendEbay(sku){var b=document.getElementById("ebaybtn_"+sku);if(b){b.textContent="Sending...";b.disabled=true;}fetch("/api/send-to-ebay",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sku:parseInt(sku,10)})}).then(function(r){return r.json();}).then(function(d){if(d.success){b.textContent="Draft Created \\u2713";b.style.background="#00838f";if(d.draft_url){b.onclick=function(){window.open(d.draft_url);};}}else{b.textContent="Retry";b.disabled=false;alert("eBay: "+(d.error||"failed"));}}).catch(function(){if(b){b.textContent="Retry";b.disabled=false;}alert("Network error contacting server.");});}'
+    +'function sendEbay(sku){var b=document.getElementById("ebaybtn_"+sku);if(b){b.textContent="Creating...";b.disabled=true;}fetch("/api/send-to-ebay",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sku:parseInt(sku,10)})}).then(function(r){return r.json();}).then(function(d){if(d.success){b.textContent="Publish to eBay";b.style.background="#e65100";b.disabled=false;b.onclick=function(){publishEbay(sku);};}else{b.textContent="Retry";b.disabled=false;alert("eBay: "+(d.error||"failed"));}}).catch(function(){if(b){b.textContent="Retry";b.disabled=false;}alert("Network error contacting server.");});}'
+    +'function publishEbay(sku){var b=document.getElementById("ebaybtn_"+sku);if(b){b.textContent="Publishing...";b.disabled=true;}fetch("/api/publish-ebay",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sku:parseInt(sku,10)})}).then(function(r){return r.json();}).then(function(d){if(d.success){b.textContent="Listed on eBay \\u2713";b.style.background="#2e7d32";b.disabled=false;b.onclick=function(){if(d.listing_url)window.open(d.listing_url);};}else{b.textContent="Retry Publish";b.disabled=false;alert("eBay: "+(d.error||"failed"));}}).catch(function(){if(b){b.textContent="Retry Publish";b.disabled=false;}alert("Network error contacting server.");});}'
     +'<\/script>'
     +'</head><body>'
     +'<div class="topbar">'
