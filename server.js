@@ -1953,14 +1953,14 @@ function getSuggestedCategory(title, token, callback){
     }).filter(function(c){ return c.id; });
     cats.sort(function(a, b){ return b.pct - a.pct; }); // highest percentage match first
     if((ack === 'Success' || ack === 'Warning') && cats.length){
-      callback(null, {id: cats[0].id, name: cats[0].name || '', percent: cats[0].pct});
+      callback(null, cats); // full ranked list — caller validates each is a leaf
       return;
     }
     callback(new Error('GetSuggestedCategories Ack=' + (ack || '?') + ': ' + (parseEbayErrors(body).join('; ') || ('HTTP ' + sc))));
   });
 }
 
-// Valid ConditionIDs for a category (GetCategoryFeatures) -> ['1000','3000',...]
+// GetCategoryFeatures -> { leaf: bool, conditions: ['1000','3000',...] } for a category
 function getCategoryFeatures(categoryId, token, callback){
   var xml = '<?xml version="1.0" encoding="utf-8"?>'
     + '<GetCategoryFeaturesRequest xmlns="urn:ebay:apis:eBLBaseComponents">'
@@ -1971,9 +1971,10 @@ function getCategoryFeatures(categoryId, token, callback){
   ebayTradingCall('GetCategoryFeatures', xml, token, function(err, sc, body){
     if(err){ callback(err); return; }
     var ack = parseXmlTag(body, 'Ack') || '';
+    var leaf = String(parseXmlTag(body, 'LeafCategory') || '').toLowerCase() === 'true';
     var cvBlock = parseXmlTag(body, 'ConditionValues') || '';
     var ids = parseXmlAll(cvBlock, 'Condition').map(function(c){ return (parseXmlTag(c, 'ID') || '').trim(); }).filter(Boolean);
-    if(ack === 'Success' || ack === 'Warning'){ callback(null, ids); return; }
+    if(ack === 'Success' || ack === 'Warning'){ callback(null, {leaf: leaf, conditions: ids}); return; }
     callback(new Error('GetCategoryFeatures Ack=' + (ack || '?')));
   });
 }
@@ -2116,45 +2117,56 @@ function createEbayListing(sku, callback){
         });
       }
 
-      // Resolve category (GetSuggestedCategories) -> valid conditions (GetCategoryFeatures)
-      // -> required item specifics (GetCategorySpecifics), then list. Each eBay lookup that
-      // fails degrades gracefully without blocking the listing.
-      getSuggestedCategory(record.listing.title, token, function(scErr, cat){
-        if(!scErr && cat && cat.id){
-          categoryId = cat.id;
-          record.ebay_category_id = cat.id;
-          record.ebay_category_name = cat.name;
-          console.log('[EBAY] suggested category for SKU', sku, '->', cat.id, '(' + cat.name + ', ' + cat.percent + '%)');
-        } else {
-          categoryId = 183446;
-          record.ebay_category_id = 183446;
-          record.ebay_category_name = 'Other Consumer Electronics (fallback)';
-          console.log('[EBAY] GetSuggestedCategories failed for SKU', sku, '-', scErr ? scErr.message : 'no result', '— falling back to 183446');
+      // ── Resolve a LEAF category with valid conditions ──
+      // GetSuggestedCategories returns a ranked list. For each (max 5), call
+      // GetCategoryFeatures to confirm it's a LEAF (LeafCategory=true) and read its
+      // valid ConditionIDs. Use the first leaf found; if none in 5, fall back to 183446.
+      function finalizeCategory(catId, catName, conditions){
+        categoryId = catId;
+        record.ebay_category_id = catId;
+        record.ebay_category_name = catName;
+        if(conditions && conditions.length){
+          record.ebay_valid_conditions = conditions;
+          forcedCondition = pickValidCondition(meta.grade, listing.parts_repair, conditions);
         }
-        // Valid conditions for this category -> pick one matching our grade
-        getCategoryFeatures(categoryId, token, function(fErr, validIds){
-          if(!fErr && validIds && validIds.length){
-            record.ebay_valid_conditions = validIds;
-            forcedCondition = pickValidCondition(meta.grade, listing.parts_repair, validIds);
-            console.log('[EBAY] category', categoryId, 'valid conditions', validIds.join(','), '-> using', forcedCondition);
-          } else {
-            console.log('[EBAY] GetCategoryFeatures unavailable for', categoryId, '-', fErr ? fErr.message : 'none', '— using default condition mapping');
+        console.log('[EBAY] category resolved for SKU', sku, '->', catId, '(' + catName + ') | leaf | conditions', (conditions||[]).join(',') || 'n/a', '| using condition', forcedCondition);
+        // Required item specifics for this category -> add any missing with "Not Specified"
+        getCategorySpecifics(catId, token, function(spErr, specs){
+          if(!spErr && specs){
+            record.ebay_required_specifics = specs.required;
+            var is = record.listing.item_specifics = record.listing.item_specifics || {};
+            var have = Object.keys(is).map(function(k){ return k.toLowerCase(); });
+            specs.required.forEach(function(name){
+              if(have.indexOf(String(name).toLowerCase()) < 0){ is[name] = 'Not Specified'; }
+            });
+            if(specs.required.length) console.log('[EBAY] category', catId, 'required specifics:', specs.required.join(', '));
           }
-          // Required item specifics for this category -> add any missing with "Not Specified"
-          getCategorySpecifics(categoryId, token, function(spErr, specs){
-            if(!spErr && specs){
-              record.ebay_required_specifics = specs.required;
-              var is = record.listing.item_specifics = record.listing.item_specifics || {};
-              var have = Object.keys(is).map(function(k){ return k.toLowerCase(); });
-              specs.required.forEach(function(name){
-                if(have.indexOf(String(name).toLowerCase()) < 0){ is[name] = 'Not Specified'; }
-              });
-              if(specs.required.length) console.log('[EBAY] category', categoryId, 'required specifics:', specs.required.join(', '));
-            }
-            try { fs.writeFileSync(listingPath, JSON.stringify(record, null, 2)); } catch(_e){}
-            attempt();
-          });
+          try { fs.writeFileSync(listingPath, JSON.stringify(record, null, 2)); } catch(_e){}
+          attempt();
         });
+      }
+      function fallbackCategory(reason){
+        console.log('[EBAY] SKU', sku, '- ' + reason + ' — falling back to 183446 (Other Consumer Electronics)');
+        getCategoryFeatures(183446, token, function(fe, feat){
+          finalizeCategory(183446, 'Other Consumer Electronics (fallback)', (feat && feat.conditions) || []);
+        });
+      }
+      getSuggestedCategory(record.listing.title, token, function(scErr, cats){
+        if(scErr || !cats || !cats.length){ fallbackCategory(scErr ? ('GetSuggestedCategories failed: ' + scErr.message) : 'no suggestions'); return; }
+        var i = 0, max = Math.min(5, cats.length); // max 5 attempts to find a leaf
+        (function tryNext(){
+          if(i >= max){ fallbackCategory('no leaf category in top ' + max + ' suggestions'); return; }
+          var c = cats[i]; i++;
+          getCategoryFeatures(c.id, token, function(fErr, feat){
+            if(!fErr && feat && feat.leaf){
+              console.log('[EBAY] suggested category', c.id, '(' + c.name + ', ' + c.pct + '%) confirmed LEAF');
+              finalizeCategory(c.id, c.name, feat.conditions || []);
+            } else {
+              console.log('[EBAY] suggested category', c.id, '(' + c.name + ')', fErr ? ('error ' + fErr.message) : 'NOT a leaf', '— trying next suggestion');
+              tryNext();
+            }
+          });
+        })();
       });
     });
   });
