@@ -927,7 +927,43 @@ const server = http.createServer(function(req, res) {
         data.parts_repair_price = parseInt(data.parts_repair_price, 10) || 0;
         data.working_price = data.estimated_high || data.estimated_low || 0;
         console.log('[IDENTIFY]', data.item_name, '| $'+data.estimated_low+'-$'+data.estimated_high, '| qty', data.quantity, '| parts:', data.parts_repair_demand);
-        sendJSON(res, 200, data);
+
+        // ── Step 1.5: confirm category + pricing from real eBay completed sold listings ──
+        // Additive: on ANY failure we fall through to the existing AI estimate (Change rule 5).
+        function finishIdentify(){
+          data.working_price = data.estimated_high || data.estimated_low || 0;
+          sendJSON(res, 200, data);
+        }
+        findCompletedItemsCategory(data.item_name, EBAY_APP_ID, function(_fcErr, result){
+          if(result && result.category_id){
+            data.ebay_category_id = result.category_id;
+            data.ebay_category_name = result.category_name;
+            data.category_source = 'ebay_completed';
+            data.category_search_level = result.search_level;
+            if(result.price_reliable){
+              data.estimated_low = result.price_low;
+              data.estimated_high = result.price_high;
+              data.pricing_source = 'ebay_completed';
+            } else {
+              data.pricing_source = 'web_search'; // keep the existing AI/web-search estimate
+            }
+            validateLeafCategory(result.category_id, function(_vErr, isLeaf){
+              data.category_confirmed = !!isLeaf;
+              data.category_needs_review = !isLeaf;
+              if(isLeaf) console.log('[IDENTIFY] Category', result.category_id, '(' + result.category_name + ') confirmed leaf — Level', result.search_level, 'match');
+              else console.log('[IDENTIFY] Category', result.category_id, 'is not a leaf — flagged for review');
+              finishIdentify();
+            });
+          } else {
+            data.ebay_category_id = null;
+            data.category_source = 'web_search';
+            data.category_confirmed = false;
+            data.category_needs_review = true;
+            data.pricing_source = 'web_search';
+            console.log('[IDENTIFY] Using web search fallback for category and pricing');
+            finishIdentify();
+          }
+        });
       });
     });
     return;
@@ -1148,6 +1184,7 @@ const server = http.createServer(function(req, res) {
       if(!ebayStatus().connected){ sendJSON(res,200,{success:false, error:'Connect eBay first'}); return; }
       createEbayListing(parsed.sku, function(lErr, info){
         if(lErr){ sendJSON(res,200,{success:false, error:lErr.message}); return; }
+        if(info && info.blocked){ sendJSON(res,200,{success:false, error:info.error, needs_category_review:true, category_id:info.category_id}); return; }
         sendJSON(res,200,{success:true, item_id:info.item_id, listing_url:info.listing_url});
       });
     });
@@ -1443,6 +1480,13 @@ function processItem(item, callback) {
     var partsRepairPrice = parseInt(idItem.parts_repair_price, 10) || 0;
     var isPartsRepair = (meta.grade==='D' || meta.powerTest==='Fail') && partsRepairDemand;
 
+    // Change 4: prefer the eBay-confirmed category from the identifier step (findCompletedItems)
+    var confirmedCategoryId = null;
+    if (meta.identified_item && meta.identified_item.ebay_category_id && meta.identified_item.category_confirmed === true) {
+      confirmedCategoryId = meta.identified_item.ebay_category_id;
+      console.log('[LISTING] SKU', sku, '— using confirmed category', confirmedCategoryId, '(', meta.identified_item.ebay_category_name, ')');
+    }
+
     // Shipping (Feature 3) — computed server-side from detected weight/dims
     var shipInfo = calcShipping(meta.weightOz, meta.dimensions, {});
 
@@ -1507,6 +1551,9 @@ function processItem(item, callback) {
     promptLines.push('Listed weight: ' + (shipInfo.listed_weight != null ? shipInfo.listed_weight + ' ' + shipInfo.listed_weight_unit : 'to be confirmed'));
     promptLines.push('Box dimensions: ' + (shipInfo.box_dimensions || 'to be confirmed'));
     promptLines.push('Return the most specific eBay LEAF category ID for this item. Do not return parent/broad categories. Examples of correct leaf categories: 177 (PC Laptops), 9355 (Cell Phones), 182091 (Enterprise Network Switches), 80258 (IP/VoIP Business Phones), 14969 (Home Audio Equipment). Always use the most specific subcategory available. Include category_id in the JSON.');
+    if(confirmedCategoryId){
+      promptLines.push('Confirmed eBay category from completed sold listings: ' + (meta.identified_item.ebay_category_name || '') + ' (ID: ' + confirmedCategoryId + '). Use this exact category_id in your JSON response. Generate item_specifics appropriate for this category.');
+    }
     promptLines.push('Title: include brand, model number, key descriptive terms, and a condition hint. Format: [Brand] [Model] [Type] [Key Feature] [Condition]. Example: "Cisco WS-C2960-24TT-L 24-Port Network Switch Used Working". Max 80 characters; front-load the most important search terms.');
     if(meta.powerTest === 'N/A' && (idItem.sealed || meta.grade === 'A')){
       promptLines.push('This item is NEW/UNUSED — NEVER use the word "untested". Use new/unused language such as "New, unused — original sealed packaging", "New, unused — opened for inspection only", or "New old stock — unused, may show storage wear on packaging".');
@@ -1576,6 +1623,7 @@ function processItem(item, callback) {
       listing.box_dimensions = shipInfo.box_dimensions;
       listing.polymailer = !!shipInfo.polymailer;
       listing.category_id = parseInt(listing.category_id, 10) || 0;
+      if(confirmedCategoryId){ listing.category_id = confirmedCategoryId; } // confirmed eBay category wins
       // eBay item specifics (Feature: auto-population) — ensure a plain object
       if(!listing.item_specifics || typeof listing.item_specifics !== 'object' || Array.isArray(listing.item_specifics)) listing.item_specifics = {};
       // Seed Brand/Model/MPN from vision data when the model left them blank
@@ -2008,6 +2056,94 @@ function getCategorySpecifics(categoryId, token, callback){
   });
 }
 
+// ── eBay Finding API (PUBLIC, AppID only) — confirm category + pricing from real
+// completed sold listings via a 3-level cascade (exact model -> brand+type -> type only).
+// Never throws: callback(null, null) on any failure so the caller can fall back.
+function findCompletedItemsCategory(itemName, appId, callback){
+  function qstring(o){ return Object.keys(o).map(function(k){ return encodeURIComponent(k) + '=' + encodeURIComponent(o[k]); }).join('&'); }
+  function search(keywords, done){
+    if(!keywords || !String(keywords).trim()){ done(null); return; }
+    var qs = qstring({
+      'OPERATION-NAME':'findCompletedItems',
+      'SERVICE-VERSION':'1.0.0',
+      'SECURITY-APPNAME': appId || '',
+      'RESPONSE-DATA-FORMAT':'JSON',
+      'keywords': keywords,
+      'itemFilter(0).name':'SoldItemsOnly',
+      'itemFilter(0).value':'true',
+      'outputSelector(0)':'CategoryHistogram',
+      'paginationInput.entriesPerPage':'20',
+      'sortOrder':'EndTimeSoonest'
+    });
+    var options = { hostname:'svcs.ebay.com', path:'/services/search/FindingService/v1?' + qs, method:'GET', headers:{'Accept':'application/json'} };
+    var req = https.request(options, function(resp){
+      var d = ''; resp.on('data', function(c){ d += c; });
+      resp.on('end', function(){
+        try {
+          var j = JSON.parse(d);
+          var sr = j && j.findCompletedItemsResponse && j.findCompletedItemsResponse[0] && j.findCompletedItemsResponse[0].searchResult && j.findCompletedItemsResponse[0].searchResult[0];
+          done(sr && Array.isArray(sr.item) ? sr.item : []);
+        } catch(e){ console.log('[IDENTIFY] Finding API parse error:', e.message); done(null); }
+      });
+    });
+    req.on('error', function(e){ console.log('[IDENTIFY] Finding API request error:', e.message); done(null); });
+    req.end();
+  }
+  function majorityCategory(items){
+    var counts = {}, names = {};
+    items.forEach(function(it){ try { var id = it.primaryCategory[0].categoryId[0]; if(id){ counts[id] = (counts[id]||0)+1; names[id] = it.primaryCategory[0].categoryName[0]; } } catch(e){} });
+    var best = null, bestN = 0;
+    Object.keys(counts).forEach(function(id){ if(counts[id] > bestN){ bestN = counts[id]; best = id; } });
+    return best ? { id: best, name: names[best] || '' } : null;
+  }
+  function prices(items){
+    var p = [];
+    items.forEach(function(it){ try { var v = parseFloat(it.sellingStatus[0].convertedCurrentPrice[0].__value__); if(!isNaN(v) && v > 0) p.push(v); } catch(e){} });
+    return p.sort(function(a, b){ return a - b; });
+  }
+  function percentile(sorted, pct){ if(!sorted.length) return 0; var i = Math.round((pct/100) * (sorted.length - 1)); return Math.round(sorted[Math.max(0, Math.min(sorted.length - 1, i))]); }
+  function stripModel(name){ return String(name||'').split(/\s+/).filter(function(t){ return !/^[A-Za-z]{0,3}[\d][\w\-]{1,}$/.test(t); }).join(' ').trim(); }
+  function typeOnly(name){ var t = String(name||'').split(/\s+/).filter(Boolean); return t.slice(Math.max(0, t.length - 3)).join(' ').trim(); }
+
+  var q1 = String(itemName || '').trim();
+  search(q1, function(items1){
+    console.log('[IDENTIFY] Level 1 search "' + q1 + '" returned ' + (items1 ? items1.length : 0) + ' results');
+    var cat1 = items1 && items1.length ? majorityCategory(items1) : null;
+    if(cat1){
+      var pr = prices(items1);
+      var out = { category_id: cat1.id, category_name: cat1.name, search_level: 1, price_reliable: true, sold_count: items1.length, source: 'ebay_completed' };
+      if(pr.length){ out.price_low = percentile(pr, 10); out.price_high = percentile(pr, 90); }
+      callback(null, out); return;
+    }
+    var q2 = stripModel(q1);
+    search(q2, function(items2){
+      console.log('[IDENTIFY] Level 2 search "' + q2 + '" returned ' + (items2 ? items2.length : 0) + ' results');
+      var cat2 = items2 && items2.length ? majorityCategory(items2) : null;
+      if(cat2){ callback(null, { category_id: cat2.id, category_name: cat2.name, search_level: 2, price_reliable: false, sold_count: items2.length, source: 'ebay_completed' }); return; }
+      var q3 = typeOnly(q2);
+      search(q3, function(items3){
+        console.log('[IDENTIFY] Level 3 search "' + q3 + '" returned ' + (items3 ? items3.length : 0) + ' results');
+        var cat3 = items3 && items3.length ? majorityCategory(items3) : null;
+        if(cat3){ callback(null, { category_id: cat3.id, category_name: cat3.name, search_level: 3, price_reliable: false, sold_count: items3.length, source: 'ebay_completed' }); return; }
+        console.log('[IDENTIFY] All levels exhausted for "' + itemName + '" — no eBay completed listings found');
+        callback(null, null);
+      });
+    });
+  });
+}
+
+// Confirm an eBay category is a LEAF (listable) before posting. Never throws.
+function validateLeafCategory(categoryId, callback){
+  getEbayToken(function(tErr, token){
+    if(tErr || !token){ console.log('[VALIDATE] Category', categoryId, 'leaf check: false (no token)'); callback(null, false); return; }
+    getCategoryFeatures(categoryId, token, function(fErr, feat){
+      var isLeaf = !!(feat && feat.leaf === true);
+      console.log('[VALIDATE] Category', categoryId, 'leaf check:', isLeaf);
+      callback(null, isLeaf);
+    });
+  });
+}
+
 // Create a live eBay listing via Trading API AddItem (with error-recovery retries)
 function createEbayListing(sku, callback){
   var itemDir = path.join(DATA_DIR, 'items', String(sku));
@@ -2150,6 +2286,28 @@ function createEbayListing(sku, callback){
         getCategoryFeatures(183446, token, function(fe, feat){
           finalizeCategory(183446, 'Other Consumer Electronics (fallback)', (feat && feat.conditions) || []);
         });
+      }
+      // Change 5: prefer a confirmed/known category (prior attempt -> identifier -> AI),
+      // leaf-validate it, and BLOCK with a structured error if it is not a leaf.
+      var knownCat = record.ebay_category_id
+        || (meta.identified_item && meta.identified_item.ebay_category_id)
+        || (listing && listing.category_id)
+        || null;
+      if(knownCat){
+        validateLeafCategory(knownCat, function(_kErr, isLeaf){
+          if(isLeaf){
+            console.log('[EBAY] SKU', sku, 'using known category', knownCat, '(leaf confirmed)');
+            getCategoryFeatures(knownCat, token, function(fe, feat){
+              var nm = record.ebay_category_name || (meta.identified_item && meta.identified_item.ebay_category_name) || '';
+              finalizeCategory(knownCat, nm, (feat && feat.conditions) || []);
+            });
+          } else {
+            console.log('[EBAY] SKU', sku, 'blocked — category', knownCat, 'is not a leaf');
+            callback(null, { blocked: true, category_id: knownCat, needs_category_review: true,
+              error: 'Category ' + knownCat + ' is not a leaf category and cannot be listed in. The item needs a more specific category. Open this listing to select the correct subcategory before posting.' });
+          }
+        });
+        return;
       }
       getSuggestedCategory(record.listing.title, token, function(scErr, cats){
         if(scErr || !cats || !cats.length){ fallbackCategory(scErr ? ('GetSuggestedCategories failed: ' + scErr.message) : 'no suggestions'); return; }
