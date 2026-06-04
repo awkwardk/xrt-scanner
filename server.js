@@ -87,7 +87,9 @@ const EBAY_TOKENS_FILE = path.join(DATA_DIR, 'ebay-tokens.json');
 const EBAY_SCOPES = [
   'https://api.ebay.com/oauth/api_scope',
   'https://api.ebay.com/oauth/api_scope/sell.inventory',
+  'https://api.ebay.com/oauth/api_scope/sell.inventory.readonly',
   'https://api.ebay.com/oauth/api_scope/sell.account',
+  'https://api.ebay.com/oauth/api_scope/sell.account.readonly',
   'https://api.ebay.com/oauth/api_scope/sell.fulfillment'
 ];
 // Mutable: set once /ebay-setup-location succeeds (also exported to process.env)
@@ -163,8 +165,10 @@ function calcShipping(itemWeightOz, dims, opts){
 
 // ── eBay TOKEN HELPERS (Feature 9) ──
 function readEbayTokens(){
+  // OAuth tokens in ebay-tokens.json are the single source of truth. The
+  // EBAY_USER_TOKEN env var is an Auth'n'Auth token with limited scopes that
+  // returns 403 on the Sell/Inventory APIs, so it is NEVER used here.
   try { if(fs.existsSync(EBAY_TOKENS_FILE)) return JSON.parse(fs.readFileSync(EBAY_TOKENS_FILE,'utf8')); } catch(e){}
-  if(EBAY_USER_TOKEN){ return {access_token: EBAY_USER_TOKEN, refresh_token:'', expires_at: Date.now()+7200000, token_type:'User Access Token'}; }
   return null;
 }
 function writeEbayTokens(t){
@@ -197,8 +201,11 @@ function refreshEbayToken(callback){
   req.write(body); req.end();
 }
 function getEbayToken(callback){
-  var t = readEbayTokens();
-  if(!t || !t.access_token){ callback(new Error('eBay not connected')); return; }
+  // Inventory/Sell API calls MUST use the OAuth token from ebay-tokens.json,
+  // never the EBAY_USER_TOKEN env var (Auth'n'Auth token → 403 Access Denied).
+  var t = null;
+  try { if(fs.existsSync(EBAY_TOKENS_FILE)) t = JSON.parse(fs.readFileSync(EBAY_TOKENS_FILE,'utf8')); } catch(e){}
+  if(!t || !t.access_token){ callback(new Error('eBay not connected — no OAuth token in ebay-tokens.json. Connect via /ebay-auth.')); return; }
   if(t.expires_at && Date.now() > (t.expires_at - 60000) && t.refresh_token){ refreshEbayToken(callback); return; }
   callback(null, t.access_token);
 }
@@ -872,6 +879,39 @@ const server = http.createServer(function(req, res) {
   }
   if(req.method==='GET' && req.url.split('?')[0]==='/ebay-status'){
     sendJSON(res, 200, ebayStatus());
+    return;
+  }
+  // ── eBay diagnostics (token never exposed) ──
+  if(req.method==='GET' && req.url.split('?')[0]==='/ebay-debug'){
+    var tokensExist = fs.existsSync(EBAY_TOKENS_FILE);
+    var tokensRedacted = null;
+    if(tokensExist){
+      try {
+        var raw = JSON.parse(fs.readFileSync(EBAY_TOKENS_FILE,'utf8'));
+        tokensRedacted = {
+          has_access_token: !!raw.access_token,
+          access_token_length: raw.access_token ? String(raw.access_token).length : 0,
+          has_refresh_token: !!raw.refresh_token,
+          refresh_token_length: raw.refresh_token ? String(raw.refresh_token).length : 0,
+          token_type: raw.token_type || null,
+          expires_at: raw.expires_at || null,
+          expires_at_iso: raw.expires_at ? new Date(raw.expires_at).toISOString() : null,
+          expired: raw.expires_at ? (Date.now() > raw.expires_at) : null
+        };
+      } catch(e){ tokensRedacted = {error:'could not parse ebay-tokens.json'}; }
+    }
+    sendJSON(res, 200, {
+      env_user_token_present: EBAY_USER_TOKEN.length > 0,
+      env_user_token_length: EBAY_USER_TOKEN.length,
+      tokens_file_path: EBAY_TOKENS_FILE,
+      tokens_file_exists: tokensExist,
+      tokens_file_contents_redacted: tokensRedacted,
+      ebay_auth_scopes: EBAY_SCOPES,
+      ebay_environment: EBAY_ENVIRONMENT,
+      inventory_api_base: EBAY_BASE,
+      authorization_header_format: 'Bearer <access_token>',
+      authorization_header_example: 'Authorization: Bearer ' + (tokensRedacted && tokensRedacted.has_access_token ? '<'+tokensRedacted.access_token_length+'-char token present>' : '<no token>')
+    });
     return;
   }
   if(req.method==='POST' && req.url==='/api/ebay-refresh-token'){
