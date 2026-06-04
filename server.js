@@ -1857,16 +1857,16 @@ function ebayTradingMultipart(callName, xmlPayload, imageBuffer, token, callback
     xmlPayload = xmlPayload.replace(/(<[A-Za-z]+Request\b[^>]*>)/, '$1' + creds);
   }
   var boundary = 'XRTMIMEBOUNDARY' + imageBuffer.length;
+  // multipart/form-data with the RAW image binary (not base64): XML part, then image part
   var pre = '--' + boundary + '\r\n'
     + 'Content-Disposition: form-data; name="XML Payload"\r\n'
     + 'Content-Type: text/xml;charset=utf-8\r\n\r\n'
     + xmlPayload + '\r\n'
     + '--' + boundary + '\r\n'
     + 'Content-Disposition: form-data; name="image"; filename="image.jpg"\r\n'
-    + 'Content-Transfer-Encoding: base64\r\n'
     + 'Content-Type: application/octet-stream\r\n\r\n';
   var post = '\r\n--' + boundary + '--\r\n';
-  var body = Buffer.concat([ Buffer.from(pre, 'utf8'), Buffer.from(imageBuffer.toString('base64'), 'utf8'), Buffer.from(post, 'utf8') ]);
+  var body = Buffer.concat([ Buffer.from(pre, 'utf8'), imageBuffer, Buffer.from(post, 'utf8') ]);
   var options = {
     hostname: EBAY_BASE.replace('https://', ''),
     path: '/ws/api.dll',
@@ -1903,9 +1903,11 @@ function uploadPhotoToEbay(sku, stem, token, callback){
       + '</UploadSiteHostedPicturesRequest>';
     ebayTradingMultipart('UploadSiteHostedPictures', xml, buf, token, function(e, sc, body){
       if(e){ callback(e); return; }
+      // eBay returns HTTP 200 on both success and failure — check Ack, not status code
+      var ack = parseXmlTag(body, 'Ack') || '';
       var full = parseXmlTag(body, 'FullURL');
-      if(full){ callback(null, full); return; }
-      callback(new Error('photo upload failed: ' + (parseEbayErrors(body).join('; ') || ('HTTP ' + sc))));
+      if((ack === 'Success' || ack === 'Warning') && full){ callback(null, full); return; }
+      callback(new Error('photo upload Ack=' + (ack || '?') + ': ' + (parseEbayErrors(body).join('; ') || ('HTTP ' + sc))));
     });
   });
 }
@@ -1965,7 +1967,10 @@ function createEbayListing(sku, callback){
         console.log('[EBAY] WARNING: SKU', sku, 'has 0 photos — submitting without images');
       }
       var policies = readEbayPolicies();
-      var categoryFallbacks = [ (listing.category_id || 293), 293 ]; // invalid category -> default 293 (Consumer Electronics)
+      // Known-valid eBay LEAF categories tried in order on error 87 (not-a-leaf).
+      // 293 is NOT a leaf; 183446 (Other Consumer Electronics) is a confirmed leaf
+      // that accepts all condition IDs and is the final fallback.
+      var categoryFallbacks = [ (listing.category_id || 183446), 9394, 175672, 58058, 183446 ];
       var condFallbacks = [ 3000, 1000 ];                            // invalid condition -> 3000, then 1000
       var catIdx = 0, condIdx = -1, titleTrunc = false, refreshed = false, triedPolicies = false, reviseId = null;
 
@@ -2009,11 +2014,12 @@ function createEbayListing(sku, callback){
             fetchEbayPolicies(function(pe, pol){ if(!pe && pol) policies = pol; attempt(); });
             return;
           }
-          // Category invalid / not a leaf category (error 87) -> retry with 293 (Consumer Electronics).
-          // Log the offending category so the AI prompt can be improved over time.
+          // Category invalid / not a leaf category (error 87) -> walk the known-leaf fallback
+          // chain (… -> 183446 Other Consumer Electronics). Log the offending category so the
+          // AI prompt can be improved over time.
           if((/category|not a leaf|\b87\b/.test(blob)) && catIdx < categoryFallbacks.length - 1){
             console.log('[EBAY] CATEGORY ERROR for SKU', sku, '- category', categoryFallbacks[catIdx],
-              'rejected (' + (msgs.join('; ') || ('code ' + ebayErrorCodes(body).join(','))) + ') — retrying with 293 (Consumer Electronics)');
+              'rejected (' + (msgs.join('; ') || ('code ' + ebayErrorCodes(body).join(','))) + ') — retrying with category', categoryFallbacks[catIdx + 1]);
             catIdx++;
             attempt(); return;
           }
