@@ -108,8 +108,8 @@ test('Grade conflict only on FAIL',       has("r==='Fail'&&currentItem.grade"));
 test('Below threshold flag (page)',       has('Below minimum threshold'));
 test('Below threshold flag (data)',       has('belowThreshold'));
 test('1600x1600 photo output',            has('var outSize=1600'));
-test('Tap to focus constraints',          has('applyConstraints') && has('pointsOfInterest'));
-test('Tap to focus manual mode',          has("focusMode:'manual'"));
+test('Tap to focus ring indicator',       has('function attachTapToFocus(') && has('focus-ring'));
+test('Manual focus override removed',      !has('applyConstraints') && !has('pointsOfInterest') && !has("focusMode:'manual'"));
 test('Photo Download All button',         has('Download All Photos'));
 test('Per-photo download attr',           has('download='));
 test('Multi-qty lot title',               has('Lot of '));
@@ -176,6 +176,20 @@ test('Grade to eBay condition',       has('function gradeToEbayCondition(') && h
 test('eBay status bar (page)',        has('eBay connected') && has('Connect eBay Account'));
 test('Send to eBay Draft button',     has('Send to eBay Draft') && has('function sendEbay') || has('sendEbay('));
 test('eBay scopes configured',        has('sell.inventory') && has('sell.fulfillment'));
+test('eBay readonly scopes',          has('sell.inventory.readonly') && has('sell.account.readonly'));
+test('eBay account scope',            has('sell.account'));
+test('Inventory token from file only',has('Inventory/Sell API calls MUST use the OAuth token'));
+test('No env-token API fallback',     !has('access_token: EBAY_USER_TOKEN'));
+test('eBay setup-location route',      has('/ebay-setup-location'));
+test('Location API path xrt-clovis',   has('/sell/inventory/v1/location/xrt-clovis'));
+test('Location key env var',           has('EBAY_LOCATION_KEY') && has("process.env.EBAY_LOCATION_KEY = 'xrt-clovis'"));
+test('Location Clovis address',        has('93612') && has('XRT Electronics Clovis') && has('WAREHOUSE'));
+test('Draft uses location key',        has('merchantLocationKey: EBAY_LOCATION_KEY'));
+test('eBay debug route',               has('/ebay-debug'));
+test('Debug reports env token flag',   has('env_user_token_present'));
+test('Debug redacts token value',      has('tokens_file_contents_redacted') && has('access_token_length'));
+test('Debug reports auth scopes',      has('ebay_auth_scopes'));
+test('Debug reports auth header fmt',  has('authorization_header_format') && has('Bearer <access_token>'));
 
 section('SYNTAX CHECK');
 try {
