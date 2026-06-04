@@ -1624,8 +1624,15 @@ function parseEbayErrors(xml){
 }
 function ebayErrorCodes(xml){ return parseXmlAll(xml || '', 'ErrorCode'); }
 
-// POST an XML body to the Trading API (api.dll) with OAuth Bearer auth
+// POST an XML body to the Trading API (api.dll).
+// The Trading API requires the auth token INSIDE the XML body (RequesterCredentials),
+// not just in the Authorization header — otherwise it returns error 930. We inject it
+// right after the opening <...Request> element for every Trading call.
 function ebayTradingCall(callName, xmlBody, token, callback){
+  var creds = '<RequesterCredentials><eBayAuthToken>' + xmlEscape(token) + '</eBayAuthToken></RequesterCredentials>';
+  if(xmlBody.indexOf('<RequesterCredentials>') === -1){
+    xmlBody = xmlBody.replace(/(<[A-Za-z]+Request\b[^>]*>)/, '$1' + creds);
+  }
   var options = {
     hostname: EBAY_BASE.replace('https://', ''),
     path: '/ws/api.dll',
