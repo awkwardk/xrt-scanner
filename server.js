@@ -1377,7 +1377,14 @@ function processItem(item, callback) {
       promptLines.push('This item FAILED testing but has parts/repair demand. Title MUST include "For Parts or Repair" or "As-Is". Use parts/repair pricing around $'+partsRepairPrice+'. Include a clear AS-IS banner in the description.');
     }
     promptLines.push('Return an item_specifics object with key-value pairs for common eBay item specifics for this item type. Include: Brand, Model, MPN (model number), Type, Compatible Brand (if applicable), Features, Color, Connectivity, Form Factor, and any other specifics relevant to this item category. Use exact values eBay accepts — no vague descriptions.');
-    promptLines.push('Each item specific VALUE must be 65 characters or less. Features MUST be returned as an array of individual strings — NEVER a comma-separated string — with each feature a short phrase of at most 10 words. Example: "Features":["Noise Cancellation","Wireless","Magnetic Clip","App Control"]. Never exceed 65 characters in any single value.');
+    promptLines.push('Populate the REQUIRED item specifics for this item\'s category (use the best-matching list below):');
+    promptLines.push('- Business phones (VoIP / desk phones): Brand, Model, MPN, Type, Compatible Brand, Number of Lines, Connectivity, Color, Condition');
+    promptLines.push('- Network switches / routers: Brand, Model, MPN, Type, Number of Ports, Connectivity, Transfer Rate, Compatible Brand, Form Factor');
+    promptLines.push('- Audio equipment: Brand, Model, MPN, Type, Connectivity, Color, Features, Compatible Brand');
+    promptLines.push('- Video equipment: Brand, Model, MPN, Type, Resolution, Connectivity, Color, Compatible Brand');
+    promptLines.push('- Business / Industrial electronics: Brand, Model, MPN, Type, Compatible Brand, Features, Color, Form Factor');
+    promptLines.push('Every value must be SPECIFIC and ACCURATE for this exact item — never vague (e.g. use "8 Ports" not "Multiple", "Gigabit Ethernet" not "Fast"). Omit a field only if it genuinely does not apply.');
+    promptLines.push('Each item specific VALUE must be 65 characters or less. Features MUST be returned as an array of individual short strings — NEVER a comma-separated string — with each feature a short phrase of at most 10 words. Example: "Features":["Noise Cancellation","Wireless","Magnetic Clip","App Control"]. Never exceed 65 characters in any single value.');
     promptLines.push('Include these fields in the JSON: shipping_policy, listed_weight, listed_weight_unit, box_dimensions, shipping_profile_id, polymailer, category_id, parts_repair, item_specifics.');
 
     promptLines = promptLines.concat([
