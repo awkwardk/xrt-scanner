@@ -1507,6 +1507,7 @@ function processItem(item, callback) {
     promptLines.push('Listed weight: ' + (shipInfo.listed_weight != null ? shipInfo.listed_weight + ' ' + shipInfo.listed_weight_unit : 'to be confirmed'));
     promptLines.push('Box dimensions: ' + (shipInfo.box_dimensions || 'to be confirmed'));
     promptLines.push('Return the most specific eBay LEAF category ID for this item. Do not return parent/broad categories. Examples of correct leaf categories: 177 (PC Laptops), 9355 (Cell Phones), 182091 (Enterprise Network Switches), 80258 (IP/VoIP Business Phones), 14969 (Home Audio Equipment). Always use the most specific subcategory available. Include category_id in the JSON.');
+    promptLines.push('Title: include brand, model number, key descriptive terms, and a condition hint. Format: [Brand] [Model] [Type] [Key Feature] [Condition]. Example: "Cisco WS-C2960-24TT-L 24-Port Network Switch Used Working". Max 80 characters; front-load the most important search terms.');
     if(meta.powerTest === 'N/A' && (idItem.sealed || meta.grade === 'A')){
       promptLines.push('This item is NEW/UNUSED — NEVER use the word "untested". Use new/unused language such as "New, unused — original sealed packaging", "New, unused — opened for inspection only", or "New old stock — unused, may show storage wear on packaging".');
     }
@@ -1937,6 +1938,75 @@ function uploadAllPhotos(record, sku, token, callback){
   next();
 }
 
+// Ask eBay for the best LEAF category for an item title (GetSuggestedCategories).
+// Returns the highest PercentItemFound match -> {id, name, percent}. Guarantees a leaf.
+function getSuggestedCategory(title, token, callback){
+  var xml = '<?xml version="1.0" encoding="utf-8"?>'
+    + '<GetSuggestedCategoriesRequest xmlns="urn:ebay:apis:eBLBaseComponents">'
+    + '<Query>' + xmlEscape(String(title || '').slice(0, 350)) + '</Query>'
+    + '</GetSuggestedCategoriesRequest>';
+  ebayTradingCall('GetSuggestedCategories', xml, token, function(err, sc, body){
+    if(err){ callback(err); return; }
+    var ack = parseXmlTag(body, 'Ack') || '';
+    var cats = parseXmlAll(body, 'SuggestedCategory').map(function(s){
+      return { id: parseXmlTag(s, 'CategoryID'), name: parseXmlTag(s, 'CategoryName'), pct: parseFloat(parseXmlTag(s, 'PercentItemFound')) || 0 };
+    }).filter(function(c){ return c.id; });
+    cats.sort(function(a, b){ return b.pct - a.pct; }); // highest percentage match first
+    if((ack === 'Success' || ack === 'Warning') && cats.length){
+      callback(null, {id: cats[0].id, name: cats[0].name || '', percent: cats[0].pct});
+      return;
+    }
+    callback(new Error('GetSuggestedCategories Ack=' + (ack || '?') + ': ' + (parseEbayErrors(body).join('; ') || ('HTTP ' + sc))));
+  });
+}
+
+// Valid ConditionIDs for a category (GetCategoryFeatures) -> ['1000','3000',...]
+function getCategoryFeatures(categoryId, token, callback){
+  var xml = '<?xml version="1.0" encoding="utf-8"?>'
+    + '<GetCategoryFeaturesRequest xmlns="urn:ebay:apis:eBLBaseComponents">'
+    + '<CategoryID>' + xmlEscape(categoryId) + '</CategoryID>'
+    + '<DetailLevel>ReturnAll</DetailLevel>'
+    + '<FeatureID>ConditionValues</FeatureID>'
+    + '</GetCategoryFeaturesRequest>';
+  ebayTradingCall('GetCategoryFeatures', xml, token, function(err, sc, body){
+    if(err){ callback(err); return; }
+    var ack = parseXmlTag(body, 'Ack') || '';
+    var cvBlock = parseXmlTag(body, 'ConditionValues') || '';
+    var ids = parseXmlAll(cvBlock, 'Condition').map(function(c){ return (parseXmlTag(c, 'ID') || '').trim(); }).filter(Boolean);
+    if(ack === 'Success' || ack === 'Warning'){ callback(null, ids); return; }
+    callback(new Error('GetCategoryFeatures Ack=' + (ack || '?')));
+  });
+}
+// Choose a valid condition ID for the grade, constrained to the category's allowed set
+function pickValidCondition(grade, partsRepair, validIds){
+  var prefByGrade = { A:[1000,1500,2000,2500,3000], B:[3000,2500,2000,4000,5000,1000], C:[5000,6000,3000,4000,7000], D:[7000,6000,5000] };
+  var pref = partsRepair ? [7000,6000,5000] : (prefByGrade[grade] || [3000,5000,1000]);
+  if(validIds && validIds.length){
+    for(var i = 0; i < pref.length; i++){ if(validIds.indexOf(String(pref[i])) >= 0) return parseInt(pref[i], 10); }
+    return parseInt(validIds[0], 10); // any valid condition the category accepts
+  }
+  return conditionIdForCategory(grade, null, partsRepair);
+}
+// Required + recommended item-specific names for a category (GetCategorySpecifics)
+function getCategorySpecifics(categoryId, token, callback){
+  var xml = '<?xml version="1.0" encoding="utf-8"?>'
+    + '<GetCategorySpecificsRequest xmlns="urn:ebay:apis:eBLBaseComponents">'
+    + '<CategoryID>' + xmlEscape(categoryId) + '</CategoryID>'
+    + '</GetCategorySpecificsRequest>';
+  ebayTradingCall('GetCategorySpecifics', xml, token, function(err, sc, body){
+    if(err){ callback(err); return; }
+    var ack = parseXmlTag(body, 'Ack') || '';
+    var required = [], recommended = [];
+    parseXmlAll(body, 'NameRecommendation').forEach(function(rc){
+      var name = parseXmlTag(rc, 'Name'); if(!name) return;
+      var minv = parseInt(parseXmlTag(rc, 'MinValues') || '0', 10);
+      if(minv >= 1) required.push(name); else recommended.push(name);
+    });
+    if(ack === 'Success' || ack === 'Warning'){ callback(null, {required: required, recommended: recommended}); return; }
+    callback(new Error('GetCategorySpecifics Ack=' + (ack || '?')));
+  });
+}
+
 // Create a live eBay listing via Trading API AddItem (with error-recovery retries)
 function createEbayListing(sku, callback){
   var itemDir = path.join(DATA_DIR, 'items', String(sku));
@@ -1967,18 +2037,18 @@ function createEbayListing(sku, callback){
         console.log('[EBAY] WARNING: SKU', sku, 'has 0 photos — submitting without images');
       }
       var policies = readEbayPolicies();
-      // Known-valid eBay LEAF categories tried in order on error 87 (not-a-leaf).
-      // 293 is NOT a leaf; 183446 (Other Consumer Electronics) is a confirmed leaf
-      // that accepts all condition IDs and is the final fallback.
-      var categoryFallbacks = [ (listing.category_id || 183446), 9394, 175672, 58058, 183446 ];
       var condFallbacks = [ 3000, 1000 ];                            // invalid condition -> 3000, then 1000
-      var catIdx = 0, condIdx = -1, titleTrunc = false, refreshed = false, triedPolicies = false, reviseId = null;
+      var condIdx = -1, titleTrunc = false, refreshed = false, triedPolicies = false, reviseId = null, triedLeafFallback = false;
+      // Category + condition resolved via eBay APIs below (guarantees valid leaf + condition).
+      var categoryId = listing.category_id || 183446;
+      var forcedCondition = null; // from GetCategoryFeatures
+      var meta = record.meta || {};
 
       function attempt(){
         var opts = {
           pictureUrls: pictureUrls,
-          categoryId: categoryFallbacks[catIdx],
-          conditionId: condIdx >= 0 ? condFallbacks[condIdx] : null,
+          categoryId: categoryId,
+          conditionId: condIdx >= 0 ? condFallbacks[condIdx] : (forcedCondition || null),
           policies: policies,
           reviseItemId: reviseId
         };
@@ -2014,13 +2084,13 @@ function createEbayListing(sku, callback){
             fetchEbayPolicies(function(pe, pol){ if(!pe && pol) policies = pol; attempt(); });
             return;
           }
-          // Category invalid / not a leaf category (error 87) -> walk the known-leaf fallback
-          // chain (… -> 183446 Other Consumer Electronics). Log the offending category so the
-          // AI prompt can be improved over time.
-          if((/category|not a leaf|\b87\b/.test(blob)) && catIdx < categoryFallbacks.length - 1){
-            console.log('[EBAY] CATEGORY ERROR for SKU', sku, '- category', categoryFallbacks[catIdx],
-              'rejected (' + (msgs.join('; ') || ('code ' + ebayErrorCodes(body).join(','))) + ') — retrying with category', categoryFallbacks[catIdx + 1]);
-            catIdx++;
+          // Category not a leaf (error 87) — rare since GetSuggestedCategories returns leaves.
+          // Single fallback to 183446 (confirmed leaf, accepts all condition IDs).
+          if((/category|not a leaf|\b87\b/.test(blob)) && String(categoryId) !== '183446' && !triedLeafFallback){
+            triedLeafFallback = true;
+            console.log('[EBAY] CATEGORY ERROR for SKU', sku, '- category', categoryId,
+              'rejected (' + (msgs.join('; ') || ('code ' + ebayErrorCodes(body).join(','))) + ') — falling back to 183446');
+            categoryId = 183446;
             attempt(); return;
           }
           // Condition invalid for category -> retry 3000, then 1000
@@ -2045,7 +2115,47 @@ function createEbayListing(sku, callback){
           callback(new Error('eBay ' + callName + ' failed: ' + (msgs.join(' | ') || ('HTTP ' + sc))));
         });
       }
-      attempt();
+
+      // Resolve category (GetSuggestedCategories) -> valid conditions (GetCategoryFeatures)
+      // -> required item specifics (GetCategorySpecifics), then list. Each eBay lookup that
+      // fails degrades gracefully without blocking the listing.
+      getSuggestedCategory(record.listing.title, token, function(scErr, cat){
+        if(!scErr && cat && cat.id){
+          categoryId = cat.id;
+          record.ebay_category_id = cat.id;
+          record.ebay_category_name = cat.name;
+          console.log('[EBAY] suggested category for SKU', sku, '->', cat.id, '(' + cat.name + ', ' + cat.percent + '%)');
+        } else {
+          categoryId = 183446;
+          record.ebay_category_id = 183446;
+          record.ebay_category_name = 'Other Consumer Electronics (fallback)';
+          console.log('[EBAY] GetSuggestedCategories failed for SKU', sku, '-', scErr ? scErr.message : 'no result', '— falling back to 183446');
+        }
+        // Valid conditions for this category -> pick one matching our grade
+        getCategoryFeatures(categoryId, token, function(fErr, validIds){
+          if(!fErr && validIds && validIds.length){
+            record.ebay_valid_conditions = validIds;
+            forcedCondition = pickValidCondition(meta.grade, listing.parts_repair, validIds);
+            console.log('[EBAY] category', categoryId, 'valid conditions', validIds.join(','), '-> using', forcedCondition);
+          } else {
+            console.log('[EBAY] GetCategoryFeatures unavailable for', categoryId, '-', fErr ? fErr.message : 'none', '— using default condition mapping');
+          }
+          // Required item specifics for this category -> add any missing with "Not Specified"
+          getCategorySpecifics(categoryId, token, function(spErr, specs){
+            if(!spErr && specs){
+              record.ebay_required_specifics = specs.required;
+              var is = record.listing.item_specifics = record.listing.item_specifics || {};
+              var have = Object.keys(is).map(function(k){ return k.toLowerCase(); });
+              specs.required.forEach(function(name){
+                if(have.indexOf(String(name).toLowerCase()) < 0){ is[name] = 'Not Specified'; }
+              });
+              if(specs.required.length) console.log('[EBAY] category', categoryId, 'required specifics:', specs.required.join(', '));
+            }
+            try { fs.writeFileSync(listingPath, JSON.stringify(record, null, 2)); } catch(_e){}
+            attempt();
+          });
+        });
+      });
     });
   });
 }
@@ -2150,17 +2260,25 @@ function generateListingsPage(listings, ebayStat){
     var perUnitTotal = quantity > 1 ?
       '<span><b>Per Unit:</b> $'+price+'</span><span><b>Total:</b> $'+(price*quantity)+'</span><span><b>Qty:</b> '+quantity+'</span>' : '';
 
-    // Collapsible eBay item specifics (review before publishing)
+    // Collapsible eBay details: category (name + ID) + item specifics (required marked)
     var spec = (listing.item_specifics && typeof listing.item_specifics === 'object') ? listing.item_specifics : {};
     var specKeys = Object.keys(spec);
+    var catId = r.ebay_category_id || listing.category_id || '';
+    var catName = r.ebay_category_name || '';
+    var reqList = Array.isArray(r.ebay_required_specifics) ? r.ebay_required_specifics.map(function(n){ return String(n).toLowerCase(); }) : [];
+    var detailRows = '';
+    if(catId){
+      detailRows += '<tr><td style="border:1px solid #e0e0e0;padding:5px 8px;font-weight:bold;width:35%;background:#eef5ff;">eBay Category</td><td style="border:1px solid #e0e0e0;padding:5px 8px;background:#eef5ff;">'+(catName?catName+' ':'')+'('+catId+')</td></tr>';
+    }
+    specKeys.forEach(function(k){
+      var v = spec[k]; v = Array.isArray(v) ? v.join(', ') : v;
+      var reqTag = reqList.indexOf(k.toLowerCase()) >= 0 ? ' <span style="color:#c62828;font-size:11px;">(required)</span>' : '';
+      detailRows += '<tr><td style="border:1px solid #e0e0e0;padding:5px 8px;font-weight:bold;width:35%;background:#fafafa;">'+k+reqTag+'</td><td style="border:1px solid #e0e0e0;padding:5px 8px;">'+v+'</td></tr>';
+    });
     var specHtml = '';
-    if(specKeys.length){
-      var specRows = specKeys.map(function(k){
-        var v = spec[k]; v = Array.isArray(v) ? v.join(', ') : v;
-        return '<tr><td style="border:1px solid #e0e0e0;padding:5px 8px;font-weight:bold;width:35%;background:#fafafa;">'+k+'</td><td style="border:1px solid #e0e0e0;padding:5px 8px;">'+v+'</td></tr>';
-      }).join('');
-      specHtml = '<details style="margin-top:12px;"><summary style="cursor:pointer;font-size:12px;font-weight:bold;color:#1565c0;letter-spacing:0.04em;">Item Specifics ('+specKeys.length+')</summary>'
-        +'<table style="border-collapse:collapse;width:100%;font-size:12.5px;color:#444;margin-top:8px;">'+specRows+'</table></details>';
+    if(detailRows){
+      specHtml = '<details style="margin-top:12px;"><summary style="cursor:pointer;font-size:12px;font-weight:bold;color:#1565c0;letter-spacing:0.04em;">eBay Details &mdash; Category &amp; Item Specifics ('+specKeys.length+')</summary>'
+        +'<table style="border-collapse:collapse;width:100%;font-size:12.5px;color:#444;margin-top:8px;">'+detailRows+'</table></details>';
     }
 
     // eBay draft button (only when connected — Feature 8)
@@ -2190,6 +2308,7 @@ function generateListingsPage(listings, ebayStat){
       +'<span><b>Shelf:</b> '+(meta.shelf||'&mdash;')+'</span>'
       +((r.weight||meta.weight)?'<span><b>Weight:</b> '+(r.weight||meta.weight)+'</span>':'')
       +'<span><b>Custom SKU:</b> '+(listing.custom_sku||(skuStr+(meta.shelf?'-'+meta.shelf:'')))+'</span>'
+      +((r.ebay_category_id||listing.category_id)?'<span><b>eBay Category:</b> '+(r.ebay_category_name?r.ebay_category_name+' ':'')+'('+(r.ebay_category_id||listing.category_id)+')</span>':'')
       +(listing.shipping_policy?'<span><b>Ship:</b> '+listing.shipping_policy+'</span>':'')
       +(listing.listed_weight!=null?'<span><b>Listed Wt:</b> '+listing.listed_weight+' '+(listing.listed_weight_unit||'oz')+'</span>':'')
       +(listing.box_dimensions?'<span><b>Box:</b> '+listing.box_dimensions+'</span>':'')
