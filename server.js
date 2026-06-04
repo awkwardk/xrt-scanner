@@ -680,7 +680,10 @@ const server = http.createServer(function(req, res) {
       if(!image || image.length < 100){ sendJSON(res,200,{error:'no_image'}); return; }
       var idPrompt = [
         'You are an electronics identification expert for an eBay resale warehouse.',
-        'Examine this image carefully.',
+        '1. Read ALL visible text in the image exactly as printed. Do not interpret, infer, or substitute characters. If you see A1 printed, return A1 not A7 or M1.',
+        '2. Use the exact text you read to identify the brand and model.',
+        '3. Use visual context only to fill in category and details that are not visible as text.',
+        'Character accuracy is critical — never substitute similar-looking characters (1 vs 7, 1 vs I, 0 vs O, A vs M, etc).',
         'Return ONLY this JSON, no markdown:',
         '{',
         '  "item_name": "full descriptive name with brand and model",',
