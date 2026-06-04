@@ -2103,9 +2103,13 @@ function findCompletedItemsCategory(itemName, appId, callback){
       var counts = {}, names = {};
       items.forEach(function(it){
         try {
-          var cat = (it.categories && it.categories.length) ? it.categories[it.categories.length - 1] : null;
-          var id = cat ? cat.categoryId : ((it.leafCategoryIds && it.leafCategoryIds[0]) || null);
-          var nm = cat ? cat.categoryName : '';
+          var cats = (it.categories && it.categories.length) ? it.categories : [];
+          var lastCat = cats.length ? cats[cats.length - 1] : null;
+          // Prefer the dedicated leafCategoryIds[0]; fall back to the last (leaf-most) categories entry
+          var id = (it.leafCategoryIds && it.leafCategoryIds[0]) ? it.leafCategoryIds[0] : (lastCat ? lastCat.categoryId : null);
+          var nm = '';
+          for(var ci = 0; ci < cats.length; ci++){ if(cats[ci].categoryId === id){ nm = cats[ci].categoryName; break; } }
+          if(!nm && lastCat){ nm = lastCat.categoryName; }
           if(id){ counts[id] = (counts[id]||0) + 1; names[id] = nm || names[id] || ''; }
         } catch(e){}
       });
