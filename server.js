@@ -939,7 +939,7 @@ const server = http.createServer(function(req, res) {
           if(result && result.category_id){
             data.ebay_category_id = result.category_id;
             data.ebay_category_name = result.category_name;
-            data.category_source = 'ebay_completed';
+            data.category_source = 'ebay_browse';
             data.category_search_level = result.search_level;
             if(result.price_reliable){
               data.estimated_low = result.price_low;
@@ -948,13 +948,22 @@ const server = http.createServer(function(req, res) {
             } else {
               data.pricing_source = 'web_search'; // keep the existing AI/web-search estimate
             }
-            validateLeafCategory(result.category_id, function(_vErr, isLeaf){
-              data.category_confirmed = !!isLeaf;
-              data.category_needs_review = !isLeaf;
-              if(isLeaf) console.log('[IDENTIFY] Category', result.category_id, '(' + result.category_name + ') confirmed leaf — Level', result.search_level, 'match');
-              else console.log('[IDENTIFY] Category', result.category_id, 'is not a leaf — flagged for review');
+            // eBay's Browse API already designates leafCategoryIds as leaf categories —
+            // trust it and skip GetCategoryFeatures validation entirely.
+            if(result.ebay_confirmed_leaf === true){
+              data.category_confirmed = true;
+              data.category_needs_review = false;
+              console.log('[IDENTIFY] Category ' + result.category_id + ' (' + result.category_name + ') confirmed leaf by Browse API — skipping validation');
               finishIdentify();
-            });
+            } else {
+              validateLeafCategory(result.category_id, function(_vErr, isLeaf){
+                data.category_confirmed = !!isLeaf;
+                data.category_needs_review = !isLeaf;
+                if(isLeaf) console.log('[IDENTIFY] Category', result.category_id, '(' + result.category_name + ') confirmed leaf — Level', result.search_level, 'match');
+                else console.log('[IDENTIFY] Category', result.category_id, 'is not a leaf — flagged for review');
+                finishIdentify();
+              });
+            }
           } else {
             data.ebay_category_id = null;
             data.category_source = 'web_search';
@@ -2088,7 +2097,6 @@ function findCompletedItemsCategory(itemName, appId, callback){
           try {
             var j = JSON.parse(d);
             var itemSummaries = Array.isArray(j.itemSummaries) ? j.itemSummaries : [];
-            if(itemSummaries.length){ console.log('[BROWSE RAW ITEM]', JSON.stringify(itemSummaries[0], null, 2)); }
             done(itemSummaries);
           } catch(e){
             console.log('[BROWSE API] Parse error — HTTP', resp.statusCode, '— Content-Type:', (resp.headers && resp.headers['content-type']) || 'n/a');
@@ -2102,22 +2110,23 @@ function findCompletedItemsCategory(itemName, appId, callback){
     }
     // Majority-vote the leaf category across the returned item summaries
     function majorityCategory(items){
-      var counts = {}, names = {};
+      var counts = {}, names = {}, fromLeaf = {};
       items.forEach(function(it){
         try {
           var cats = (it.categories && it.categories.length) ? it.categories : [];
           var lastCat = cats.length ? cats[cats.length - 1] : null;
           // Prefer the dedicated leafCategoryIds[0]; fall back to the last (leaf-most) categories entry
-          var id = (it.leafCategoryIds && it.leafCategoryIds[0]) ? it.leafCategoryIds[0] : (lastCat ? lastCat.categoryId : null);
+          var leafId = (it.leafCategoryIds && it.leafCategoryIds[0]) ? it.leafCategoryIds[0] : null;
+          var id = leafId || (lastCat ? lastCat.categoryId : null);
           var nm = '';
           for(var ci = 0; ci < cats.length; ci++){ if(cats[ci].categoryId === id){ nm = cats[ci].categoryName; break; } }
           if(!nm && lastCat){ nm = lastCat.categoryName; }
-          if(id){ counts[id] = (counts[id]||0) + 1; names[id] = nm || names[id] || ''; }
+          if(id){ counts[id] = (counts[id]||0) + 1; names[id] = nm || names[id] || ''; if(leafId){ fromLeaf[id] = true; } }
         } catch(e){}
       });
       var best = null, bestN = 0;
       Object.keys(counts).forEach(function(id){ if(counts[id] > bestN){ bestN = counts[id]; best = id; } });
-      return best ? { id: best, name: names[best] || '' } : null;
+      return best ? { id: best, name: names[best] || '', ebay_confirmed_leaf: fromLeaf[best] === true } : null;
     }
     function stripModel(name){ return String(name||'').split(/\s+/).filter(function(t){ return !/^[A-Za-z]{0,3}[\d][\w\-]{1,}$/.test(t); }).join(' ').trim(); }
     function typeOnly(name){ var t = String(name||'').split(/\s+/).filter(Boolean); return t.slice(Math.max(0, t.length - 3)).join(' ').trim(); }
@@ -2126,17 +2135,17 @@ function findCompletedItemsCategory(itemName, appId, callback){
     search(q1, function(items1){
       console.log('[IDENTIFY] Level 1 search "' + q1 + '" returned ' + (items1 ? items1.length : 0) + ' results');
       var cat1 = items1 && items1.length ? majorityCategory(items1) : null;
-      if(cat1){ callback(null, { category_id: cat1.id, category_name: cat1.name, search_level: 1, price_reliable: false, sold_count: items1.length, source: 'ebay_browse' }); return; }
+      if(cat1){ callback(null, { category_id: cat1.id, category_name: cat1.name, search_level: 1, price_reliable: false, sold_count: items1.length, source: 'ebay_browse', ebay_confirmed_leaf: cat1.ebay_confirmed_leaf === true }); return; }
       var q2 = stripModel(q1);
       search(q2, function(items2){
         console.log('[IDENTIFY] Level 2 search "' + q2 + '" returned ' + (items2 ? items2.length : 0) + ' results');
         var cat2 = items2 && items2.length ? majorityCategory(items2) : null;
-        if(cat2){ callback(null, { category_id: cat2.id, category_name: cat2.name, search_level: 2, price_reliable: false, sold_count: items2.length, source: 'ebay_browse' }); return; }
+        if(cat2){ callback(null, { category_id: cat2.id, category_name: cat2.name, search_level: 2, price_reliable: false, sold_count: items2.length, source: 'ebay_browse', ebay_confirmed_leaf: cat2.ebay_confirmed_leaf === true }); return; }
         var q3 = typeOnly(q2);
         search(q3, function(items3){
           console.log('[IDENTIFY] Level 3 search "' + q3 + '" returned ' + (items3 ? items3.length : 0) + ' results');
           var cat3 = items3 && items3.length ? majorityCategory(items3) : null;
-          if(cat3){ callback(null, { category_id: cat3.id, category_name: cat3.name, search_level: 3, price_reliable: false, sold_count: items3.length, source: 'ebay_browse' }); return; }
+          if(cat3){ callback(null, { category_id: cat3.id, category_name: cat3.name, search_level: 3, price_reliable: false, sold_count: items3.length, source: 'ebay_browse', ebay_confirmed_leaf: cat3.ebay_confirmed_leaf === true }); return; }
           console.log('[IDENTIFY] All levels exhausted for "' + itemName + '" — no eBay Browse listings found');
           callback(null, null);
         });
@@ -2306,6 +2315,18 @@ function createEbayListing(sku, callback){
         || (meta.identified_item && meta.identified_item.ebay_category_id)
         || (listing && listing.category_id)
         || null;
+      var catSource = record.category_source
+        || (meta.identified_item && meta.identified_item.category_source)
+        || null;
+      if(knownCat && catSource === 'ebay_browse'){
+        // eBay's Browse API leafCategoryIds are leaf categories by definition — trust, skip validation.
+        console.log('[EBAY] SKU', sku, 'using known category', knownCat, '(leaf confirmed by Browse API — skipping validation)');
+        getCategoryFeatures(knownCat, token, function(fe, feat){
+          var nm = record.ebay_category_name || (meta.identified_item && meta.identified_item.ebay_category_name) || '';
+          finalizeCategory(knownCat, nm, (feat && feat.conditions) || []);
+        });
+        return;
+      }
       if(knownCat){
         validateLeafCategory(knownCat, function(_kErr, isLeaf){
           if(isLeaf){
