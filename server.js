@@ -1506,7 +1506,7 @@ function processItem(item, callback) {
     promptLines.push('Shipping policy: ' + shipInfo.shipping_policy);
     promptLines.push('Listed weight: ' + (shipInfo.listed_weight != null ? shipInfo.listed_weight + ' ' + shipInfo.listed_weight_unit : 'to be confirmed'));
     promptLines.push('Box dimensions: ' + (shipInfo.box_dimensions || 'to be confirmed'));
-    promptLines.push('Suggest the most appropriate eBay category ID for this item from standard electronics categories. Include category_id in the JSON.');
+    promptLines.push('Return the most specific eBay LEAF category ID for this item. Do not return parent/broad categories. Examples of correct leaf categories: 177 (PC Laptops), 9355 (Cell Phones), 182091 (Enterprise Network Switches), 80258 (IP/VoIP Business Phones), 14969 (Home Audio Equipment). Always use the most specific subcategory available. Include category_id in the JSON.');
     if(meta.powerTest === 'N/A' && (idItem.sealed || meta.grade === 'A')){
       promptLines.push('This item is NEW/UNUSED — NEVER use the word "untested". Use new/unused language such as "New, unused — original sealed packaging", "New, unused — opened for inspection only", or "New old stock — unused, may show storage wear on packaging".');
     }
@@ -2009,10 +2009,12 @@ function createEbayListing(sku, callback){
             fetchEbayPolicies(function(pe, pol){ if(!pe && pol) policies = pol; attempt(); });
             return;
           }
-          // Category invalid -> retry with parent/default 293
-          if(/category/.test(blob) && catIdx < categoryFallbacks.length - 1){
+          // Category invalid / not a leaf category (error 87) -> retry with 293 (Consumer Electronics).
+          // Log the offending category so the AI prompt can be improved over time.
+          if((/category|not a leaf|\b87\b/.test(blob)) && catIdx < categoryFallbacks.length - 1){
+            console.log('[EBAY] CATEGORY ERROR for SKU', sku, '- category', categoryFallbacks[catIdx],
+              'rejected (' + (msgs.join('; ') || ('code ' + ebayErrorCodes(body).join(','))) + ') — retrying with 293 (Consumer Electronics)');
             catIdx++;
-            console.log('[EBAY] category invalid — retrying with category', categoryFallbacks[catIdx]);
             attempt(); return;
           }
           // Condition invalid for category -> retry 3000, then 1000
