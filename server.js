@@ -252,18 +252,87 @@ function ebayCall(method, urlPath, bodyObj, callback){
 function ebayHasError(r, id){
   return !!(r && Array.isArray(r.errors) && r.errors.some(function(e){ return e.errorId === id; }));
 }
+// Split a string into pieces each <= limit chars, breaking at natural points
+// (commas first, then spaces; a single over-long token is hard-sliced as a last resort).
+function splitToLimit(str, limit){
+  str = String(str == null ? '' : str).trim();
+  if(!str) return [];
+  if(str.length <= limit) return [str];
+  var out = [];
+  var commaParts = str.split(',').map(function(s){ return s.trim(); }).filter(Boolean);
+  if(commaParts.length > 1){
+    commaParts.forEach(function(p){ out = out.concat(splitToLimit(p, limit)); });
+    return out;
+  }
+  // No usable commas — pack words up to the limit
+  var words = str.split(/\s+/);
+  var cur = '';
+  words.forEach(function(w){
+    if(w.length > limit){ // single word longer than the limit
+      if(cur){ out.push(cur); cur = ''; }
+      for(var i = 0; i < w.length; i += limit) out.push(w.slice(i, i + limit));
+      return;
+    }
+    if((cur ? cur.length + 1 : 0) + w.length <= limit){ cur = cur ? cur + ' ' + w : w; }
+    else { if(cur) out.push(cur); cur = w; }
+  });
+  if(cur) out.push(cur);
+  return out;
+}
+
 // eBay enforces a 65-character maximum per item-specific (aspect) value.
-// Normalize every value to a string array and hard-trim each entry to 65 chars.
+// Splits over-long values at natural break points, always splits Features on
+// commas into separate entries, and removes empty/duplicate values.
 function trimAspects(aspects){
+  var LIMIT = 65;
   var out = {};
   Object.keys(aspects || {}).forEach(function(k){
-    var arr = aspects[k];
-    if(!Array.isArray(arr)) arr = [arr];
-    var cleaned = arr.map(function(v){ return String(v == null ? '' : v).trim().slice(0, 65); })
-                     .filter(function(v){ return v.length > 0; });
+    var raw = aspects[k];
+    if(!Array.isArray(raw)) raw = [raw];
+    var vals = [];
+    raw.forEach(function(v){
+      if(v === null || v === undefined) return;
+      var s = String(v).trim();
+      if(!s) return;
+      // Features (or any comma-separated value) -> split on commas into separate entries
+      if(k === 'Features' || s.indexOf(',') >= 0){
+        s.split(',').forEach(function(part){
+          part = part.trim();
+          if(part) vals = vals.concat(splitToLimit(part, LIMIT));
+        });
+      } else {
+        vals = vals.concat(splitToLimit(s, LIMIT));
+      }
+    });
+    // remove empties + dedupe (preserve order)
+    var seen = {}, cleaned = [];
+    vals.forEach(function(v){ v = String(v).trim(); if(v && !seen[v]){ seen[v] = 1; cleaned.push(v); } });
     if(cleaned.length) out[k] = cleaned;
   });
   return out;
+}
+
+// Pre-flight validation before publishing an offer. Returns an array of
+// human-readable problems, or null if everything is OK.
+function validateForPublish(record){
+  var listing = (record && record.listing) || {};
+  var problems = [];
+  var title = listing.title || '';
+  if(!title){ problems.push('Title is missing.'); }
+  else if(title.length > 80){ problems.push('Title is ' + title.length + ' characters (max 80) — shorten it.'); }
+  var price = parseFloat(listing.suggested_price || listing.avg_sold_price || 0);
+  if(!(price > 0)){ problems.push('Price must be greater than 0 (set suggested_price or avg_sold_price).'); }
+  // Aspects: after trimAspects every value must be <= 65 chars
+  var aspects = {};
+  var spec = listing.item_specifics || {};
+  Object.keys(spec).forEach(function(k){ var v = spec[k]; if(v === null || v === undefined || v === '') return; aspects[k] = Array.isArray(v) ? v.map(String) : [String(v)]; });
+  aspects = trimAspects(aspects);
+  Object.keys(aspects).forEach(function(k){
+    aspects[k].forEach(function(v){
+      if(String(v).length > 65){ problems.push('Item specific "' + k + '" has a value over 65 characters: "' + String(v).slice(0, 40) + '...".'); }
+    });
+  });
+  return problems.length ? problems : null;
 }
 
 // Map processor grade letter → eBay Inventory API condition enum + Trading condition ID
@@ -1308,7 +1377,7 @@ function processItem(item, callback) {
       promptLines.push('This item FAILED testing but has parts/repair demand. Title MUST include "For Parts or Repair" or "As-Is". Use parts/repair pricing around $'+partsRepairPrice+'. Include a clear AS-IS banner in the description.');
     }
     promptLines.push('Return an item_specifics object with key-value pairs for common eBay item specifics for this item type. Include: Brand, Model, MPN (model number), Type, Compatible Brand (if applicable), Features, Color, Connectivity, Form Factor, and any other specifics relevant to this item category. Use exact values eBay accepts — no vague descriptions.');
-    promptLines.push('Each item specific VALUE must be 65 characters or less. For Features, return an ARRAY of separate short values (each under 65 chars) instead of one long comma-separated string — e.g. "Features":["Noise Cancellation","Wireless","Magnetic Clip","App Control"]. Never exceed 65 characters in any single value.');
+    promptLines.push('Each item specific VALUE must be 65 characters or less. Features MUST be returned as an array of individual strings — NEVER a comma-separated string — with each feature a short phrase of at most 10 words. Example: "Features":["Noise Cancellation","Wireless","Magnetic Clip","App Control"]. Never exceed 65 characters in any single value.');
     promptLines.push('Include these fields in the JSON: shipping_policy, listed_weight, listed_weight_unit, box_dimensions, shipping_profile_id, polymailer, category_id, parts_repair, item_specifics.');
 
     promptLines = promptLines.concat([
@@ -1573,6 +1642,10 @@ function publishEbayOffer(sku, callback){
   var record; try { record = JSON.parse(fs.readFileSync(listingPath,'utf8')); } catch(e){ callback(new Error('Bad listing.json')); return; }
   var offerId = record.ebay_offer_id;
   if(!offerId){ callback(new Error('No eBay draft offer for this SKU — create the draft first')); return; }
+
+  // Pre-flight validation — block publish with a specific, fixable message
+  var problems = validateForPublish(record);
+  if(problems){ callback(new Error('Cannot publish — fix these before publishing: ' + problems.join(' '))); return; }
 
   function savePublished(r){
     var listingId = (r && r.listingId) ? r.listingId : null;
