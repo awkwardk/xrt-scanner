@@ -2103,7 +2103,7 @@ function findCompletedItemsCategory(itemName, appId, callback){
       var counts = {}, names = {};
       items.forEach(function(it){
         try {
-          var cat = (it.categories && it.categories[0]) ? it.categories[0] : null;
+          var cat = (it.categories && it.categories.length) ? it.categories[it.categories.length - 1] : null;
           var id = cat ? cat.categoryId : ((it.leafCategoryIds && it.leafCategoryIds[0]) || null);
           var nm = cat ? cat.categoryName : '';
           if(id){ counts[id] = (counts[id]||0) + 1; names[id] = nm || names[id] || ''; }
