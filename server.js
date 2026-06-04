@@ -1272,7 +1272,8 @@ function processItem(item, callback) {
     if(isPartsRepair){
       promptLines.push('This item FAILED testing but has parts/repair demand. Title MUST include "For Parts or Repair" or "As-Is". Use parts/repair pricing around $'+partsRepairPrice+'. Include a clear AS-IS banner in the description.');
     }
-    promptLines.push('Include these fields in the JSON: shipping_policy, listed_weight, listed_weight_unit, box_dimensions, shipping_profile_id, polymailer, category_id, parts_repair.');
+    promptLines.push('Return an item_specifics object with key-value pairs for common eBay item specifics for this item type. Include: Brand, Model, MPN (model number), Type, Compatible Brand (if applicable), Features, Color, Connectivity, Form Factor, and any other specifics relevant to this item category. Use exact values eBay accepts — no vague descriptions.');
+    promptLines.push('Include these fields in the JSON: shipping_policy, listed_weight, listed_weight_unit, box_dimensions, shipping_profile_id, polymailer, category_id, parts_repair, item_specifics.');
 
     promptLines = promptLines.concat([
       '',
@@ -1293,7 +1294,7 @@ function processItem(item, callback) {
       '</div>',
       '',
       'Search eBay sold listings then return ONLY this JSON, no markdown'+(quantity>1?' (avg_sold_price and prices are PER UNIT)':'')+':',
-      '{"title":"eBay title under 80 chars'+(quantity>1?', starts with Lot of '+quantity:'')+' with brand model key terms","condition_box":"2-3 honest sentences for eBay condition field","description_html":"completed HTML using structure above","avg_sold_price":45,"price_low":30,"price_high":65,"suggested_price":48,"accept_price":38,"decline_price":28,"shipping":"FedEx Ground","custom_sku":"'+customSku+'"}'
+      '{"title":"eBay title under 80 chars'+(quantity>1?', starts with Lot of '+quantity:'')+' with brand model key terms","condition_box":"2-3 honest sentences for eBay condition field","description_html":"completed HTML using structure above","avg_sold_price":45,"price_low":30,"price_high":65,"suggested_price":48,"accept_price":38,"decline_price":28,"shipping":"FedEx Ground","item_specifics":{"Brand":"value","Model":"value","MPN":"value","Type":"value"},"custom_sku":"'+customSku+'"}'
     ]);
 
     var listingPrompt = promptLines.join('\n');
@@ -1323,6 +1324,12 @@ function processItem(item, callback) {
       listing.box_dimensions = shipInfo.box_dimensions;
       listing.polymailer = !!shipInfo.polymailer;
       listing.category_id = parseInt(listing.category_id, 10) || 0;
+      // eBay item specifics (Feature: auto-population) — ensure a plain object
+      if(!listing.item_specifics || typeof listing.item_specifics !== 'object' || Array.isArray(listing.item_specifics)) listing.item_specifics = {};
+      // Seed Brand/Model/MPN from vision data when the model left them blank
+      if(!listing.item_specifics.Brand && visionData.brand) listing.item_specifics.Brand = visionData.brand;
+      if(!listing.item_specifics.Model && visionData.model) listing.item_specifics.Model = visionData.model;
+      if(!listing.item_specifics.MPN && visionData.model) listing.item_specifics.MPN = visionData.model;
       listing.parts_repair = isPartsRepair || !!listing.parts_repair;
       if(isPartsRepair && partsRepairPrice > 0){
         listing.suggested_price = listing.suggested_price || partsRepairPrice;
@@ -1445,12 +1452,20 @@ function createEbayDraft(sku, callback){
     var imageUrls = stems.map(function(s){ return EBAY_PUBLIC_BASE + '/api/photo/' + sku + '/' + s; });
     var cond = gradeToEbayCondition(meta.grade, listing.parts_repair);
     var qty = (meta.quantity && meta.quantity > 1) ? meta.quantity : 1;
+    // Map item_specifics -> eBay aspects: each value becomes an array of strings
+    var aspects = {};
+    var spec = listing.item_specifics || {};
+    Object.keys(spec).forEach(function(k){
+      var v = spec[k];
+      if(v === null || v === undefined || v === '') return;
+      aspects[k] = Array.isArray(v) ? v.map(String) : [String(v)];
+    });
     var inventoryBody = {
       product: {
         title: (listing.title || ('SKU '+sku)).slice(0,80),
         description: listing.description_html || listing.condition_box || '',
         imageUrls: imageUrls,
-        aspects: {}
+        aspects: aspects
       },
       condition: cond.enum,
       conditionDescription: listing.condition_box || '',
@@ -1619,6 +1634,19 @@ function generateListingsPage(listings, ebayStat){
     var perUnitTotal = quantity > 1 ?
       '<span><b>Per Unit:</b> $'+price+'</span><span><b>Total:</b> $'+(price*quantity)+'</span><span><b>Qty:</b> '+quantity+'</span>' : '';
 
+    // Collapsible eBay item specifics (review before publishing)
+    var spec = (listing.item_specifics && typeof listing.item_specifics === 'object') ? listing.item_specifics : {};
+    var specKeys = Object.keys(spec);
+    var specHtml = '';
+    if(specKeys.length){
+      var specRows = specKeys.map(function(k){
+        var v = spec[k]; v = Array.isArray(v) ? v.join(', ') : v;
+        return '<tr><td style="border:1px solid #e0e0e0;padding:5px 8px;font-weight:bold;width:35%;background:#fafafa;">'+k+'</td><td style="border:1px solid #e0e0e0;padding:5px 8px;">'+v+'</td></tr>';
+      }).join('');
+      specHtml = '<details style="margin-top:12px;"><summary style="cursor:pointer;font-size:12px;font-weight:bold;color:#1565c0;letter-spacing:0.04em;">Item Specifics ('+specKeys.length+')</summary>'
+        +'<table style="border-collapse:collapse;width:100%;font-size:12.5px;color:#444;margin-top:8px;">'+specRows+'</table></details>';
+    }
+
     // eBay draft button (only when connected — Feature 8)
     var ebayBtn = '';
     if(ebayStat.connected){
@@ -1664,6 +1692,7 @@ function generateListingsPage(listings, ebayStat){
       +'<textarea id="t_'+skuStr+'" style="display:none;">'+rawTitle+'</textarea>'
       +'<textarea id="c_'+skuStr+'" style="display:none;">'+condBox+'</textarea>'
       +'<textarea id="h_'+skuStr+'" style="display:none;">'+descHtml+'</textarea>'
+      +specHtml
       +photoStrip
       +'</div></div>';
   }).join('');
