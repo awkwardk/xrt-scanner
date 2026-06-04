@@ -343,6 +343,21 @@ function gradeToEbayCondition(grade, partsRepair){
   if(grade === 'C') return {enum:'USED_GOOD', id:5000};
   return {enum:'USED_GOOD', id:5000};
 }
+// Map our grade -> the correct eBay condition ID for the item's category.
+// Most electronics and Audio/Musical instruments share the same mapping.
+function conditionIdForCategory(grade, categoryId, partsRepair){
+  var idMap = { A:1000, B:3000, C:5000, D:7000 };
+  if(partsRepair) return 7000;
+  return idMap[grade] || 5000;
+}
+// eBay Inventory API uses condition enums; map an ID back to its enum.
+function conditionIdToEnum(id){
+  if(id === 1000) return 'NEW';
+  if(id === 3000) return 'USED_VERY_GOOD';
+  if(id === 5000) return 'USED_GOOD';
+  if(id === 7000) return 'FOR_PARTS_OR_NOT_WORKING';
+  return 'USED_GOOD';
+}
 
 function callGemini(options, body, callback) {
   // Route through OpenRouter to bypass Google IP restrictions
@@ -1630,13 +1645,15 @@ function processItem(item, callback) {
 }
 
 // Build the eBay Inventory API inventory_item body from a stored listing record.
-function buildInventoryBody(record, sku){
+// condOverrideId lets the publish retry force a specific condition ID (25021 fallback).
+function buildInventoryBody(record, sku, condOverrideId){
   var listing = record.listing || {};
   var meta = record.meta || {};
   var customSku = listing.custom_sku || String(sku);
   var stems = (record.outputPhotos && record.outputPhotos.length) ? record.outputPhotos : ['photo_1'];
   var imageUrls = stems.map(function(s){ return EBAY_PUBLIC_BASE + '/api/photo/' + sku + '/' + s; });
-  var cond = gradeToEbayCondition(meta.grade, listing.parts_repair);
+  var condId = condOverrideId || conditionIdForCategory(meta.grade, listing.category_id, listing.parts_repair);
+  var condEnum = conditionIdToEnum(condId);
   var qty = (meta.quantity && meta.quantity > 1) ? meta.quantity : 1;
   // Map item_specifics -> eBay aspects (string arrays), then enforce 65-char limit
   var aspects = {};
@@ -1647,15 +1664,17 @@ function buildInventoryBody(record, sku){
     aspects[k] = Array.isArray(v) ? v.map(String) : [String(v)];
   });
   aspects = trimAspects(aspects);
-  return { customSku: customSku, qty: qty, body: {
+  // conditionDescription is required for some categories — always provide a non-empty value
+  var condDesc = (listing.condition_box && listing.condition_box.trim()) ? listing.condition_box : ('Grade ' + (meta.grade || 'B') + ' — used, tested. See photos and description.');
+  return { customSku: customSku, qty: qty, conditionId: condId, conditionEnum: condEnum, conditionDescription: condDesc, body: {
     product: {
       title: (listing.title || ('SKU '+sku)).slice(0,80),
       description: listing.description_html || listing.condition_box || '',
       imageUrls: imageUrls,
       aspects: aspects
     },
-    condition: cond.enum,
-    conditionDescription: listing.condition_box || '',
+    condition: condEnum,
+    conditionDescription: condDesc,
     availability: { shipToLocationAvailability: { quantity: qty } }
   }};
 }
@@ -1674,7 +1693,9 @@ function createEbayDraft(sku, callback){
     record.ebay_offer_id = offerId;
     record.ebay_item_id = offerId;
     record.ebay_offer_status = 'UNPUBLISHED';
-    record.ebay_draft_url = offerId ? ('https://www.ebay.com/sh/lst/drafts') : '';
+    // Unpublished offers do NOT show in Seller Hub Drafts — open the UNPUBLISHED offers
+    // review tab where the user can preview/publish them.
+    record.ebay_draft_url = offerId ? 'https://www.ebay.com/sh/lst/offers?tab=UNPUBLISHED' : '';
     record.sent_at = new Date().toISOString();
     try { fs.writeFileSync(listingPath, JSON.stringify(record, null, 2)); } catch(e){}
     callback(null, {item_id: offerId, offer_id: offerId, status: 'UNPUBLISHED', draft_url: record.ebay_draft_url});
@@ -1693,6 +1714,7 @@ function createEbayDraft(sku, callback){
       availableQuantity: inv.qty,
       categoryId: listing.category_id ? String(listing.category_id) : undefined,
       listingDescription: listing.description_html || '',
+      conditionDescription: inv.conditionDescription, // required for some categories
       pricingSummary: { price: { value: String(listing.suggested_price || listing.avg_sold_price || 0), currency: 'USD' } },
       listingPolicies: {},
       merchantLocationKey: EBAY_LOCATION_KEY
@@ -1746,26 +1768,49 @@ function publishEbayOffer(sku, callback){
     callback(null, {listing_id: listingId, listing_url: record.ebay_listing_url});
   }
 
-  function tryPublish(isRetry){
-    ebayCall('POST', '/sell/inventory/v1/offer/' + encodeURIComponent(offerId) + '/publish', {}, function(e, sc, r){
-      if(e){ callback(e); return; }
-      console.log('[EBAY] publish offer', offerId, '| status', sc, (isRetry?'(retry)':''), '| response:', JSON.stringify(r));
-      if(sc < 400){ savePublished(r); return; }
-      // Aspect character-limit error — re-trim aspects (65 max) via inventory PUT and retry publish ONCE
-      var isCharLimit = /65 characters|is too long|max(imum)?[^]{0,20}character|exceeds[^]{0,20}length/i.test(JSON.stringify(r));
-      if(isCharLimit && !isRetry){
-        console.log('[EBAY] publish hit aspect character-limit — re-trimming aspects to 65 and retrying once');
-        var inv = buildInventoryBody(record, sku); // buildInventoryBody applies trimAspects (65)
-        ebayCall('PUT', '/sell/inventory/v1/inventory_item/' + encodeURIComponent(inv.customSku), inv.body, function(pe, psc, pr){
-          if(pe){ callback(pe); return; }
-          tryPublish(true);
-        });
-        return;
-      }
-      callback(new Error('publish failed ('+sc+'): '+JSON.stringify(r).slice(0,300)));
+  var triedCharLimit = false;
+  var condFallbacks = [3000, 1000]; // on 25021 retry with these condition IDs in order
+  var condIdx = -1;
+
+  // Re-PUT the inventory item (optionally forcing a condition ID), then run "done"
+  function reputInventory(condOverrideId, done){
+    var inv = buildInventoryBody(record, sku, condOverrideId);
+    ebayCall('PUT', '/sell/inventory/v1/inventory_item/' + encodeURIComponent(inv.customSku), inv.body, function(pe, psc, pr){
+      if(pe){ done(pe); return; }
+      console.log('[EBAY] re-PUT inventory_item SKU', inv.customSku, '| condition', inv.conditionEnum, '(' + inv.conditionId + ') | status', psc);
+      done(null);
     });
   }
-  tryPublish(false);
+
+  function tryPublish(){
+    ebayCall('POST', '/sell/inventory/v1/offer/' + encodeURIComponent(offerId) + '/publish', {}, function(e, sc, r){
+      if(e){ callback(e); return; }
+      console.log('[EBAY] publish offer', offerId, '| status', sc, '| response:', JSON.stringify(r));
+      if(sc < 400){ savePublished(r); return; }
+      var body = JSON.stringify(r);
+      // Aspect character-limit error — re-trim aspects (65 max) and retry publish ONCE
+      var isCharLimit = /65 characters|is too long|max(imum)?[^]{0,20}character|exceeds[^]{0,20}length/i.test(body);
+      if(isCharLimit && !triedCharLimit){
+        triedCharLimit = true;
+        console.log('[EBAY] publish hit aspect character-limit — re-trimming aspects to 65 and retrying once');
+        reputInventory(null, function(pe){ if(pe){ callback(pe); return; } tryPublish(); });
+        return;
+      }
+      // Condition ID invalid for category (25021) — retry with condition 3000, then 1000
+      if(ebayHasError(r, 25021) && condIdx < condFallbacks.length - 1){
+        condIdx++;
+        var condId = condFallbacks[condIdx];
+        console.log('[EBAY] 25021 invalid condition for category — retrying with condition ID', condId, '(' + conditionIdToEnum(condId) + ')');
+        reputInventory(condId, function(pe){ if(pe){ callback(pe); return; } tryPublish(); });
+        return;
+      }
+      if(ebayHasError(r, 25021)){
+        console.log('[EBAY] SKU', sku, '- condition fallbacks (3000, 1000) exhausted, logging failure');
+      }
+      callback(new Error('publish failed ('+sc+'): '+body.slice(0,300)));
+    });
+  }
+  tryPublish();
 }
 
 // ── LISTINGS STORAGE (FIX 3) ──
