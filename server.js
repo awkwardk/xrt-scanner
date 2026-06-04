@@ -2076,6 +2076,8 @@ function findCompletedItemsCategory(itemName, appId, callback){
       'sortOrder':'EndTimeSoonest'
     });
     var options = { hostname:'svcs.ebay.com', path:'/services/search/FindingService/v1?' + qs, method:'GET', headers:{'Accept':'application/json'} };
+    var fullUrl = 'https://' + options.hostname + options.path;
+    console.log('[FINDING API] Request URL:', fullUrl);
     var req = https.request(options, function(resp){
       var d = ''; resp.on('data', function(c){ d += c; });
       resp.on('end', function(){
