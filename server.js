@@ -471,13 +471,20 @@ function callClaude(payload, callback) {
     res.on('end', function() {
       console.log('[API] Status:', res.statusCode);
       if(res.statusCode !== 200) console.log('[API] Error:', data.slice(0,300));
-      try { callback(null, JSON.parse(data)); }
-      catch(e) { callback(null, {content:[], type:'error', error:{message:'parse_failed'}}); }
+      try { var parsed = JSON.parse(data); parsed._httpStatus = res.statusCode; callback(null, parsed); }
+      catch(e) { callback(null, {content:[], type:'error', error:{message:'parse_failed'}, _httpStatus: res.statusCode}); }
     });
   });
   req.on('error', function(e) { console.log('[API] Network error:', e.message); callback(e); });
   req.write(body);
   req.end();
+}
+// True when Anthropic signals a rate limit / overload (429 or rate_limit_error)
+function isClaudeRateLimited(resp){
+  if(!resp) return false;
+  if(resp._httpStatus === 429) return true;
+  if(resp.error && (resp.error.type === 'rate_limit_error' || resp.error.type === 'overloaded_error')) return true;
+  return false;
 }
 
 function extractText(content) {
@@ -893,28 +900,9 @@ const server = http.createServer(function(req, res) {
       console.log('[SUBMIT] SKU', sku, 'saved with', photos.length, 'photos +', testingPhotoFiles.length, 'testing photos');
       sendJSON(res,200,{success:true, sku:sku});
 
-      // Auto-generate listing in background — stagger by SKU to avoid rate limit collisions
-      var _itemsDir = path.join(DATA_DIR, 'items');
-      var _sku = sku;
-      var _delay = ((sku % 10) * 3000) + 1000; // stagger 1-30 seconds based on SKU
-      setTimeout(function(){
-        var pendingDir = path.join(_itemsDir, String(_sku));
-        var metaPath = path.join(pendingDir, 'meta.json');
-        if(fs.existsSync(metaPath)){
-          try {
-            var itemMeta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
-            if(!itemMeta.processed){
-              console.log('[AUTO-LIST] Starting background listing for SKU', sku);
-              processItem({meta:itemMeta, dir:pendingDir}, function(result){
-                // processItem writes items/[sku]/listing.json itself (FIX 3).
-                // Refresh the assembled cache from item folders.
-                loadListings();
-                console.log('[AUTO-LIST] Complete for SKU', sku);
-              });
-            }
-          } catch(e){ console.log('[AUTO-LIST] Error:', e.message); }
-        }
-      }, 500);
+      // Queue listing generation instead of generating immediately. The queue
+      // processes one item at a time with an 8s gap to avoid rate-limit errors.
+      enqueueListing(sku);
     });
     return;
   }
@@ -1178,6 +1166,26 @@ const server = http.createServer(function(req, res) {
     return;
   }
 
+  // ── Listing generation queue status ──
+  if(req.method==='GET' && req.url==='/api/queue-status'){
+    sendJSON(res, 200, {
+      pending: listingQueue.length,
+      processing: queueProcessing,
+      last_completed_sku: lastCompletedSku,
+      failed: Object.keys(failedItems).map(function(k){ return failedItems[k]; })
+    });
+    return;
+  }
+  // Retry a failed (or any) item's listing generation
+  if(req.method==='POST' && req.url==='/api/retry-listing'){
+    parseBody(req, function(err, parsed){
+      if(err || !parsed || !parsed.sku){ sendJSON(res,400,{success:false, error:'Bad request'}); return; }
+      enqueueListing(parsed.sku); // clears the failed flag and re-queues
+      sendJSON(res,200,{success:true, sku: Number(parsed.sku)});
+    });
+    return;
+  }
+
   if(req.method==='GET' && req.url==='/api/listings'){
     var listings = loadListings();
     if(listings.length === 0){
@@ -1220,6 +1228,77 @@ function processBatch(pending) {
 // ── LISTING GENERATION (Anthropic Sonnet) — FIX 1 ──
 // Step 1: vision ID via claude-sonnet-4-5 (skipped if identifier screen already ran)
 // Step 2: listing write via claude-sonnet-4-5 with web_search tool enabled
+// ── LISTING GENERATION QUEUE ──
+// Handles 50+ items/shift without rate-limit errors: one item at a time, an
+// 8s gap between API calls, 60s pause on a 429, max 3 retries before failed.
+var listingQueue = [];          // [{sku, attempts}]
+var queueProcessing = false;
+var lastCompletedSku = null;
+var failedItems = {};           // sku -> {sku, attempts, error, at}
+var QUEUE_GAP_MS = 8000;
+var QUEUE_RATELIMIT_PAUSE_MS = 60000;
+var QUEUE_MAX_RETRIES = 3;
+
+function enqueueListing(sku){
+  sku = Number(sku);
+  if(!sku) return;
+  if(listingQueue.some(function(q){ return q.sku === sku; })) return; // already queued
+  delete failedItems[sku];
+  listingQueue.push({sku: sku, attempts: 0});
+  console.log('[QUEUE] Enqueued SKU', sku, '| pending', listingQueue.length);
+  if(!queueProcessing) processQueue();
+}
+
+function processQueue(){
+  if(queueProcessing) return;
+  if(listingQueue.length === 0) return;
+  queueProcessing = true;
+  var job = listingQueue[0];
+  var sku = job.sku;
+  var itemDir = path.join(DATA_DIR, 'items', String(sku));
+  var metaPath = path.join(itemDir, 'meta.json');
+  var itemMeta = null;
+  try { if(fs.existsSync(metaPath)) itemMeta = JSON.parse(fs.readFileSync(metaPath, 'utf8')); } catch(e){}
+  if(!itemMeta){ // nothing to do — drop and continue
+    listingQueue.shift(); queueProcessing = false; setTimeout(processQueue, 50); return;
+  }
+  if(itemMeta.processed){ // already generated — drop and continue
+    listingQueue.shift(); lastCompletedSku = sku; queueProcessing = false; setTimeout(processQueue, 50); return;
+  }
+  job.attempts++;
+  console.log('[QUEUE] Processing SKU', sku, '| attempt', job.attempts, 'of', QUEUE_MAX_RETRIES);
+  processItem({meta: itemMeta, dir: itemDir}, function(result){
+    if(result && result.rateLimited){
+      // 429 — pause the whole queue 60s, keep this job at the head, do NOT count the attempt
+      job.attempts = Math.max(0, job.attempts - 1);
+      console.log('[QUEUE] Rate limited on SKU', sku, '- pausing queue 60s then retrying');
+      queueProcessing = false;
+      setTimeout(processQueue, QUEUE_RATELIMIT_PAUSE_MS);
+      return;
+    }
+    if(result && result.error){
+      if(job.attempts >= QUEUE_MAX_RETRIES){
+        listingQueue.shift();
+        failedItems[sku] = {sku: sku, attempts: job.attempts, error: result.error, at: new Date().toISOString()};
+        console.log('[QUEUE] SKU', sku, 'FAILED after', job.attempts, 'attempts:', result.error);
+      } else {
+        console.log('[QUEUE] SKU', sku, 'attempt', job.attempts, 'failed:', result.error, '- will retry');
+      }
+      queueProcessing = false;
+      setTimeout(processQueue, QUEUE_GAP_MS);
+      return;
+    }
+    // Success
+    loadListings();
+    lastCompletedSku = sku;
+    listingQueue.shift();
+    delete failedItems[sku];
+    console.log('[QUEUE] Completed SKU', sku, '| pending', listingQueue.length);
+    queueProcessing = false;
+    setTimeout(processQueue, QUEUE_GAP_MS); // 8s gap between API calls
+  });
+}
+
 // Feature 3: scan ALL submitted photos for a scale reading + reference-object dimensions
 function detectWeightAndDims(photoB64Array, callback){
   if(!photoB64Array || photoB64Array.length === 0){ callback(null); return; }
@@ -1418,6 +1497,8 @@ function processItem(item, callback) {
       tools: [{type:'web_search_20250305', name:'web_search', max_uses:5}],
       messages:[{role:'user', content: listingPrompt}]
     }, function(err2, resp2) {
+      // Rate limited — do not save a fallback listing; signal the queue to pause + retry
+      if(isClaudeRateLimited(resp2)){ callback({sku:sku, meta:meta, rateLimited:true}); return; }
       var listing = {};
       var listingText = resp2 ? extractText(resp2.content) : '';
       var parsedListing = extractFirstJson(listingText);
@@ -1868,6 +1949,9 @@ function generateListingsPage(listings, ebayStat){
     +'function dlAll(sku,stems,safe){for(var i=0;i<stems.length;i++){(function(n){setTimeout(function(){var a=document.createElement("a");a.href="/api/photo/"+sku+"/"+stems[n];a.download=sku+"-"+safe+"-photo"+(n+1)+".jpg";document.body.appendChild(a);a.click();document.body.removeChild(a);},n*500);})(i);}}'
     +'function sendEbay(sku){var b=document.getElementById("ebaybtn_"+sku);if(b){b.textContent="Creating...";b.disabled=true;}fetch("/api/send-to-ebay",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sku:parseInt(sku,10)})}).then(function(r){return r.json();}).then(function(d){if(d.success){b.textContent="Publish to eBay";b.style.background="#e65100";b.disabled=false;b.onclick=function(){publishEbay(sku);};if(d.draft_url){window.open(d.draft_url,"_blank");}}else{b.textContent="Retry";b.disabled=false;alert("eBay: "+(d.error||"failed"));}}).catch(function(){if(b){b.textContent="Retry";b.disabled=false;}alert("Network error contacting server.");});}'
     +'function publishEbay(sku){var b=document.getElementById("ebaybtn_"+sku);if(b){b.textContent="Publishing...";b.disabled=true;}fetch("/api/publish-ebay",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sku:parseInt(sku,10)})}).then(function(r){return r.json();}).then(function(d){if(d.success){b.textContent="Listed on eBay \\u2713";b.style.background="#2e7d32";b.disabled=false;b.onclick=function(){if(d.listing_url)window.open(d.listing_url);};}else{b.textContent="Retry Publish";b.disabled=false;alert("eBay: "+(d.error||"failed"));}}).catch(function(){if(b){b.textContent="Retry Publish";b.disabled=false;}alert("Network error contacting server.");});}'
+    +'function loadQueue(){fetch("/api/queue-status").then(function(r){return r.json();}).then(function(d){var banner=document.getElementById("queueBanner");if(d.pending>0||d.processing){banner.style.display="block";banner.textContent=d.pending+" listing"+(d.pending===1?"":"s")+" generating...";}else{banner.style.display="none";}var fc=document.getElementById("failedItems");fc.innerHTML="";(d.failed||[]).forEach(function(f){var row=document.createElement("div");row.style.cssText="background:#ffebee;border:1px solid #c62828;color:#b71c1c;padding:8px 14px;border-radius:6px;margin-bottom:8px;font-size:13px;display:flex;align-items:center;gap:12px;";var span=document.createElement("span");span.style.flex="1";span.textContent="SKU "+f.sku+" failed: "+(f.error||"error")+" (after "+f.attempts+" attempts)";var btn=document.createElement("button");btn.textContent="Retry";btn.style.cssText="padding:6px 14px;border:none;border-radius:4px;background:#c62828;color:#fff;font-weight:bold;cursor:pointer;";btn.onclick=function(){retryListing(f.sku);};row.appendChild(span);row.appendChild(btn);fc.appendChild(row);});}).catch(function(){});}'
+    +'function retryListing(sku){fetch("/api/retry-listing",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sku:sku})}).then(function(){loadQueue();});}'
+    +'setInterval(loadQueue,10000);loadQueue();'
     +'<\/script>'
     +'</head><body>'
     +'<div class="topbar">'
@@ -1878,6 +1962,8 @@ function generateListingsPage(listings, ebayStat){
     +'</div>'
     +'</div>'
     +ebayBar
+    +'<div id="queueBanner" style="display:none;background:#e3f2fd;border:1px solid #1565c0;color:#0d47a1;padding:10px 16px;border-radius:6px;margin-bottom:14px;font-size:13px;font-weight:bold;"></div>'
+    +'<div id="failedItems"></div>'
     +cards
     +'</body></html>';
 }
@@ -1894,6 +1980,19 @@ function generateHTML(results) {
   var needRebuild = true;
   try { if(fs.existsSync(lp)){ var cur = JSON.parse(fs.readFileSync(lp,'utf8')); if(Array.isArray(cur) && cur.length > 0) needRebuild = false; } } catch(e){}
   if(needRebuild){ rebuildListings(); }
+})();
+
+// On startup, re-queue any unprocessed items so the queue resumes after a restart
+(function(){
+  var itemsDir = path.join(DATA_DIR, 'items');
+  try {
+    fs.readdirSync(itemsDir).forEach(function(f){
+      var mp = path.join(itemsDir, f, 'meta.json');
+      if(fs.existsSync(mp)){
+        try { var m = JSON.parse(fs.readFileSync(mp,'utf8')); if(!m.processed) enqueueListing(m.sku || parseInt(f,10)); } catch(e){}
+      }
+    });
+  } catch(e){}
 })();
 
 server.listen(PORT, function(){console.log('XRT Server running on port '+PORT);});
