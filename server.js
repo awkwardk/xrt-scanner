@@ -226,6 +226,20 @@ function ebayApi(method, urlPath, token, bodyObj, callback){
   if(body) req.write(body);
   req.end();
 }
+// eBay enforces a 65-character maximum per item-specific (aspect) value.
+// Normalize every value to a string array and hard-trim each entry to 65 chars.
+function trimAspects(aspects){
+  var out = {};
+  Object.keys(aspects || {}).forEach(function(k){
+    var arr = aspects[k];
+    if(!Array.isArray(arr)) arr = [arr];
+    var cleaned = arr.map(function(v){ return String(v == null ? '' : v).trim().slice(0, 65); })
+                     .filter(function(v){ return v.length > 0; });
+    if(cleaned.length) out[k] = cleaned;
+  });
+  return out;
+}
+
 // Map processor grade letter → eBay Inventory API condition enum + Trading condition ID
 function gradeToEbayCondition(grade, partsRepair){
   if(partsRepair || grade === 'D') return {enum:'FOR_PARTS_OR_NOT_WORKING', id:7000};
@@ -1273,6 +1287,7 @@ function processItem(item, callback) {
       promptLines.push('This item FAILED testing but has parts/repair demand. Title MUST include "For Parts or Repair" or "As-Is". Use parts/repair pricing around $'+partsRepairPrice+'. Include a clear AS-IS banner in the description.');
     }
     promptLines.push('Return an item_specifics object with key-value pairs for common eBay item specifics for this item type. Include: Brand, Model, MPN (model number), Type, Compatible Brand (if applicable), Features, Color, Connectivity, Form Factor, and any other specifics relevant to this item category. Use exact values eBay accepts — no vague descriptions.');
+    promptLines.push('Each item specific VALUE must be 65 characters or less. For Features, return an ARRAY of separate short values (each under 65 chars) instead of one long comma-separated string — e.g. "Features":["Noise Cancellation","Wireless","Magnetic Clip","App Control"]. Never exceed 65 characters in any single value.');
     promptLines.push('Include these fields in the JSON: shipping_policy, listed_weight, listed_weight_unit, box_dimensions, shipping_profile_id, polymailer, category_id, parts_repair, item_specifics.');
 
     promptLines = promptLines.concat([
@@ -1294,7 +1309,7 @@ function processItem(item, callback) {
       '</div>',
       '',
       'Search eBay sold listings then return ONLY this JSON, no markdown'+(quantity>1?' (avg_sold_price and prices are PER UNIT)':'')+':',
-      '{"title":"eBay title under 80 chars'+(quantity>1?', starts with Lot of '+quantity:'')+' with brand model key terms","condition_box":"2-3 honest sentences for eBay condition field","description_html":"completed HTML using structure above","avg_sold_price":45,"price_low":30,"price_high":65,"suggested_price":48,"accept_price":38,"decline_price":28,"shipping":"FedEx Ground","item_specifics":{"Brand":"value","Model":"value","MPN":"value","Type":"value"},"custom_sku":"'+customSku+'"}'
+      '{"title":"eBay title under 80 chars'+(quantity>1?', starts with Lot of '+quantity:'')+' with brand model key terms","condition_box":"2-3 honest sentences for eBay condition field","description_html":"completed HTML using structure above","avg_sold_price":45,"price_low":30,"price_high":65,"suggested_price":48,"accept_price":38,"decline_price":28,"shipping":"FedEx Ground","item_specifics":{"Brand":"value","Model":"value","MPN":"value","Type":"value","Features":["short value under 65 chars","another short value"]},"custom_sku":"'+customSku+'"}'
     ]);
 
     var listingPrompt = promptLines.join('\n');
@@ -1460,6 +1475,8 @@ function createEbayDraft(sku, callback){
       if(v === null || v === undefined || v === '') return;
       aspects[k] = Array.isArray(v) ? v.map(String) : [String(v)];
     });
+    // Enforce eBay's 65-char-per-value limit before sending
+    aspects = trimAspects(aspects);
     var inventoryBody = {
       product: {
         title: (listing.title || ('SKU '+sku)).slice(0,80),
