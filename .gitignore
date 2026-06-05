@@ -1,0 +1,12 @@
+# Local-only docs / build notes (not part of the deployed app)
+XRT-Master-Features.md
+XRT-v4-Claude-Code-Spec.md
+build-summary.txt
+
+# Runtime data & secrets (never deploy/commit these)
+data/
+xrt-data/
+ebay-tokens.json
+ebay-policies.json
+node_modules/
+*.log
