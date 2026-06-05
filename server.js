@@ -2024,13 +2024,17 @@ function buildAddItemXml(record, opts){
     : '';
   // Business policies (SellerProfiles) when available — required when the seller has
   // opted into business policies (error 21919456). Otherwise use legacy shipping/return.
+  // FIX 2: return policy by grade — Grade D = AS IS No Returns, all others = Free 30 Day Returns
+  var gradeVal = String(record.grade || listing.grade || meta.grade || '').toUpperCase();
+  var returnId = (gradeVal === 'D') ? '272360861015' : '272360797015';
+  console.log('[EBAY] SKU ' + sku + ' grade ' + (gradeVal || '?') + ' → return policy ' + returnId);
   var policies = opts.policies;
   var shippingBlock;
   if(policies && policies.fulfillment_id && policies.payment_id && policies.return_id){
     var shipId = (policies.shipping_map && policies.shipping_map[listing.shipping_policy]) || policies.fulfillment_id;
     shippingBlock = '<SellerProfiles>'
       + '<SellerShippingProfile><ShippingProfileID>' + xmlEscape(shipId) + '</ShippingProfileID></SellerShippingProfile>'
-      + '<SellerReturnProfile><ReturnProfileID>' + xmlEscape(policies.return_id) + '</ReturnProfileID></SellerReturnProfile>'
+      + '<SellerReturnProfile><ReturnProfileID>' + xmlEscape(returnId) + '</ReturnProfileID></SellerReturnProfile>'
       + '<SellerPaymentProfile><PaymentProfileID>' + xmlEscape(policies.payment_id) + '</PaymentProfileID></SellerPaymentProfile>'
       + '</SellerProfiles>';
   } else {
@@ -2117,41 +2121,37 @@ function ebayTradingMultipart(callName, xmlPayload, imageBuffer, token, callback
   req.write(body); req.end();
 }
 
-// Upload one photo to eBay's Media API (apiz.ebay.com) -> returns the i.ebayimg.com CDN URL.
-// Replaces the deprecated UploadSiteHostedPictures (Trading API) call. The image binary is
-// sent directly as the request body with Content-Type image/jpeg and a Bearer OAuth token.
+// Upload one photo to eBay via the Media API create_image_from_url operation
+// (apim.ebay.com/commerce/media/v1_beta/image/create_image_from_url). eBay fetches the image
+// from our public server URL and returns the EPS (i.ebayimg.com) CDN URL — primarily in the
+// Location header, with response.imageUrl in the JSON body as a fallback. Uses the OAuth Bearer
+// token (same one used for Browse/Trading calls). Never reads the local file.
 function uploadPhotoToEbay(sku, stem, token, callback){
-  var stemClean = String(stem).replace(/\.(jpe?g|png)$/i, '');
-  var isPng = /\.png$/i.test(String(stem));
-  var photoPath = path.join(DATA_DIR, 'items', String(sku), stemClean + (isPng ? '.png' : '.jpg'));
-  fs.readFile(photoPath, function(err, buf){
-    if(err){ callback(err); return; }
-    var mediaHost = (EBAY_BASE.indexOf('sandbox') >= 0) ? 'apiz.sandbox.ebay.com' : 'apiz.ebay.com';
-    var options = {
-      hostname: mediaHost,
-      path: '/sell/media/v1/image',
-      method: 'POST',
-      headers: {
-        'Authorization': 'Bearer ' + token,
-        'Content-Type': isPng ? 'image/png' : 'image/jpeg',
-        'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US',
-        'Content-Length': buf.length
-      }
-    };
-    var req = https.request(options, function(resp){
-      var d = ''; resp.on('data', function(c){ d += c; });
-      resp.on('end', function(){
-        var imageUrl = '';
-        try { var j = d ? JSON.parse(d) : {}; imageUrl = j.imageUrl || (j.image && j.image.imageUrl) || ''; } catch(e){}
-        // Some Media API responses return the resource URL in the Location header instead of a body
-        if(!imageUrl && resp.headers && resp.headers.location){ imageUrl = resp.headers.location; }
-        if(resp.statusCode >= 200 && resp.statusCode < 300 && imageUrl){ callback(null, imageUrl); return; }
-        callback(new Error('Media API HTTP ' + resp.statusCode + (d ? (': ' + String(d).slice(0, 300)) : '')));
-      });
+  var photoUrl = EBAY_PHOTO_BASE + '/api/photo/' + sku + '/' + stem;
+  var bodyStr = JSON.stringify({ imageUrl: photoUrl });
+  var options = {
+    hostname: 'apim.ebay.com',
+    path: '/commerce/media/v1_beta/image/create_image_from_url',
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer ' + token,
+      'Content-Type': 'application/json',
+      'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US',
+      'Content-Length': Buffer.byteLength(bodyStr)
+    }
+  };
+  var req = https.request(options, function(resp){
+    var d = ''; resp.on('data', function(c){ d += c; });
+    resp.on('end', function(){
+      // EPS URL comes back primarily in the Location header; fall back to JSON body imageUrl
+      var imageUrl = (resp.headers && resp.headers.location) ? resp.headers.location : '';
+      if(!imageUrl){ try { var j = d ? JSON.parse(d) : {}; imageUrl = j.imageUrl || (j.image && j.image.imageUrl) || ''; } catch(e){} }
+      if(resp.statusCode >= 200 && resp.statusCode < 300 && imageUrl){ callback(null, imageUrl); return; }
+      callback(new Error('HTTP ' + resp.statusCode + (d ? (': ' + String(d).slice(0, 300)) : '')));
     });
-    req.on('error', function(e){ callback(e); });
-    req.write(buf); req.end();
   });
+  req.on('error', function(e){ callback(e); });
+  req.write(bodyStr); req.end();
 }
 
 // Upload all output photos as base64 (weight photo already excluded from outputPhotos).
@@ -2166,16 +2166,17 @@ function uploadAllPhotos(record, sku, token, callback){
   function next(){
     if(i >= stems.length){ callback(null, urls); return; }
     var stem = stems[i];
+    var serverUrl = EBAY_PHOTO_BASE + '/api/photo/' + sku + '/' + stem;
     uploadPhotoToEbay(sku, stem, token, function(err, cdnUrl){
       if(!err && cdnUrl){
         urls.push(cdnUrl);
         console.log('[EBAY] photo uploaded to CDN:', cdnUrl);
       } else {
-        var fallback = EBAY_PHOTO_BASE + '/api/photo/' + sku + '/' + stem;
-        urls.push(fallback);
-        console.log('[EBAY] Media API photo upload failed — using fallback', fallback, err ? ('(' + err.message + ')') : '');
+        urls.push(serverUrl); // fall back to our server URL so a failed upload never blocks AddItem
+        console.log('[EBAY] Media API failed for ' + serverUrl + ': ' + (err ? err.message : 'no imageUrl returned'));
       }
-      i++; next();
+      // FIX 1 rate limit: 150ms between Media API calls (eBay allows 50 per 5s)
+      setTimeout(function(){ i++; next(); }, 150);
     });
   }
   next();
