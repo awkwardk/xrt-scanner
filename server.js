@@ -1526,17 +1526,28 @@ function detectWeightAndDims(photoB64Array, callback){
     content.push({type:'text', text:'Photo '+(i+1)+':'});
     content.push({type:'image', source:{type:'base64', media_type:'image/jpeg', data:b64}});
   });
+  // FIX 2: a specific, direct scale-reading prompt (Gemini/vision best practice). The
+  // dimensions request is preserved so the processor flow is unaffected.
   content.push({type:'text', text:[
-    'You are a shipping-prep assistant. Examine ALL the photos above.',
-    'Some photo may show the item on a digital/dial scale; a bright reference object (a tape measure permanently affixed to the table) may be visible for size estimation.',
-    'Return ONLY this JSON, no markdown:',
+    'These photos may include a digital postal or kitchen scale with an item on it. Examine ALL the photos above.',
+    'PRIMARY TASK — read the weight number displayed on the digital screen / LCD of the scale.',
+    'Look specifically for:',
+    '- A digital LCD or LED display showing numbers',
+    '- The weight value which may be shown as: Xlb Yoz, X.X lbs, X oz, X.XXX kg, or similar formats',
+    '- Ignore any other numbers, labels, or text in the image',
+    'Do not guess. Do not estimate. Only return a weight value if you can clearly read the display.',
+    'A bright reference object (a tape measure / ruler affixed to the table) may also be visible for size estimation.',
+    'Return ONLY this JSON object with no other text:',
     '{',
-    '  "has_scale": true if any photo shows a scale with a weight reading,',
-    '  "weight_oz": the weight reading converted to OUNCES as a number (0 if none found),',
+    '  "has_scale": true if any photo shows a scale with a readable weight,',
+    '  "weight_oz": total weight in OUNCES as a number, or null if you cannot clearly read a reading,',
+    '  "display_reading": exactly what the display shows (string), or null,',
+    '  "confidence": "high" | "medium" | "low",',
     '  "weight_photo_index": 1-based index of the photo showing the scale (0 if none),',
     '  "has_reference": true if a tape measure / ruler reference object is visible,',
     '  "dimensions": {"l": length_inches, "w": width_inches, "h": height_inches} estimated via the reference object (0 if cannot determine)',
-    '}'
+    '}',
+    'If you cannot clearly see a digital display with a weight reading, return weight_oz: null, display_reading: null, confidence: "low".'
   ].join('\n')});
   callClaude({ model:'claude-sonnet-4-5', max_tokens:512, messages:[{role:'user', content:content}] }, function(err, resp){
     if(err || !resp){ callback(null); return; }
@@ -1549,9 +1560,15 @@ function detectWeightAndDims(photoB64Array, callback){
       var dh = parseFloat(data.dimensions.h || data.dimensions.height) || 0;
       if(dl && dw && dh) dims = {l:dl, w:dw, h:dh};
     }
+    // Confidence gate: only trust the reading at medium/high confidence with a real value
+    var conf = String(data.confidence || '').toLowerCase();
+    var rawOz = (data.weight_oz === null || data.weight_oz === undefined) ? null : parseFloat(data.weight_oz);
+    var trustedOz = (conf === 'medium' || conf === 'high') && rawOz !== null && !isNaN(rawOz) && rawOz > 0 ? rawOz : 0;
     callback({
       has_scale: !!data.has_scale,
-      weight_oz: parseFloat(data.weight_oz) || 0,
+      weight_oz: trustedOz,
+      display_reading: (data.display_reading === undefined ? null : data.display_reading),
+      confidence: conf || 'low',
       weight_photo_index: parseInt(data.weight_photo_index, 10) || 0,
       has_reference: !!data.has_reference,
       dimensions: dims
@@ -1656,6 +1673,13 @@ function processItem(item, callback) {
 
     // FIX 5: force the model to enumerate every visible accessory/cable/adapter/included item
     promptLines.push('Carefully examine ALL photos to identify every accessory, cable, adapter, power supply, remote, manual, or included item visible. List ALL included accessories explicitly in both the title (if space allows) and the description. If a power supply or adapter is visible in any photo, it MUST be mentioned as included. Do not miss accessories — buyers make purchase decisions based on what is included.');
+
+    // FIX 1: if the processor notes imply a specific condition, tell the AI so the
+    // condition_box / description match what will actually be listed on eBay.
+    var notesCond = notesToConditionId(combinedNotes);
+    if(notesCond){
+      promptLines.push('Condition hint from processor notes: this item should be described as "' + notesCond.name + '" (eBay condition ' + notesCond.id + '). Write the condition_box and description to match this exact condition — do not contradict it.');
+    }
 
     if(quantity > 1){
       promptLines.push('');
@@ -1871,12 +1895,13 @@ function processItem(item, callback) {
       meta.weightPhotoIndex = winfo.weight_photo_index > 0 ? winfo.weight_photo_index : null;
       meta.dimensions = winfo.dimensions || null;
       meta.noWeightFlag = false;
+      console.log('[WEIGHT] SKU ' + sku + ' scale reading: ' + (winfo.display_reading || '?') + ' = ' + winfo.weight_oz + 'oz (confidence: ' + (winfo.confidence || '?') + ')');
     } else {
       meta.weightOz = parseWeightOz(meta.weight);
       meta.weightPhotoIndex = (winfo && winfo.weight_photo_index > 0) ? winfo.weight_photo_index : null;
       meta.dimensions = (winfo && winfo.dimensions) ? winfo.dimensions : null;
       meta.noWeightFlag = !meta.weightOz;
-      console.log('[WEIGHT] SKU', sku, '- no scale reading found, flagged "No weight photo"');
+      console.log('[WEIGHT] SKU ' + sku + ' no scale reading found — flagged for manual entry');
     }
     if(!meta.dimensions) meta.dimsFlag = true;
     runIdentify();
@@ -2267,6 +2292,21 @@ function pickValidCondition(grade, partsRepair, validIds){
   }
   return conditionIdForCategory(grade, null, partsRepair);
 }
+// FIX 1: map keywords in the processor notes field to an eBay condition ID. Returns
+// {id, name} or null. Never throws — caller only uses the result if it is valid for the category.
+function notesToConditionId(notes){
+  var s = String(notes || '').toLowerCase();
+  if(!s.trim()) return null;
+  try {
+    if(/for parts|parts only|not working/.test(s)) return { id: 7000, name: 'For parts or not working' };
+    if(/open box/.test(s)) return { id: 1500, name: 'New: Open Box' };            // covers "new open box"
+    if(/like new/.test(s)) return { id: 1500, name: 'New: Open Box' };            // closest match
+    if(/refurbished|seller refurbished/.test(s)) return { id: 2500, name: 'Seller Refurbished' };
+    if(/new sealed|factory sealed|sealed/.test(s)) return { id: 1000, name: 'New' };
+    if(/\bnew\b/.test(s)) return { id: 1000, name: 'New' };                       // "new" alone
+  } catch(e){}
+  return null;
+}
 // Required + recommended item-specific names for a category (GetCategorySpecifics)
 function getCategorySpecifics(categoryId, token, callback){
   var xml = '<?xml version="1.0" encoding="utf-8"?>'
@@ -2553,6 +2593,20 @@ function createEbayListing(sku, callback){
           record.ebay_valid_conditions = conditions;
           forcedCondition = pickValidCondition(meta.grade, listing.parts_repair, conditions);
         }
+        // FIX 1: prefer a condition matched from the processor notes keywords, but only when it
+        // is valid for this category; otherwise keep the grade-derived default. Never blocks.
+        try {
+          var noteText = [listing.notes, record.notes, meta.notes, meta.test_notes].filter(Boolean).join(' ');
+          var km = notesToConditionId(noteText);
+          if(km){
+            if(conditions && conditions.length && conditions.indexOf(String(km.id)) >= 0){
+              forcedCondition = km.id;
+              console.log('[EBAY] SKU ' + sku + ' notes keyword matched condition ' + km.id + ' (' + km.name + ')');
+            } else {
+              console.log('[EBAY] SKU ' + sku + ' keyword condition ' + km.id + ' not valid for category — using default');
+            }
+          }
+        } catch(e){}
         console.log('[EBAY] category resolved for SKU', sku, '->', catId, '(' + catName + ') | leaf | conditions', (conditions||[]).join(',') || 'n/a', '| using condition', forcedCondition);
         // Required item specifics for this category -> add any missing with "Not Specified"
         getCategorySpecifics(catId, token, function(spErr, specs){
@@ -2785,8 +2839,13 @@ function generateListingsPage(listings, ebayStat){
       ebayBtn = '<button id="ebaybtn_'+skuStr+'" onclick="listEbay(\''+skuStr+'\')" style="padding:8px 16px;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:bold;background:#0064d2;color:#fff;">List on eBay</button>';
     }
 
+    // FIX 3: bulk-select checkbox — only on listings not yet posted to eBay
+    var selectBox = !r.ebay_item_id ?
+      '<input type="checkbox" class="bulkSel" value="'+skuStr+'" onchange="updateBulkCount()" style="width:18px;height:18px;cursor:pointer;flex:0 0 auto;" title="Select for bulk listing">' : '';
+
     return '<div id="card_'+skuStr+'" style="background:#fff;border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,0.15);margin-bottom:28px;overflow:hidden;">'
       +'<div style="background:'+headerColor+';color:#fff;padding:12px 16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;">'
+      +selectBox
       +'<span style="background:rgba(255,255,255,0.25);border-radius:4px;padding:2px 8px;font-size:13px;font-weight:bold;">SKU '+skuStr+'</span>'
       +'<span style="font-size:15px;font-weight:bold;flex:1;">'+displayTitle+'</span>'
       +qtyBadge
@@ -2850,7 +2909,11 @@ function generateListingsPage(listings, ebayStat){
     +'function deletePhoto(sku,name,btn){if(!confirm("Delete this photo from the listing?"))return;fetch("/api/listings/"+sku+"/photo/"+encodeURIComponent(name),{method:"DELETE"}).then(function(r){return r.json();}).then(function(d){if(d.success){var t=btn.parentNode;if(t&&t.parentNode){t.parentNode.removeChild(t);}}else{alert("Delete failed: "+(d.error||"unknown"));}}).catch(function(){alert("Network error deleting photo.");});}'
     +'function saveQty(sku){var inp=document.getElementById("qty_"+sku);var msg=document.getElementById("qtymsg_"+sku);var v=inp?parseInt(inp.value,10):NaN;if(isNaN(v)||v<1||v>99){if(msg){msg.style.color="#c62828";msg.textContent="1-99 only";}return;}if(msg){msg.style.color="#8d6e00";msg.textContent="Saving...";}fetch("/api/listings/"+sku,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({quantity:v})}).then(function(r){return r.json();}).then(function(d){if(d.success){if(msg){msg.style.color="#2e7d32";msg.textContent="Saved \\u2713";}}else{if(msg){msg.style.color="#c62828";msg.textContent=d.error||"Failed";}}}).catch(function(){if(msg){msg.style.color="#c62828";msg.textContent="Network error";}});}'
     +'function deleteListing(sku){if(!confirm("Delete this listing permanently? This cannot be undone."))return;fetch("/api/listings/"+sku,{method:"DELETE"}).then(function(r){return r.json();}).then(function(d){if(d.success){var c=document.getElementById("card_"+sku);if(c&&c.parentNode){c.parentNode.removeChild(c);}}else{alert("Delete failed: "+(d.error||"unknown"));}}).catch(function(){alert("Network error deleting listing.");});}'
-    +'setInterval(loadQueue,10000);loadQueue();'
+    +'function updateBulkCount(){var all=Array.prototype.slice.call(document.querySelectorAll(".bulkSel"));var sel=all.filter(function(b){return b.checked;});var btn=document.getElementById("listSelectedBtn");if(btn){btn.textContent="List Selected ("+sel.length+")";btn.disabled=sel.length===0;btn.style.opacity=sel.length===0?"0.5":"1";btn.style.cursor=sel.length===0?"not-allowed":"pointer";}var sa=document.getElementById("selectAll");if(sa){sa.checked=all.length>0&&sel.length===all.length;}}'
+    +'function toggleSelectAll(cb){var all=Array.prototype.slice.call(document.querySelectorAll(".bulkSel"));all.forEach(function(b){b.checked=cb.checked;});updateBulkCount();}'
+    +'function markListed(sku,url){var cb=document.querySelector(".bulkSel[value=\\""+sku+"\\"]");if(cb&&cb.parentNode){cb.parentNode.removeChild(cb);}var b=document.getElementById("ebaybtn_"+sku);if(b){var a=document.createElement("a");a.id="ebaybtn_"+sku;a.href=url||"#";a.target="_blank";a.textContent="Listed \\u2713";a.style.cssText="padding:8px 16px;border-radius:4px;font-size:13px;font-weight:bold;background:#2e7d32;color:#fff;text-decoration:none;";if(b.parentNode)b.parentNode.replaceChild(a,b);}}'
+    +'function listSelected(){var skus=Array.prototype.slice.call(document.querySelectorAll(".bulkSel:checked")).map(function(b){return b.value;});if(!skus.length)return;if(!confirm("List "+skus.length+" items on eBay?"))return;var prog=document.getElementById("bulkProgress");var btn=document.getElementById("listSelectedBtn");if(btn){btn.disabled=true;btn.style.opacity="0.5";btn.style.cursor="not-allowed";}var ok=0,fails=[],idx=0;function postNext(){if(idx>=skus.length){if(prog){prog.textContent="Listed "+ok+" items successfully, "+fails.length+" failed"+(fails.length?(" ("+fails.map(function(f){return f.sku+": "+f.error;}).join("; ")+")"):"");}updateBulkCount();return;}var sku=skus[idx];idx++;if(prog){prog.textContent="Listing item "+idx+" of "+skus.length+"...";}fetch("/api/send-to-ebay",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sku:parseInt(sku,10)})}).then(function(r){return r.json();}).then(function(d){if(d.success){ok++;markListed(sku,d.listing_url);}else{fails.push({sku:sku,error:(d.error||"failed")});}}).catch(function(){fails.push({sku:sku,error:"network error"});}).then(function(){setTimeout(postNext,2000);});}postNext();}'
+    +'setInterval(loadQueue,10000);loadQueue();updateBulkCount();'
     +'<\/script>'
     +'</head><body>'
     +'<div class="topbar">'
@@ -2861,6 +2924,12 @@ function generateListingsPage(listings, ebayStat){
     +'</div>'
     +'</div>'
     +ebayBar
+    +(listings.some(function(x){ return !x.ebay_item_id; }) ?
+       '<div id="bulkBar" style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;background:#fff;border:1px solid #ddd;border-radius:6px;padding:10px 16px;margin-bottom:14px;">'
+       +'<label style="display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:bold;color:#333;cursor:pointer;"><input type="checkbox" id="selectAll" onclick="toggleSelectAll(this)" style="width:18px;height:18px;cursor:pointer;">Select All</label>'
+       +'<button id="listSelectedBtn" onclick="listSelected()" disabled style="padding:8px 16px;border:none;border-radius:4px;cursor:not-allowed;font-size:13px;font-weight:bold;background:#0064d2;color:#fff;opacity:0.5;">List Selected (0)</button>'
+       +'<span id="bulkProgress" style="font-size:13px;font-weight:bold;color:#444;"></span>'
+       +'</div>' : '')
     +'<div id="queueBanner" style="display:none;background:#e3f2fd;border:1px solid #1565c0;color:#0d47a1;padding:10px 16px;border-radius:6px;margin-bottom:14px;font-size:13px;font-weight:bold;"></div>'
     +'<div id="failedItems"></div>'
     +cards
