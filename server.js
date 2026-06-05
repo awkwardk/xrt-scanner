@@ -2739,14 +2739,14 @@ function generateListingsPage(listings, ebayStat){
         +'<table style="border-collapse:collapse;width:100%;font-size:12.5px;color:#444;margin-top:8px;">'+detailRows+'</table></details>';
     }
 
-    // eBay draft button (only when connected — Feature 8)
+    // eBay publish button — always visible on every card (FIX 1). When already listed,
+    // show the live-listing link; otherwise show "List on eBay" (posting logic unchanged —
+    // /api/send-to-ebay reports "Connect eBay first" if not connected).
     var ebayBtn = '';
-    if(ebayStat.connected){
-      if(r.ebay_item_id){
-        ebayBtn = '<a href="'+(r.ebay_listing_url||('https://www.ebay.com/itm/'+r.ebay_item_id))+'" target="_blank" id="ebaybtn_'+skuStr+'" style="padding:8px 16px;border-radius:4px;font-size:13px;font-weight:bold;background:#2e7d32;color:#fff;text-decoration:none;">Listed &#10003;</a>';
-      } else {
-        ebayBtn = '<button id="ebaybtn_'+skuStr+'" onclick="listEbay(\''+skuStr+'\')" style="padding:8px 16px;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:bold;background:#0064d2;color:#fff;">List on eBay</button>';
-      }
+    if(r.ebay_item_id){
+      ebayBtn = '<a href="'+(r.ebay_listing_url||('https://www.ebay.com/itm/'+r.ebay_item_id))+'" target="_blank" id="ebaybtn_'+skuStr+'" style="padding:8px 16px;border-radius:4px;font-size:13px;font-weight:bold;background:#2e7d32;color:#fff;text-decoration:none;">Listed &#10003;</a>';
+    } else {
+      ebayBtn = '<button id="ebaybtn_'+skuStr+'" onclick="listEbay(\''+skuStr+'\')" style="padding:8px 16px;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:bold;background:#0064d2;color:#fff;">List on eBay</button>';
     }
 
     return '<div id="card_'+skuStr+'" style="background:#fff;border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,0.15);margin-bottom:28px;overflow:hidden;">'
@@ -2781,7 +2781,7 @@ function generateListingsPage(listings, ebayStat){
       +'<button id="btn_h_'+skuStr+'" onclick="cp(this.id.slice(4))" style="padding:8px 16px;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:bold;background:#2e7d32;color:#fff;">Copy HTML Description</button>'
       +ebayBtn
       +'<span style="display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:bold;color:#444;"><label for="qty_'+skuStr+'">Qty:</label><input id="qty_'+skuStr+'" type="number" min="1" max="99" value="'+quantity+'" style="width:62px;padding:7px 8px;border:1px solid #bbb;border-radius:4px;font-size:13px;"><button onclick="saveQty(\''+skuStr+'\')" style="padding:8px 12px;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:bold;background:#455a64;color:#fff;">Save Qty</button><span id="qtymsg_'+skuStr+'" style="font-size:12px;"></span></span>'
-      +'<button onclick="deleteListing(\''+skuStr+'\')" style="padding:8px 16px;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:bold;background:#c62828;color:#fff;">Delete Listing</button>'
+      +'<button onclick="deleteListing(\''+skuStr+'\')" style="padding:8px 16px;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:bold;background:#c62828;color:#fff;">Remove from List</button>'
       +'</div>'
       +'<textarea id="t_'+skuStr+'" style="display:none;">'+rawTitle+'</textarea>'
       +'<textarea id="c_'+skuStr+'" style="display:none;">'+condBox+'</textarea>'
