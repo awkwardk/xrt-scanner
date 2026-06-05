@@ -1063,6 +1063,32 @@ const server = http.createServer(function(req, res) {
     return;
   }
 
+  // FIX 4: delete a single photo from a listing record + disk (listings page X button)
+  if(req.method==='DELETE' && req.url.startsWith('/api/listings/')){
+    var dParts = req.url.split('?')[0].split('/'); // ['','api','listings',sku,'photo',name]
+    if(dParts.length >= 6 && dParts[4] === 'photo'){
+      var dSku = dParts[3];
+      var dName = decodeURIComponent(dParts[5] || '').replace(/\.jpg$/i,'');
+      if(!dSku || !dName || !/^[a-z0-9_]+$/i.test(dName)){ sendJSON(res,400,{success:false, error:'Bad request'}); return; }
+      var dDir = path.join(DATA_DIR, 'items', String(dSku));
+      var dLp = path.join(dDir, 'listing.json');
+      if(!fs.existsSync(dLp)){ sendJSON(res,404,{success:false, error:'Listing not found for SKU ' + dSku}); return; }
+      var dRec; try { dRec = JSON.parse(fs.readFileSync(dLp, 'utf8')); }
+      catch(e){ sendJSON(res,500,{success:false, error:'Bad listing.json'}); return; }
+      if(Array.isArray(dRec.outputPhotos)){
+        dRec.outputPhotos = dRec.outputPhotos.filter(function(s){ return String(s).replace(/\.jpg$/i,'') !== dName; });
+      }
+      try { var dFile = path.join(dDir, dName + '.jpg'); if(fs.existsSync(dFile)) fs.unlinkSync(dFile); } catch(e){}
+      try { fs.writeFileSync(dLp, JSON.stringify(dRec, null, 2)); }
+      catch(e){ sendJSON(res,500,{success:false, error:'Write failed'}); return; }
+      console.log('[PHOTO] SKU', dSku, '- deleted photo', dName);
+      sendJSON(res,200,{success:true});
+      return;
+    }
+    sendJSON(res,404,{success:false, error:'Not found'});
+    return;
+  }
+
   // Log a recycle / hold decision from the value-check screen (Feature 1, Step C)
   if(req.method==='POST' && req.url==='/api/log-action'){
     parseBody(req, function(err, parsed){
@@ -1652,6 +1678,8 @@ function processItem(item, callback) {
       '{"title":"eBay title under 80 chars'+(quantity>1?', starts with Lot of '+quantity:'')+' with brand model key terms","condition_box":"2-3 honest sentences for eBay condition field","description_html":"completed HTML using structure above","avg_sold_price":45,"price_low":30,"price_high":65,"suggested_price":48,"accept_price":38,"decline_price":28,"shipping":"FedEx Ground","item_specifics":{"Brand":"value","Model":"value","MPN":"value","Type":"value","Features":["short value under 65 chars","another short value"]},"custom_sku":"'+customSku+'"}'
     ]);
 
+    // FIX 2: required-aspects fetch gates the listing-generation AI (see below)
+    function runListingClaude(){
     var listingPrompt = promptLines.join('\n');
 
     // ── Step 2: listing write with web_search ──
@@ -1730,6 +1758,22 @@ function processItem(item, callback) {
 
       callback(result);
     });
+    }
+    // FIX 2: when a category is confirmed, fetch its REQUIRED item aspects and inject them
+    // into the listing-generation prompt before calling the AI. Any failure -> proceed normally.
+    if(confirmedCategoryId){
+      getEbayToken(function(tErr, token){
+        if(tErr || !token){ runListingClaude(); return; }
+        getItemAspectsForCategory(confirmedCategoryId, token, function(_aErr, requiredAspects){
+          if(requiredAspects && requiredAspects.length){
+            promptLines.push('Required eBay item specifics for this category that MUST be included in item_specifics: ' + requiredAspects.join(', ') + '. These are mandatory — do not omit them.');
+          }
+          runListingClaude();
+        });
+      });
+    } else {
+      runListingClaude();
+    }
   }
 
   // Runs identification (pre-identified shortcut OR Sonnet vision), then withVision
@@ -1902,6 +1946,21 @@ function buildAddItemXml(record, opts){
   var qty = (meta.quantity && meta.quantity > 1) ? meta.quantity : 1;
   var customSku = listing.custom_sku || String(sku);
   var shipCost = estimateShipCost(listing);
+  // FIX 1: eBay's Trading API requires weight as separate WeightMajor (lbs) + WeightMinor (oz),
+  // not total ounces (sending total oz causes Error 717). listed_weight is the package weight;
+  // normalize to total oz then split. Items over 1 lb round UP to whole pounds.
+  var lwUnit = String(listing.listed_weight_unit || 'oz').toLowerCase();
+  var lwVal = parseFloat(listing.listed_weight) || 0;
+  var totalOz = Math.round(lwUnit.indexOf('lb') >= 0 ? lwVal * 16 : lwVal);
+  var wLbs = Math.floor(totalOz / 16);
+  var wOz = totalOz % 16;
+  if(wLbs >= 1 && wOz > 0){ wLbs = wLbs + 1; wOz = 0; } // over 1 lb with leftover oz -> next whole lb
+  console.log('[EBAY] SKU ' + sku + ' weight: ' + totalOz + 'oz → ' + wLbs + 'lb ' + wOz + 'oz');
+  var packageXml = '<ShippingPackageDetails>'
+    + '<WeightMajor unit="lbs">' + wLbs + '</WeightMajor>'
+    + '<WeightMinor unit="oz">' + wOz + '</WeightMinor>'
+    + '<ShippingIrregular>false</ShippingIrregular>'
+    + '</ShippingPackageDetails>';
   var picXml = (opts.pictureUrls && opts.pictureUrls.length)
     ? '<PictureDetails>' + opts.pictureUrls.map(function(u){ return '<PictureURL>' + xmlEscape(u) + '</PictureURL>'; }).join('') + '</PictureDetails>'
     : '';
@@ -1952,6 +2011,7 @@ function buildAddItemXml(record, opts){
     + '<SKU>' + xmlEscape(customSku) + '</SKU>'
     + buildItemSpecificsXml(listing.item_specifics)
     + picXml
+    + packageXml
     + shippingBlock
     + '</Item>'
     + '</' + rootTag + '>';
@@ -2112,6 +2172,42 @@ function getCategorySpecifics(categoryId, token, callback){
     if(ack === 'Success' || ack === 'Warning'){ callback(null, {required: required, recommended: recommended}); return; }
     callback(new Error('GetCategorySpecifics Ack=' + (ack || '?')));
   });
+}
+
+// FIX 2: REQUIRED item aspects for a category via the modern Taxonomy API (OAuth Bearer,
+// same token as the Browse API). Returns an array of required aspect names. Never throws —
+// callback(null, []) on any error so the listing/posting flow always continues.
+function getItemAspectsForCategory(categoryId, token, callback){
+  var done = false;
+  function finish(arr){ if(done) return; done = true; callback(null, arr || []); }
+  if(!categoryId || !token){ finish([]); return; }
+  var pathUrl = '/commerce/taxonomy/v1/category_tree/0/get_item_aspects_for_category?category_id=' + encodeURIComponent(categoryId);
+  var options = {
+    hostname: EBAY_BASE.replace('https://', ''),
+    path: pathUrl,
+    method: 'GET',
+    headers: {
+      'Authorization': 'Bearer ' + token,
+      'Content-Type': 'application/json',
+      'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US'
+    }
+  };
+  var req = https.request(options, function(resp){
+    var d = ''; resp.on('data', function(c){ d += c; });
+    resp.on('end', function(){
+      try {
+        var j = JSON.parse(d);
+        var aspects = Array.isArray(j.aspects) ? j.aspects : [];
+        var required = aspects.filter(function(a){
+          return a && a.aspectConstraint && a.aspectConstraint.aspectRequired === true;
+        }).map(function(a){ return a.localizedAspectName || a.name; }).filter(Boolean);
+        console.log('[ASPECTS] Category ' + categoryId + ' requires: ' + required.join(', '));
+        finish(required);
+      } catch(e){ console.log('[ASPECTS] Category ' + categoryId + ' parse error:', e.message); finish([]); }
+    });
+  });
+  req.on('error', function(e){ console.log('[ASPECTS] Category ' + categoryId + ' request error:', e.message); finish([]); });
+  req.end();
 }
 
 // ── eBay Browse API (OAuth) — confirm category from real eBay listings via a 3-level
@@ -2348,7 +2444,17 @@ function createEbayListing(sku, callback){
             if(specs.required.length) console.log('[EBAY] category', catId, 'required specifics:', specs.required.join(', '));
           }
           try { fs.writeFileSync(listingPath, JSON.stringify(record, null, 2)); } catch(_e){}
-          attempt();
+          // FIX 2: verify the category's required aspects (Taxonomy API) are present in
+          // item_specifics. Warn only — never block; eBay returns a specific error if truly required.
+          getItemAspectsForCategory(catId, token, function(_aErr, requiredAspects){
+            if(requiredAspects && requiredAspects.length){
+              var isObj = record.listing.item_specifics || {};
+              var haveKeys = Object.keys(isObj).map(function(k){ return String(k).toLowerCase(); });
+              var missing = requiredAspects.filter(function(name){ return haveKeys.indexOf(String(name).toLowerCase()) < 0; });
+              if(missing.length){ console.log('[EBAY] SKU', sku, 'missing aspects:', missing.join(', ')); }
+            }
+            attempt();
+          });
         });
       }
       function fallbackCategory(reason){
@@ -2505,15 +2611,18 @@ function generateListingsPage(listings, ebayStat){
     if(photoCount > 0){
       var thumbs = '';
       var dlBtns = '';
-      for(var p=0;p<Math.min(photoCount,12);p++){
+      for(var p=0;p<Math.min(photoCount,24);p++){
         var st = stems[p];
         var posLabel = (p===1 && st.indexOf('test_photo')===0) ? 'Test' : ('Photo '+(p+1));
-        thumbs += '<img src="/api/photo/'+skuStr+'/'+st+'" style="width:90px;height:90px;object-fit:cover;border-radius:6px;border:2px solid '+(st.indexOf("test_photo")===0?"#2e7d32":"#e0e0e0")+';cursor:pointer;" onclick="window.open(this.src)" title="Click to view full size">';
+        thumbs += '<div style="position:relative;flex:0 0 auto;">'
+          +'<img src="/api/photo/'+skuStr+'/'+st+'" style="width:90px;height:90px;object-fit:cover;border-radius:6px;border:2px solid '+(st.indexOf("test_photo")===0?"#2e7d32":"#e0e0e0")+';cursor:pointer;" onclick="window.open(this.src)" title="Click to view full size">'
+          +'<button onclick="deletePhoto(\''+skuStr+'\',\''+st+'\',this)" title="Delete photo" style="position:absolute;top:-7px;right:-7px;width:22px;height:22px;border-radius:50%;border:none;background:#c62828;color:#fff;font-size:14px;font-weight:bold;line-height:1;cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,0.4);">&times;</button>'
+          +'</div>';
         dlBtns += '<a href="/api/photo/'+skuStr+'/'+st+'" download="'+skuStr+'-'+safeTitle+'-photo'+(p+1)+'.jpg" style="padding:6px 12px;border:1px solid #1565c0;border-radius:4px;font-size:12px;font-weight:bold;background:#fff;color:#1565c0;text-decoration:none;">'+posLabel+'</a>';
       }
       var stemArr = '['+stems.map(function(s){return "'"+s+"'";}).join(',')+']';
       photoStrip = '<div style="font-size:11px;font-weight:bold;color:#888;letter-spacing:0.08em;text-transform:uppercase;margin-top:14px;margin-bottom:6px;">Photos ('+photoCount+') &middot; weight photo excluded</div>'
-        +'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">'+thumbs+'</div>'
+        +'<div style="display:flex;gap:10px;overflow-x:auto;padding:6px 2px 12px;margin-bottom:10px;">'+thumbs+'</div>'
         +'<div style="font-size:11px;font-weight:bold;color:#888;letter-spacing:0.08em;text-transform:uppercase;margin-bottom:6px;">Download</div>'
         +'<div style="display:flex;gap:8px;flex-wrap:wrap;">'+dlBtns
         +'<button onclick="dlAll(\''+skuStr+'\','+stemArr+',\''+safeTitle+'\')" style="padding:6px 14px;border:none;border-radius:4px;font-size:12px;font-weight:bold;background:#1565c0;color:#fff;cursor:pointer;">Download All Photos</button>'
@@ -2614,6 +2723,7 @@ function generateListingsPage(listings, ebayStat){
     +'function loadQueue(){fetch("/api/queue-status").then(function(r){return r.json();}).then(function(d){var banner=document.getElementById("queueBanner");if(d.pending>0||d.processing){banner.style.display="block";banner.textContent=d.pending+" listing"+(d.pending===1?"":"s")+" generating...";}else{banner.style.display="none";}var fc=document.getElementById("failedItems");fc.innerHTML="";(d.failed||[]).forEach(function(f){var row=document.createElement("div");row.style.cssText="background:#ffebee;border:1px solid #c62828;color:#b71c1c;padding:8px 14px;border-radius:6px;margin-bottom:8px;font-size:13px;display:flex;align-items:center;gap:12px;";var span=document.createElement("span");span.style.flex="1";span.textContent="SKU "+f.sku+" failed: "+(f.error||"error")+" (after "+f.attempts+" attempts)";var btn=document.createElement("button");btn.textContent="Retry";btn.style.cssText="padding:6px 14px;border:none;border-radius:4px;background:#c62828;color:#fff;font-weight:bold;cursor:pointer;";btn.onclick=function(){retryListing(f.sku);};row.appendChild(span);row.appendChild(btn);fc.appendChild(row);});}).catch(function(){});}'
     +'function retryListing(sku){fetch("/api/retry-listing",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sku:sku})}).then(function(){loadQueue();});}'
     +'function saveWeight(sku){var inp=document.getElementById("wt_"+sku);var msg=document.getElementById("wtmsg_"+sku);var v=inp?parseFloat(inp.value):NaN;if(isNaN(v)||v<=0){if(msg){msg.style.color="#c62828";msg.textContent="Enter a valid weight";}return;}if(msg){msg.style.color="#8d6e00";msg.textContent="Saving...";}fetch("/api/set-weight",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sku:parseInt(sku,10),weight_lbs:v})}).then(function(r){return r.json();}).then(function(d){if(d.success){if(msg){msg.style.color="#2e7d32";msg.textContent="Saved \\u2713";}setTimeout(function(){location.reload();},700);}else{if(msg){msg.style.color="#c62828";msg.textContent=d.error||"Save failed";}}}).catch(function(){if(msg){msg.style.color="#c62828";msg.textContent="Network error";}});}'
+    +'function deletePhoto(sku,name,btn){if(!confirm("Delete this photo from the listing?"))return;fetch("/api/listings/"+sku+"/photo/"+encodeURIComponent(name),{method:"DELETE"}).then(function(r){return r.json();}).then(function(d){if(d.success){var t=btn.parentNode;if(t&&t.parentNode){t.parentNode.removeChild(t);}}else{alert("Delete failed: "+(d.error||"unknown"));}}).catch(function(){alert("Network error deleting photo.");});}'
     +'setInterval(loadQueue,10000);loadQueue();'
     +'<\/script>'
     +'</head><body>'
