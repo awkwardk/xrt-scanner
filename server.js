@@ -2121,11 +2121,12 @@ function ebayTradingMultipart(callName, xmlPayload, imageBuffer, token, callback
   req.write(body); req.end();
 }
 
-// Upload one photo to eBay via the Media API create_image_from_url operation
-// (apim.ebay.com/commerce/media/v1_beta/image/create_image_from_url). eBay fetches the image
-// from our public server URL and returns the EPS (i.ebayimg.com) CDN URL — primarily in the
-// Location header, with response.imageUrl in the JSON body as a fallback. Uses the OAuth Bearer
-// token (same one used for Browse/Trading calls). Never reads the local file.
+// Upload one photo to eBay via the Media API — TWO-STEP flow. eBay's create_image_from_url
+// only returns an API resource URI in the Location header; using that URI directly as a
+// PictureURL causes AddItem error 10124. We must then call getImage to obtain the real EPS
+// (i.ebayimg.com) URL. Uses the OAuth Bearer token; never reads the local file.
+//   STEP 1: POST create_image_from_url -> image_id (last segment of the Location header)
+//   STEP 2: GET image/{image_id}       -> response.imageUrl (the EPS URL to use as PictureURL)
 function uploadPhotoToEbay(sku, stem, token, callback){
   var photoUrl = EBAY_PHOTO_BASE + '/api/photo/' + sku + '/' + stem;
   var bodyStr = JSON.stringify({ imageUrl: photoUrl });
@@ -2143,15 +2144,49 @@ function uploadPhotoToEbay(sku, stem, token, callback){
   var req = https.request(options, function(resp){
     var d = ''; resp.on('data', function(c){ d += c; });
     resp.on('end', function(){
-      // EPS URL comes back primarily in the Location header; fall back to JSON body imageUrl
-      var imageUrl = (resp.headers && resp.headers.location) ? resp.headers.location : '';
-      if(!imageUrl){ try { var j = d ? JSON.parse(d) : {}; imageUrl = j.imageUrl || (j.image && j.image.imageUrl) || ''; } catch(e){} }
-      if(resp.statusCode >= 200 && resp.statusCode < 300 && imageUrl){ callback(null, imageUrl); return; }
-      callback(new Error('HTTP ' + resp.statusCode + (d ? (': ' + String(d).slice(0, 300)) : '')));
+      // STEP 1 result: the image resource id is the last path segment of the Location header
+      // (https://apim.ebay.com/commerce/media/v1_beta/image/{image_id}).
+      var loc = (resp.headers && resp.headers.location) ? String(resp.headers.location) : '';
+      var imageId = loc ? loc.split('?')[0].split('/').filter(Boolean).pop() : '';
+      if(!imageId){ try { var cj = d ? JSON.parse(d) : {}; imageId = cj.imageId || (cj.image && cj.image.imageId) || ''; } catch(e){} }
+      if(!(resp.statusCode >= 200 && resp.statusCode < 300) || !imageId){
+        callback(new Error('createImageFromUrl HTTP ' + resp.statusCode + (d ? (': ' + String(d).slice(0, 300)) : '')));
+        return;
+      }
+      // STEP 2: resolve the image id to its EPS (i.ebayimg.com) URL via getImage
+      getEbayImageEps(imageId, token, callback);
     });
   });
   req.on('error', function(e){ callback(e); });
   req.write(bodyStr); req.end();
+}
+
+// STEP 2 helper: GET the image resource and return its EPS imageUrl (https://i.ebayimg.com/...).
+function getEbayImageEps(imageId, token, callback){
+  var options = {
+    hostname: 'apim.ebay.com',
+    path: '/commerce/media/v1_beta/image/' + encodeURIComponent(imageId),
+    method: 'GET',
+    headers: {
+      'Authorization': 'Bearer ' + token,
+      'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US'
+    }
+  };
+  var req = https.request(options, function(resp){
+    var d = ''; resp.on('data', function(c){ d += c; });
+    resp.on('end', function(){
+      var imageUrl = '';
+      try { var j = d ? JSON.parse(d) : {}; imageUrl = j.imageUrl || (j.image && j.image.imageUrl) || ''; } catch(e){}
+      if(resp.statusCode >= 200 && resp.statusCode < 300 && imageUrl){
+        console.log('[EBAY] photo EPS URL: ' + imageUrl);
+        callback(null, imageUrl);
+        return;
+      }
+      callback(new Error('getImage HTTP ' + resp.statusCode + (d ? (': ' + String(d).slice(0, 300)) : '')));
+    });
+  });
+  req.on('error', function(e){ callback(e); });
+  req.end();
 }
 
 // Upload all output photos as base64 (weight photo already excluded from outputPhotos).
