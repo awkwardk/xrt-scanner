@@ -2058,24 +2058,39 @@ function ebayTradingMultipart(callName, xmlPayload, imageBuffer, token, callback
   req.write(body); req.end();
 }
 
-// Upload one photo file as base64 via UploadSiteHostedPictures -> eBay CDN FullURL
+// Upload one photo to eBay's Media API (apiz.ebay.com) -> returns the i.ebayimg.com CDN URL.
+// Replaces the deprecated UploadSiteHostedPictures (Trading API) call. The image binary is
+// sent directly as the request body with Content-Type image/jpeg and a Bearer OAuth token.
 function uploadPhotoToEbay(sku, stem, token, callback){
-  var photoPath = path.join(DATA_DIR, 'items', String(sku), String(stem).replace(/\.jpg$/i, '') + '.jpg');
+  var stemClean = String(stem).replace(/\.(jpe?g|png)$/i, '');
+  var isPng = /\.png$/i.test(String(stem));
+  var photoPath = path.join(DATA_DIR, 'items', String(sku), stemClean + (isPng ? '.png' : '.jpg'));
   fs.readFile(photoPath, function(err, buf){
     if(err){ callback(err); return; }
-    var xml = '<?xml version="1.0" encoding="utf-8"?>'
-      + '<UploadSiteHostedPicturesRequest xmlns="urn:ebay:apis:eBLBaseComponents">'
-      + '<PictureName>' + xmlEscape(sku + '-' + stem) + '</PictureName>'
-      + '<PictureSet>Supersize</PictureSet>'
-      + '</UploadSiteHostedPicturesRequest>';
-    ebayTradingMultipart('UploadSiteHostedPictures', xml, buf, token, function(e, sc, body){
-      if(e){ callback(e); return; }
-      // eBay returns HTTP 200 on both success and failure — check Ack, not status code
-      var ack = parseXmlTag(body, 'Ack') || '';
-      var full = parseXmlTag(body, 'FullURL');
-      if((ack === 'Success' || ack === 'Warning') && full){ callback(null, full); return; }
-      callback(new Error('photo upload Ack=' + (ack || '?') + ': ' + (parseEbayErrors(body).join('; ') || ('HTTP ' + sc))));
+    var mediaHost = (EBAY_BASE.indexOf('sandbox') >= 0) ? 'apiz.sandbox.ebay.com' : 'apiz.ebay.com';
+    var options = {
+      hostname: mediaHost,
+      path: '/sell/media/v1/image',
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + token,
+        'Content-Type': isPng ? 'image/png' : 'image/jpeg',
+        'Content-Length': buf.length
+      }
+    };
+    var req = https.request(options, function(resp){
+      var d = ''; resp.on('data', function(c){ d += c; });
+      resp.on('end', function(){
+        var imageUrl = '';
+        try { var j = d ? JSON.parse(d) : {}; imageUrl = j.imageUrl || (j.image && j.image.imageUrl) || ''; } catch(e){}
+        // Some Media API responses return the resource URL in the Location header instead of a body
+        if(!imageUrl && resp.headers && resp.headers.location){ imageUrl = resp.headers.location; }
+        if(resp.statusCode >= 200 && resp.statusCode < 300 && imageUrl){ callback(null, imageUrl); return; }
+        callback(new Error('Media API HTTP ' + resp.statusCode + (d ? (': ' + String(d).slice(0, 300)) : '')));
+      });
     });
+    req.on('error', function(e){ callback(e); });
+    req.write(buf); req.end();
   });
 }
 
@@ -2092,11 +2107,13 @@ function uploadAllPhotos(record, sku, token, callback){
     if(i >= stems.length){ callback(null, urls); return; }
     var stem = stems[i];
     uploadPhotoToEbay(sku, stem, token, function(err, cdnUrl){
-      if(!err && cdnUrl){ urls.push(cdnUrl); }
-      else {
+      if(!err && cdnUrl){
+        urls.push(cdnUrl);
+        console.log('[EBAY] photo uploaded to CDN:', cdnUrl);
+      } else {
         var fallback = EBAY_PHOTO_BASE + '/api/photo/' + sku + '/' + stem;
         urls.push(fallback);
-        console.log('[EBAY] photo upload failed for', stem, '- using fallback URL', fallback, err ? ('(' + err.message + ')') : '');
+        console.log('[EBAY] Media API photo upload failed — using fallback', fallback, err ? ('(' + err.message + ')') : '');
       }
       i++; next();
     });
@@ -2369,6 +2386,15 @@ function createEbayListing(sku, callback){
           var ack = parseXmlTag(body, 'Ack') || '';
           var itemId = parseXmlTag(body, 'ItemID') || reviseId;
           console.log('[EBAY]', callName, 'SKU', sku, '| http', sc, '| Ack', ack, '| ItemID', itemId);
+          // ISSUE 1: when eBay rejects, log every error it returned (code + short + long message)
+          if(ack !== 'Success'){
+            parseXmlAll(body, 'Errors').forEach(function(er){
+              var ec = parseXmlTag(er, 'ErrorCode') || '?';
+              var sm = parseXmlTag(er, 'ShortMessage') || '';
+              var lm = parseXmlTag(er, 'LongMessage') || '';
+              console.log('[EBAY] AddItem error ' + ec + ': ' + sm + ' — ' + lm);
+            });
+          }
           if((ack === 'Success' || ack === 'Warning') && itemId){
             record.ebay_item_id = itemId;
             record.ebay_listing_url = 'https://www.ebay.com/itm/' + itemId;
