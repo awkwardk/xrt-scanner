@@ -631,9 +631,16 @@ const server = http.createServer(function(req, res) {
     return;
   }
 
-  if(req.method==='GET' && req.url==='/ping'){
-    res.writeHead(200,{'Content-Type':'text/plain'});
-    res.end('ok');
+  // Health check (UptimeRobot). Tolerate HEAD (UptimeRobot's default probe
+  // method) plus query strings / trailing slash so it never falls through to 404.
+  if((req.method==='GET' || req.method==='HEAD') && /^\/ping\/?(\?|$)/.test(req.url)){
+    if(req.method==='HEAD'){
+      res.writeHead(200,{'Content-Type':'application/json','Cache-Control':'no-store'});
+      res.end();
+      return;
+    }
+    res.writeHead(200,{'Content-Type':'application/json'});
+    res.end(JSON.stringify({status:'ok'}));
     return;
   }
 
