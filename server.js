@@ -1549,8 +1549,202 @@ const server = http.createServer(function(req, res) {
     return;
   }
 
+  // ── PICKING APP (additive) ──
+  if(req.method==='GET' && req.url==='/pick'){
+    res.writeHead(200,{'Content-Type':'text/html; charset=utf-8'});
+    res.end(renderPickPage());
+    return;
+  }
+  if(req.method==='GET' && req.url.split('?')[0]==='/api/pick/orders'){
+    fetchPickOrders(function(_e, result){ sendJSON(res, 200, result || { error:'Unknown error', orders: [] }); });
+    return;
+  }
+
   res.writeHead(404);res.end('Not found');
 });
+
+// ── PICKING APP BACKEND (additive — never crashes, always returns JSON) ──
+function pickDateOnly(dt){
+  try { var y = dt.getFullYear(), m = ('0'+(dt.getMonth()+1)).slice(-2), d = ('0'+dt.getDate()).slice(-2); return y+'-'+m+'-'+d; }
+  catch(e){ return ''; }
+}
+function pickShelfFromSku(sku){
+  sku = String(sku == null ? '' : sku).trim();
+  if(!sku || sku.indexOf('-') < 0) return 'UNKNOWN';
+  var part = sku.slice(sku.lastIndexOf('-') + 1).trim();
+  return part || 'UNKNOWN';
+}
+function pickStatus(shipByDate, todayStr){
+  if(!shipByDate) return 'upcoming';
+  var sd = pickDateOnly(new Date(shipByDate));
+  if(!sd) return 'upcoming';
+  if(sd < todayStr) return 'overdue';
+  if(sd === todayStr) return 'today';
+  return 'upcoming';
+}
+function pickShelfParts(shelf){
+  if(!shelf || shelf === 'UNKNOWN') return { unit:'ZZZ', num:999999, suffix:'ZZ', unknown:true };
+  var m = /^([A-Za-z]+)(\d+)([A-Za-z]*)$/.exec(String(shelf).trim());
+  if(!m) return { unit:String(shelf).toUpperCase(), num:0, suffix:'', unknown:false };
+  return { unit:m[1].toUpperCase(), num:parseInt(m[2],10)||0, suffix:(m[3]||'').toUpperCase(), unknown:false };
+}
+function pickSort(a, b){
+  var pa = pickShelfParts(a.shelfLocation), pb = pickShelfParts(b.shelfLocation);
+  if(pa.unknown !== pb.unknown) return pa.unknown ? 1 : -1;       // UNKNOWN sorts last
+  if(pa.unit !== pb.unit) return pa.unit < pb.unit ? -1 : 1;       // A before B
+  if(pa.num !== pb.num) return pa.num - pb.num;                    // 1 before 2
+  if(pa.suffix !== pb.suffix) return pa.suffix < pb.suffix ? -1 : 1; // A before B suffix
+  var pri = { overdue:0, today:1, upcoming:2 };                    // overdue first within a shelf
+  return (pri[a.status] == null ? 3 : pri[a.status]) - (pri[b.status] == null ? 3 : pri[b.status]);
+}
+// Flatten eBay orders[] -> one entry per line item, with shelf + status, sorted by shelf.
+function buildPickItems(orders){
+  var todayStr = pickDateOnly(new Date());
+  var out = [];
+  (Array.isArray(orders) ? orders : []).forEach(function(order){
+    try {
+      var lineItems = Array.isArray(order.lineItems) ? order.lineItems : [];
+      var orderShipBy = (lineItems[0] && lineItems[0].lineItemFulfillmentInstructions && lineItems[0].lineItemFulfillmentInstructions.shipByDate) || null;
+      lineItems.forEach(function(li){
+        var sku = li.sku || '';
+        var liShipBy = (li.lineItemFulfillmentInstructions && li.lineItemFulfillmentInstructions.shipByDate) || orderShipBy;
+        out.push({
+          orderId: order.orderId || '',
+          buyerUsername: (order.buyer && order.buyer.username) || '',
+          orderDate: order.creationDate || '',
+          shipByDate: liShipBy || '',
+          lineItemId: li.lineItemId || '',
+          title: li.title || '(no title)',
+          sku: sku,
+          quantity: parseInt(li.quantity, 10) || 1,
+          shelfLocation: pickShelfFromSku(sku),
+          status: pickStatus(liShipBy, todayStr)
+        });
+      });
+    } catch(e){}
+  });
+  out.sort(pickSort);
+  return out;
+}
+// GET unfulfilled orders from eBay's Fulfillment API. Never throws — callback(null, {orders} | {error,orders:[]}).
+function fetchPickOrders(callback){
+  getEbayToken(function(tErr, token){
+    if(tErr || !token){ console.log('[PICK] no eBay token — cannot fetch orders:', tErr ? tErr.message : 'none'); callback(null, { error: 'eBay not connected', orders: [] }); return; }
+    var path = '/sell/fulfillment/v1/order?filter=' + encodeURIComponent('orderfulfillmentstatus:{NOT_STARTED|IN_PROGRESS}') + '&limit=50';
+    var options = {
+      hostname: EBAY_BASE.replace('https://', ''),
+      path: path,
+      method: 'GET',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', 'Accept': 'application/json', 'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US' }
+    };
+    var req = https.request(options, function(resp){
+      var d = ''; resp.on('data', function(c){ d += c; });
+      resp.on('end', function(){
+        var j = null; try { j = d ? JSON.parse(d) : {}; } catch(e){ j = null; }
+        if(!j || resp.statusCode >= 400 || !Array.isArray(j.orders)){
+          console.log('[PICK] Fulfillment API error — HTTP', resp.statusCode, '— body:', String(d).slice(0, 300));
+          callback(null, { error: 'eBay API error (HTTP ' + resp.statusCode + ')', orders: [] });
+          return;
+        }
+        var items = buildPickItems(j.orders);
+        var counts = { overdue:0, today:0, upcoming:0 };
+        items.forEach(function(it){ if(counts[it.status] != null) counts[it.status]++; });
+        console.log('[PICK] fetched ' + items.length + ' orders | ' + counts.overdue + ' overdue | ' + counts.today + ' today | ' + counts.upcoming + ' upcoming');
+        callback(null, { orders: items });
+      });
+    });
+    req.on('error', function(e){ console.log('[PICK] request error:', e.message); callback(null, { error: 'Network error', orders: [] }); });
+    req.end();
+  });
+}
+
+// Picking app HTML (mobile-first, single page, all CSS+JS inline). Additive.
+function renderPickPage(){
+  return '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
+  + '<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">'
+  + '<title>Pick List</title>'
+  + '<style>'
+  + '*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}'
+  + 'body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;background:#eceff1;color:#222;}'
+  + '.wrap{max-width:480px;margin:0 auto;min-height:100vh;background:#eceff1;}'
+  + '.hdr{background:#263238;color:#fff;padding:14px 16px;position:sticky;top:0;z-index:10;}'
+  + '.hdr-row{display:flex;align-items:center;justify-content:space-between;}'
+  + '.hdr h1{font-size:20px;font-weight:700;}'
+  + '.hdr .sub{font-size:12.5px;color:#b0bec5;margin-top:2px;}'
+  + '.refresh{background:rgba(255,255,255,0.12);border:none;color:#fff;width:40px;height:40px;border-radius:50%;font-size:20px;cursor:pointer;line-height:1;}'
+  + '.refresh:active{background:rgba(255,255,255,0.28);}'
+  + '.stats{display:flex;gap:6px;margin-top:12px;}'
+  + '.stat{flex:1;text-align:center;background:rgba(255,255,255,0.08);border-radius:8px;padding:6px 2px;}'
+  + '.stat .n{font-size:18px;font-weight:700;display:block;}'
+  + '.stat .l{font-size:10px;color:#b0bec5;text-transform:uppercase;letter-spacing:0.04em;}'
+  + '.stat.ov .n{color:#ff8a80;}.stat.td .n{color:#a5d6a7;}.stat.up .n{color:#cfd8dc;}.stat.pk .n{color:#90caf9;}'
+  + '.tabs{display:flex;background:#fff;border-bottom:1px solid #dde;position:sticky;top:128px;z-index:9;}'
+  + '.tab{flex:1;text-align:center;padding:12px 4px;font-size:13px;font-weight:600;color:#789;cursor:pointer;border-bottom:3px solid transparent;}'
+  + '.tab.active{color:#1565c0;border-bottom-color:#1565c0;}'
+  + '.list{padding:12px;}'
+  + '.card{background:#fff;border-radius:10px;box-shadow:0 1px 4px rgba(0,0,0,0.12);padding:14px;margin-bottom:12px;transition:opacity .25s,transform .25s;}'
+  + '.card.gone{opacity:0;transform:translateX(40px);}'
+  + '.card.picked{opacity:0.6;background:#f5f5f5;}'
+  + '.crow{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:8px;}'
+  + '.shelf{font-size:20px;font-weight:800;color:#fff;border-radius:8px;padding:6px 12px;min-width:54px;text-align:center;line-height:1.1;}'
+  + '.shelf.overdue{background:#c62828;}.shelf.today{background:#2e7d32;}.shelf.upcoming{background:#607d8b;}'
+  + '.qty{background:#e65100;color:#fff;font-size:12px;font-weight:700;border-radius:6px;padding:4px 8px;white-space:nowrap;}'
+  + '.pkbadge{background:#455a64;color:#fff;font-size:12px;font-weight:700;border-radius:6px;padding:4px 8px;}'
+  + '.title{font-size:15px;font-weight:700;line-height:1.3;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}'
+  + '.sku{font-size:12px;color:#90a4ae;margin-top:4px;}'
+  + '.shipby{font-size:13px;font-weight:600;margin-top:6px;}'
+  + '.shipby.overdue{color:#c62828;}.shipby.today{color:#e65100;}.shipby.upcoming{color:#789;}'
+  + '.btn{display:block;width:100%;margin-top:12px;background:#2e7d32;color:#fff;border:none;border-radius:10px;padding:14px;font-size:16px;font-weight:700;cursor:pointer;}'
+  + '.btn:active{background:#1b5e20;}'
+  + '.unmark{display:inline-block;margin-top:10px;color:#1565c0;font-size:13px;text-decoration:underline;cursor:pointer;}'
+  + '.empty{text-align:center;padding:50px 20px;color:#789;}'
+  + '.empty .big{font-size:44px;margin-bottom:10px;}'
+  + '.empty button{margin-top:16px;background:#1565c0;color:#fff;border:none;border-radius:8px;padding:12px 22px;font-size:14px;font-weight:700;cursor:pointer;}'
+  + '.sk{background:#fff;border-radius:10px;padding:14px;margin-bottom:12px;}'
+  + '.sk .bar{background:#e3e7ea;border-radius:6px;height:14px;margin-bottom:10px;animation:pulse 1.2s infinite;}'
+  + '.sk .bar.s{width:54px;height:36px;}.sk .bar.t{width:80%;}.sk .bar.b{width:50%;}.sk .bar.btn{height:44px;margin-top:4px;}'
+  + '@keyframes pulse{0%{opacity:1;}50%{opacity:0.45;}100%{opacity:1;}}'
+  + '</style></head><body><div class="wrap">'
+  + '<div class="hdr"><div class="hdr-row"><div><h1>Pick List</h1><div class="sub" id="subDate">&nbsp;</div></div>'
+  + '<button class="refresh" onclick="load()" title="Refresh">&#8635;</button></div>'
+  + '<div class="stats">'
+  + '<div class="stat ov"><span class="n" id="sOver">0</span><span class="l">Overdue</span></div>'
+  + '<div class="stat td"><span class="n" id="sToday">0</span><span class="l">Today</span></div>'
+  + '<div class="stat up"><span class="n" id="sUp">0</span><span class="l">Upcoming</span></div>'
+  + '<div class="stat pk"><span class="n" id="sPick">0</span><span class="l">Picked</span></div>'
+  + '</div></div>'
+  + '<div class="tabs">'
+  + '<div class="tab" data-tab="all" onclick="setTab(\'all\')">All</div>'
+  + '<div class="tab active" data-tab="topick" onclick="setTab(\'topick\')">To Pick</div>'
+  + '<div class="tab" data-tab="picked" onclick="setTab(\'picked\')">Picked</div>'
+  + '</div>'
+  + '<div class="list" id="list"></div>'
+  + '</div>'
+  + '<script>'
+  + 'var ORDERS=[];var currentTab="topick";var loadErr=false;'
+  + 'function esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");}'
+  + 'function loadPicked(){try{return JSON.parse(localStorage.getItem("xrt_picked")||"{}")||{};}catch(e){return {};}}'
+  + 'function savePicked(p){try{localStorage.setItem("xrt_picked",JSON.stringify(p));}catch(e){}}'
+  + 'function keyOf(it,i){return [it.orderId||"",it.lineItemId||"",it.sku||"",i].join("|");}'
+  + 'function fmtShip(iso){if(!iso)return "\\u2014";var d=new Date(iso);if(isNaN(d.getTime()))return iso;var wd=["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][d.getDay()];var mo=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][d.getMonth()];return wd+" "+mo+" "+d.getDate();}'
+  + 'function setSubDate(){var n=new Date();var WD=["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];var MO=["January","February","March","April","May","June","July","August","September","October","November","December"];document.getElementById("subDate").textContent=WD[n.getDay()]+", "+MO[n.getMonth()]+" "+n.getDate();}'
+  + 'function setTab(t){currentTab=t;var tabs=document.querySelectorAll(".tab");for(var i=0;i<tabs.length;i++){tabs[i].classList.toggle("active",tabs[i].getAttribute("data-tab")===t);}render();}'
+  + 'function markPicked(k){var p=loadPicked();p[k]=true;savePicked(p);render();}'
+  + 'function unmark(k){var p=loadPicked();delete p[k];savePicked(p);render();}'
+  + 'function skeleton(){var s="";for(var i=0;i<3;i++){s+="<div class=\\"sk\\"><div class=\\"bar s\\"></div><div class=\\"bar t\\"></div><div class=\\"bar b\\"></div><div class=\\"bar btn\\"></div></div>";}document.getElementById("list").innerHTML=s;}'
+  + 'function cardHtml(it,k,isPicked){var st=it.status||"upcoming";var h="";h+="<div class=\\"card"+(isPicked?" picked":"")+"\\" id=\\"c_"+encodeURIComponent(k)+"\\">";h+="<div class=\\"crow\\"><div class=\\"shelf "+st+"\\">"+esc(it.shelfLocation||"?")+"</div>";if(isPicked){h+="<div class=\\"pkbadge\\">&#10003; Picked</div>";}else if(it.quantity>1){h+="<div class=\\"qty\\">QTY: "+it.quantity+"</div>";}h+="</div>";h+="<div class=\\"title\\">"+esc(it.title)+"</div>";h+="<div class=\\"sku\\">SKU: "+esc(it.sku||"\\u2014")+"</div>";h+="<div class=\\"shipby "+st+"\\">Ship by: "+esc(fmtShip(it.shipByDate))+"</div>";if(isPicked){h+="<span class=\\"unmark\\" onclick=\\"unmark(\'"+k.replace(/\'/g,"")+"\')\\">Unmark</span>";}else{h+="<button class=\\"btn\\" onclick=\\"markPicked(\'"+k.replace(/\'/g,"")+"\')\\">&#10003; Mark Picked</button>";}h+="</div>";return h;}'
+  + 'function render(){setSubDate();var p=loadPicked();var ov=0,td=0,up=0,pk=0;ORDERS.forEach(function(it,i){var k=keyOf(it,i);if(p[k]){pk++;return;}if(it.status==="overdue")ov++;else if(it.status==="today")td++;else up++;});document.getElementById("sOver").textContent=ov;document.getElementById("sToday").textContent=td;document.getElementById("sUp").textContent=up;document.getElementById("sPick").textContent=pk;'
+  + 'var listEl=document.getElementById("list");'
+  + 'if(loadErr){listEl.innerHTML="<div class=\\"empty\\"><div class=\\"big\\">&#9888;</div><div>Could not load orders. Check eBay connection.</div><button onclick=\\"load()\\">Retry</button></div>";return;}'
+  + 'var rows=ORDERS.map(function(it,i){return {it:it,k:keyOf(it,i),picked:!!p[keyOf(it,i)]};});'
+  + 'var shown=rows.filter(function(x){if(currentTab==="picked")return x.picked;if(currentTab==="topick")return !x.picked;return true;});'
+  + 'if(ORDERS.length===0){listEl.innerHTML="<div class=\\"empty\\"><div class=\\"big\\">&#128230;</div><div>No orders to pick today. Check back later.</div><button onclick=\\"load()\\">&#8635; Refresh</button></div>";return;}'
+  + 'if(shown.length===0){if(currentTab==="topick"){listEl.innerHTML="<div class=\\"empty\\"><div class=\\"big\\">&#10003;</div><div>All items picked! Great work.</div></div>";}else if(currentTab==="picked"){listEl.innerHTML="<div class=\\"empty\\"><div>No picked items yet.</div></div>";}else{listEl.innerHTML="<div class=\\"empty\\"><div>Nothing here.</div></div>";}return;}'
+  + 'var html="";shown.forEach(function(x){html+=cardHtml(x.it,x.k,x.picked);});listEl.innerHTML=html;}'
+  + 'function load(){loadErr=false;skeleton();fetch("/api/pick/orders").then(function(r){return r.json();}).then(function(d){ORDERS=(d&&Array.isArray(d.orders))?d.orders:[];loadErr=!!(d&&d.error&&ORDERS.length===0);render();}).catch(function(){ORDERS=[];loadErr=true;render();});}'
+  + 'setSubDate();load();'
+  + '</scr' + 'ipt></body></html>';
+}
 
 // NOTE: listings storage + page rendering are defined once, lower in this file
 // (folder-scanning loadListings/saveListings/rebuildListings + generateListingsPage).
