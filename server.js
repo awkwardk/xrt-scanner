@@ -1555,6 +1555,24 @@ const server = http.createServer(function(req, res) {
     res.end(renderPickPage());
     return;
   }
+  if(req.method==='GET' && req.url==='/pick-icon.svg'){
+    res.writeHead(200,{'Content-Type':'image/svg+xml'});
+    res.end('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192"><rect width="192" height="192" rx="24" fill="#FFD700"/><text x="96" y="140" text-anchor="middle" font-family="sans-serif" font-weight="bold" font-size="120" fill="#1a1a1a">P</text></svg>');
+    return;
+  }
+  if(req.method==='GET' && req.url==='/pick-manifest.json'){
+    res.writeHead(200,{'Content-Type':'application/json'});
+    res.end(JSON.stringify({
+      name: 'XRT Pick List',
+      short_name: 'Pick List',
+      start_url: '/pick',
+      display: 'standalone',
+      background_color: '#1a1a1a',
+      theme_color: '#FFD700',
+      icons: [ { src: '/pick-icon.svg', sizes: '192x192', type: 'image/svg+xml' } ]
+    }));
+    return;
+  }
   if(req.method==='GET' && req.url.split('?')[0]==='/api/pick/orders'){
     fetchPickOrders(function(_e, result){ sendJSON(res, 200, result || { error:'Unknown error', orders: [] }); });
     return;
@@ -1662,6 +1680,13 @@ function fetchPickOrders(callback){
 function renderPickPage(){
   return '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
   + '<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">'
+  + '<link rel="icon" type="image/svg+xml" href="/pick-icon.svg">'
+  + '<link rel="apple-touch-icon" href="/pick-icon.svg">'
+  + '<link rel="manifest" href="/pick-manifest.json">'
+  + '<meta name="apple-mobile-web-app-capable" content="yes">'
+  + '<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">'
+  + '<meta name="apple-mobile-web-app-title" content="Pick List">'
+  + '<meta name="theme-color" content="#FFD700">'
   + '<title>Pick List</title>'
   + '<style>'
   + '*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}'
