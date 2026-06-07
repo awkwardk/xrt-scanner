@@ -1223,10 +1223,34 @@ const server = http.createServer(function(req, res) {
           console.log('[LISTING] SKU ' + pSku + ' photo order updated: ' + clean.join(', '));
         }
       }
+      // FIX 1 (this task): partial item-specifics edit/add from the listings page. Merge the
+      // incoming fields into the existing object — never wipe fields not included in the patch.
+      if(parsed.item_specifics !== undefined && parsed.item_specifics && typeof parsed.item_specifics === 'object' && !Array.isArray(parsed.item_specifics)){
+        pRec.listing = pRec.listing || {};
+        if(!pRec.listing.item_specifics || typeof pRec.listing.item_specifics !== 'object' || Array.isArray(pRec.listing.item_specifics)) pRec.listing.item_specifics = {};
+        Object.keys(parsed.item_specifics).forEach(function(fk){
+          var name = String(fk).trim();
+          if(!name) return;
+          var val = parsed.item_specifics[fk];
+          pRec.listing.item_specifics[name] = (val == null ? '' : (Array.isArray(val) ? val : String(val))); // empty allowed
+          console.log('[LISTING] SKU ' + pSku + ' item specific "' + name + '" updated');
+        });
+        // Clear any now-filled fields from the missing-required list; lift the review flag when done
+        if(Array.isArray(pRec.missing_specifics)){
+          var isObj = pRec.listing.item_specifics;
+          pRec.missing_specifics = pRec.missing_specifics.filter(function(nm){
+            var v = isObj[nm]; var has = Array.isArray(v) ? v.join('').trim() : String(v == null ? '' : v).trim();
+            // also match case-insensitively
+            if(!has){ Object.keys(isObj).forEach(function(kk){ if(kk.toLowerCase() === String(nm).toLowerCase()){ var vv = isObj[kk]; if(Array.isArray(vv)?vv.join('').trim():String(vv==null?'':vv).trim()) has = true; } }); }
+            return !has;
+          });
+          if(pRec.missing_specifics.length === 0){ pRec.needs_specifics_review = false; }
+        }
+      }
       try { fs.writeFileSync(pLp, JSON.stringify(pRec, null, 2)); }
       catch(e){ sendJSON(res,500,{success:false, error:'Write failed'}); return; }
       if(parsed.quantity !== undefined) console.log('[LISTING] SKU', pSku, '- updated quantity to', pRec.quantity);
-      sendJSON(res,200,{success:true, quantity: pRec.quantity, suggested_price: (pRec.listing && pRec.listing.suggested_price), photo_order: pRec.outputPhotos});
+      sendJSON(res,200,{success:true, quantity: pRec.quantity, suggested_price: (pRec.listing && pRec.listing.suggested_price), photo_order: pRec.outputPhotos, item_specifics: (pRec.listing && pRec.listing.item_specifics), missing_specifics: pRec.missing_specifics, needs_specifics_review: pRec.needs_specifics_review});
     });
     return;
   }
@@ -2673,10 +2697,18 @@ function createEbayListing(sku, callback){
           var missing = requiredAspects.filter(function(name){ return !present[String(name).toLowerCase()]; });
           if(missing.length){
             console.log('[EBAY] SKU ' + sku + ' blocked — missing required specifics: ' + missing.join(', '));
+            // Persist the flag so the listings page can highlight the missing fields for editing.
+            record.needs_specifics_review = true; record.missing_specifics = missing;
+            try { fs.writeFileSync(listingPath, JSON.stringify(record, null, 2)); } catch(_w){}
             callback(null, { blocked_specifics: true, success: false, missing_specifics: missing, needs_specifics_review: true,
               error: 'Required item specifics missing: ' + missing.join(', ') + '. Edit this listing to add these before posting.' });
             return;
           }
+        }
+        // all required present — clear any prior review flag so the red highlight goes away
+        if(record.needs_specifics_review || (record.missing_specifics && record.missing_specifics.length)){
+          record.needs_specifics_review = false; record.missing_specifics = [];
+          try { fs.writeFileSync(listingPath, JSON.stringify(record, null, 2)); } catch(_w){}
         }
         proceedCreate(token);
       });
@@ -3003,7 +3035,7 @@ function generateListingsPage(listings, ebayStat){
         var posLabel = (p===1 && st.indexOf('test_photo')===0) ? 'Test' : ('Photo '+(p+1));
         thumbs += '<div class="lp-thumb" data-sku="'+skuStr+'" data-stem="'+st+'" style="position:relative;flex:0 0 auto;cursor:grab;">'
           +'<div class="lp-grip" title="Drag to reorder" style="position:absolute;top:0;left:0;bottom:0;width:28px;display:flex;align-items:center;justify-content:center;z-index:2;background:rgba(0,0,0,0.45);color:#fff;border-radius:6px 0 0 6px;font-size:15px;cursor:grab;touch-action:none;">&#9776;</div>'
-          +'<img src="/api/photo/'+skuStr+'/'+st+'" style="width:90px;height:90px;object-fit:cover;border-radius:6px;border:2px solid '+(st.indexOf("test_photo")===0?"#2e7d32":"#e0e0e0")+';cursor:pointer;" onclick="window.open(this.src)" title="Click to view full size">'
+          +'<img src="/api/photo/'+skuStr+'/'+st+'" style="width:90px;height:90px;object-fit:cover;border-radius:6px;border:2px solid '+(st.indexOf("test_photo")===0?"#2e7d32":"#e0e0e0")+';cursor:pointer;pointer-events:none;" title="Drag to reorder; tap to view">'
           +'<button class="thumb-del-btn" onclick="deletePhoto(\''+skuStr+'\',\''+st+'\',this)" title="Delete photo" style="position:absolute;top:-7px;right:-7px;width:22px;height:22px;border-radius:50%;border:none;background:#c62828;color:#fff;font-size:14px;font-weight:bold;line-height:1;cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,0.4);">&times;</button>'
           +'</div>';
         dlBtns += '<a href="/api/photo/'+skuStr+'/'+st+'" download="'+skuStr+'-'+safeTitle+'-photo'+(p+1)+'.jpg" style="padding:6px 12px;border:1px solid #1565c0;border-radius:4px;font-size:12px;font-weight:bold;background:#fff;color:#1565c0;text-decoration:none;">'+posLabel+'</a>';
@@ -3027,19 +3059,46 @@ function generateListingsPage(listings, ebayStat){
     var catId = r.ebay_category_id || listing.category_id || '';
     var catName = r.ebay_category_name || '';
     var reqList = Array.isArray(r.ebay_required_specifics) ? r.ebay_required_specifics.map(function(n){ return String(n).toLowerCase(); }) : [];
+    // FIX 1: missing-required highlight (set when send-to-ebay blocked on required specifics)
+    var missingReq = (Array.isArray(r.missing_specifics) ? r.missing_specifics : []).map(function(n){ return String(n).toLowerCase(); });
+    var needsReview = r.needs_specifics_review === true;
     var detailRows = '';
     if(catId){
       detailRows += '<tr><td style="border:1px solid #e0e0e0;padding:5px 8px;font-weight:bold;width:35%;background:#eef5ff;">eBay Category</td><td style="border:1px solid #e0e0e0;padding:5px 8px;background:#eef5ff;">'+(catName?catName+' ':'')+'('+catId+')</td></tr>';
     }
     specKeys.forEach(function(k){
-      var v = spec[k]; v = Array.isArray(v) ? v.join(', ') : v;
-      var reqTag = reqList.indexOf(k.toLowerCase()) >= 0 ? ' <span style="color:#c62828;font-size:11px;">(required)</span>' : '';
-      detailRows += '<tr><td style="border:1px solid #e0e0e0;padding:5px 8px;font-weight:bold;width:35%;background:#fafafa;">'+k+reqTag+'</td><td style="border:1px solid #e0e0e0;padding:5px 8px;">'+v+'</td></tr>';
+      var v = spec[k]; v = Array.isArray(v) ? v.join(', ') : (v==null?'':v);
+      var isReq = reqList.indexOf(k.toLowerCase()) >= 0;
+      var isMissing = (missingReq.indexOf(k.toLowerCase()) >= 0) || (needsReview && isReq && !String(v).trim());
+      var reqTag = isReq ? ' <span style="color:#c62828;font-size:11px;">(required)</span>' : '';
+      var fAttr = String(k).replace(/"/g,'&quot;');
+      var nameStyle = 'border:1px solid #e0e0e0;padding:5px 8px;font-weight:bold;width:35%;background:#fafafa;' + (isMissing?'color:#c62828;border-left:3px solid #c62828;':'');
+      var valStyle = 'border:1px solid #e0e0e0;padding:5px 8px;cursor:pointer;' + (isMissing?'border-left:3px solid #c62828;':'');
+      var valCell = String(v).trim() ? v : (isMissing ? '<span style="color:#c62828;">Required &mdash; tap to add</span>' : '<span style="color:#bbb;">(tap to add)</span>');
+      detailRows += '<tr>'
+        +'<td style="'+nameStyle+'">'+k+reqTag+'</td>'
+        +'<td class="spec-val" data-sku="'+skuStr+'" data-field="'+fAttr+'" onclick="editSpec(this)" title="Click to edit" style="'+valStyle+'">'+valCell+'</td></tr>';
+    });
+    // FIX 1: also render rows for required fields that are MISSING from item_specifics entirely,
+    // so the user can tap to add them (these caused the eBay block).
+    var _renderedLower = {}; specKeys.forEach(function(k){ _renderedLower[k.toLowerCase()] = true; });
+    (Array.isArray(r.missing_specifics) ? r.missing_specifics : []).forEach(function(mf){
+      if(_renderedLower[String(mf).toLowerCase()]) return;
+      var mAttr = String(mf).replace(/"/g,'&quot;');
+      detailRows += '<tr>'
+        +'<td style="border:1px solid #e0e0e0;padding:5px 8px;font-weight:bold;width:35%;background:#fafafa;color:#c62828;border-left:3px solid #c62828;">'+mf+' <span style="color:#c62828;font-size:11px;">(required)</span></td>'
+        +'<td class="spec-val" data-sku="'+skuStr+'" data-field="'+mAttr+'" onclick="editSpec(this)" title="Click to edit" style="border:1px solid #e0e0e0;padding:5px 8px;cursor:pointer;border-left:3px solid #c62828;"><span style="color:#c62828;">Required &mdash; tap to add</span></td></tr>';
     });
     var specHtml = '';
     if(detailRows){
-      specHtml = '<details style="margin-top:12px;"><summary style="cursor:pointer;font-size:12px;font-weight:bold;color:#1565c0;letter-spacing:0.04em;">eBay Details &mdash; Category &amp; Item Specifics ('+specKeys.length+')</summary>'
-        +'<table style="border-collapse:collapse;width:100%;font-size:12.5px;color:#444;margin-top:8px;">'+detailRows+'</table></details>';
+      specHtml = '<details'+(needsReview?' open':'')+' style="margin-top:12px;"><summary style="cursor:pointer;font-size:12px;font-weight:bold;color:'+(needsReview?'#c62828':'#1565c0')+';letter-spacing:0.04em;">eBay Details &mdash; Category &amp; Item Specifics ('+specKeys.length+')'+(needsReview?' &mdash; required fields missing':'')+'</summary>'
+        +'<table style="border-collapse:collapse;width:100%;font-size:12.5px;color:#444;margin-top:8px;">'+detailRows+'</table>'
+        +'<div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap;align-items:center;">'
+          +'<input id="nf_name_'+skuStr+'" type="text" placeholder="Field name" style="flex:1;min-width:110px;padding:5px 7px;border:1px solid #bbb;border-radius:4px;font-size:12.5px;">'
+          +'<input id="nf_val_'+skuStr+'" type="text" placeholder="Value" style="flex:1;min-width:110px;padding:5px 7px;border:1px solid #bbb;border-radius:4px;font-size:12.5px;">'
+          +'<button onclick="addSpec(\''+skuStr+'\')" style="padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12.5px;font-weight:bold;background:#455a64;color:#fff;">Add field</button>'
+          +'<span id="specmsg_'+skuStr+'" style="font-weight:bold;font-size:12px;"></span>'
+        +'</div></details>';
     }
 
     // eBay publish button — always visible on every card (FIX 1). When already listed,
@@ -3128,7 +3187,10 @@ function generateListingsPage(listings, ebayStat){
     +'function markListed(sku,url){var cb=document.querySelector(".bulkSel[value=\\""+sku+"\\"]");if(cb&&cb.parentNode){cb.parentNode.removeChild(cb);}var b=document.getElementById("ebaybtn_"+sku);if(b){var a=document.createElement("a");a.id="ebaybtn_"+sku;a.href=url||"#";a.target="_blank";a.textContent="Listed \\u2713";a.style.cssText="padding:8px 16px;border-radius:4px;font-size:13px;font-weight:bold;background:#2e7d32;color:#fff;text-decoration:none;";if(b.parentNode)b.parentNode.replaceChild(a,b);}}'
     +'function listSelected(){var skus=Array.prototype.slice.call(document.querySelectorAll(".bulkSel:checked")).map(function(b){return b.value;});if(!skus.length)return;if(!confirm("List "+skus.length+" items on eBay?"))return;var prog=document.getElementById("bulkProgress");var btn=document.getElementById("listSelectedBtn");if(btn){btn.disabled=true;btn.style.opacity="0.5";btn.style.cursor="not-allowed";}var ok=0,fails=[],idx=0;function postNext(){if(idx>=skus.length){if(prog){prog.textContent="Listed "+ok+" items successfully, "+fails.length+" failed"+(fails.length?(" ("+fails.map(function(f){return f.sku+": "+f.error;}).join("; ")+")"):"");}updateBulkCount();return;}var sku=skus[idx];idx++;if(prog){prog.textContent="Listing item "+idx+" of "+skus.length+"...";}fetch("/api/send-to-ebay",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sku:parseInt(sku,10)})}).then(function(r){return r.json();}).then(function(d){if(d.success){ok++;markListed(sku,d.listing_url);}else{fails.push({sku:sku,error:(d.error||"failed")});}}).catch(function(){fails.push({sku:sku,error:"network error"});}).then(function(){setTimeout(postNext,2000);});}postNext();}'
     +'function savePhotoOrder(sku,order,strip){var msg=strip.parentNode.querySelector(".lp-order-msg");fetch("/api/listings/"+sku,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({photo_order:order})}).then(function(r){return r.json();}).then(function(d){if(d.success){if(msg){msg.style.color="#2e7d32";msg.textContent="Order saved";setTimeout(function(){msg.textContent="";},1500);}}else{if(msg){msg.style.color="#c62828";msg.textContent=d.error||"Save failed";}}}).catch(function(){if(msg){msg.style.color="#c62828";msg.textContent="Network error";}});}'
-    +'function setupStrip(strip){var dragEl=null,dragging=false,sku=null;function thumbs(){return Array.prototype.slice.call(strip.querySelectorAll(".lp-thumb"));}function moveTo(x,y){if(!dragEl)return;var over=document.elementFromPoint(x,y);if(!over)return;var t=over.closest?over.closest(".lp-thumb"):null;if(t&&t!==dragEl&&t.parentNode===strip){var rect=t.getBoundingClientRect();var before=(x<rect.left+rect.width/2);strip.insertBefore(dragEl,before?t:t.nextSibling);}}strip.addEventListener("pointerdown",function(e){var grip=e.target.closest?e.target.closest(".lp-grip"):null;if(!grip)return;var th=grip.closest(".lp-thumb");if(!th)return;e.preventDefault();dragEl=th;dragging=true;sku=th.getAttribute("data-sku");th.style.opacity="0.5";th.style.cursor="grabbing";try{grip.setPointerCapture(e.pointerId);}catch(_e){}function mv(ev){if(!dragging)return;if(ev.cancelable)ev.preventDefault();moveTo(ev.clientX,ev.clientY);}function up(){if(!dragging)return;dragging=false;grip.removeEventListener("pointermove",mv);grip.removeEventListener("pointerup",up);grip.removeEventListener("pointercancel",up);try{grip.releasePointerCapture(e.pointerId);}catch(_e){}if(dragEl){dragEl.style.opacity="";dragEl.style.cursor="grab";var order=thumbs().map(function(x){return x.getAttribute("data-stem");});savePhotoOrder(sku,order,strip);}dragEl=null;}grip.addEventListener("pointermove",mv);grip.addEventListener("pointerup",up);grip.addEventListener("pointercancel",up);});}'
+    +'function flashTick(cell,ok){var s=document.createElement("span");s.textContent=ok?" \\u2713":" \\u2717";s.style.color=ok?"#2e7d32":"#c62828";s.style.fontWeight="bold";cell.appendChild(s);setTimeout(function(){if(s.parentNode)s.parentNode.removeChild(s);},1500);}'
+    +'function editSpec(cell){if(cell.dataset.editing)return;cell.dataset.editing="1";var sku=cell.getAttribute("data-sku");var field=cell.getAttribute("data-field");var cur=cell.textContent.replace(/\\s*[\\u2713\\u2717]\\s*$/,"").trim();if(cur==="Required \\u2014 tap to add"||cur==="(tap to add)"||cur==="(empty)")cur="";var inp=document.createElement("input");inp.type="text";inp.value=cur;inp.style.cssText="width:100%;box-sizing:border-box;padding:3px 5px;border:1px solid #1565c0;border-radius:3px;font-size:12.5px;";cell.textContent="";cell.appendChild(inp);inp.focus();inp.select();var done=false;function save(){if(done)return;done=true;var nv=inp.value;var body={item_specifics:{}};body.item_specifics[field]=nv;fetch("/api/listings/"+sku,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(function(r){return r.json();}).then(function(d){cell.removeAttribute("data-editing");if(d&&d.success){cell.textContent=(nv.trim()?nv:"(empty)");cell.style.borderLeft="1px solid #e0e0e0";var row=cell.parentNode;if(row){var nm=row.querySelector("td");if(nm){nm.style.color="";nm.style.borderLeft="1px solid #e0e0e0";}}cell.style.background="#e8f5e9";setTimeout(function(){cell.style.background="";},1200);flashTick(cell,true);}else{cell.textContent=(cur||"(empty)");flashTick(cell,false);}}).catch(function(){cell.removeAttribute("data-editing");cell.textContent=(cur||"(empty)");flashTick(cell,false);});}inp.addEventListener("blur",save);inp.addEventListener("keydown",function(e){if(e.key==="Enter"){e.preventDefault();inp.blur();}else if(e.key==="Escape"){done=true;cell.removeAttribute("data-editing");cell.textContent=(cur||"(empty)");}});}'
+    +'function addSpec(sku){var nameI=document.getElementById("nf_name_"+sku);var valI=document.getElementById("nf_val_"+sku);var msg=document.getElementById("specmsg_"+sku);var name=nameI?nameI.value.trim():"";var val=valI?valI.value:"";if(!name){if(msg){msg.style.color="#c62828";msg.textContent="Enter a field name";}return;}var body={item_specifics:{}};body.item_specifics[name]=val;if(msg){msg.style.color="#8d6e00";msg.textContent="Saving...";}fetch("/api/listings/"+sku,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(function(r){return r.json();}).then(function(d){if(d&&d.success){if(msg){msg.style.color="#2e7d32";msg.textContent="Added \\u2713";}setTimeout(function(){location.reload();},600);}else{if(msg){msg.style.color="#c62828";msg.textContent=(d&&d.error)||"Add failed";}}}).catch(function(){if(msg){msg.style.color="#c62828";msg.textContent="Network error";}});}'
+    +'function setupStrip(strip){function thumbs(){return Array.prototype.slice.call(strip.querySelectorAll(".lp-thumb"));}thumbs().forEach(function(thumb){thumb.style.cursor="grab";thumb.style.touchAction="none";var dragging=false,moved=false,sku=thumb.getAttribute("data-sku");thumb.addEventListener("pointerdown",function(e){if(e.target.closest&&e.target.closest(".thumb-del-btn"))return;e.preventDefault();try{thumb.setPointerCapture(e.pointerId);}catch(_e){}dragging=true;moved=false;});thumb.addEventListener("pointermove",function(e){if(!dragging)return;e.preventDefault();if(!moved){moved=true;thumb.style.opacity="0.7";thumb.style.cursor="grabbing";thumb.style.borderLeft="3px solid #1565c0";}var over=document.elementFromPoint(e.clientX,e.clientY);var t=(over&&over.closest)?over.closest(".lp-thumb"):null;if(t&&t!==thumb&&t.parentNode===strip){var rect=t.getBoundingClientRect();var before=(e.clientX<rect.left+rect.width/2);strip.insertBefore(thumb,before?t:t.nextSibling);}});function end(e){if(!dragging)return;dragging=false;try{thumb.releasePointerCapture(e.pointerId);}catch(_e){}thumb.style.opacity="";thumb.style.cursor="grab";thumb.style.borderLeft="";if(moved){var order=thumbs().map(function(x){return x.getAttribute("data-stem");});savePhotoOrder(sku,order,strip);}else{var im=thumb.querySelector("img");if(im)window.open(im.src);}}thumb.addEventListener("pointerup",end);thumb.addEventListener("pointercancel",function(e){if(dragging){dragging=false;thumb.style.opacity="";thumb.style.cursor="grab";thumb.style.borderLeft="";try{thumb.releasePointerCapture(e.pointerId);}catch(_e){}}});});}'
     +'function initPhotoReorder(){Array.prototype.slice.call(document.querySelectorAll(".lp-photostrip")).forEach(function(s){setupStrip(s);});}'
     +'setInterval(loadQueue,10000);loadQueue();updateBulkCount();initPhotoReorder();'
     +'<\/script>'
