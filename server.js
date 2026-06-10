@@ -1181,6 +1181,18 @@ const server = http.createServer(function(req, res) {
     return;
   }
 
+  // CHANGE 1: regenerate the listing copy (title/condition/description/pricing) for a SKU.
+  // Never crashes — always returns JSON. Preserves photos, weight, category, item_specifics, SKU.
+  if(req.method==='POST' && /^\/api\/regenerate-listing\/\d+$/.test(req.url.split('?')[0])){
+    var rgSku = req.url.split('?')[0].split('/').pop();
+    parseBody(req, function(rerr, rbody){
+      var userNotes = (rbody && rbody.notes != null) ? String(rbody.notes) : '';
+      try { regenerateListing(rgSku, userNotes, function(result){ sendJSON(res, 200, result || {success:false, error:'Unknown error'}); }); }
+      catch(e){ sendJSON(res, 200, {success:false, error:'Regeneration error'}); }
+    });
+    return;
+  }
+
   // FIX 4: PATCH /api/listings/:sku -> update editable fields (quantity) on the listing record
   if(req.method==='PATCH' && req.url.startsWith('/api/listings/')){
     var pParts = req.url.split('?')[0].split('/');
@@ -1959,6 +1971,123 @@ function detectWeightAndDims(photoB64Array, callback){
   });
 }
 
+// The improved, buyer-focused listing-generation system prompt. Shared by the main batch
+// generation and the regenerate endpoint so both stay in sync (CHANGE 2: emoji-free by default).
+function buildListingSystemPrompt(){
+  return [
+    'You are an experienced eBay reseller writing a listing for a personal resale account. You have 20+ years of eBay selling experience and know what buyers want to see.',
+    '',
+    'Your job:',
+    '- Search eBay completed/sold listings for accurate current pricing. List just below mid-range of recent sold comps.',
+    '- Write honest, specific, confident copy. No overselling, no underselling. Say what it is and what condition it is in.',
+    '- Clean up any raw seller notes into professional copy regardless of how they were written (fragments, all caps, shorthand — clean it up automatically).',
+    '- Identify and list ALL accessories and included items visible in the photos. Buyers make purchase decisions based on what is included. If a power supply, charger, cable, remote, or accessory is visible, it MUST be listed.',
+    '- Note any visible cosmetic issues honestly — scratches, scuffs, wear marks. Be specific about where they are. Honest condition notes build buyer trust and reduce returns.',
+    '- Include a brief practical description of what the item is and what it is used for (1-2 sentences). Not every buyer knows every product.',
+    '- Do NOT include serial numbers, internal SKUs, or pricing context in the buyer-facing description.',
+    '- Do NOT use these words (eBay policy violation): "like new", "vintage", "mint", "mint condition", "copy", "reproduction", "insurance", "check", "money order"',
+    'Do NOT use emoji characters (⚠ ✓ ★ ✔ © ® ™ or any others) anywhere in the title or description.',
+    'Do NOT use special Unicode symbols.',
+    'Plain text and standard HTML only.',
+    'eBay listing policy flags emoji and special characters.',
+    '',
+    'Grade scale:',
+    '  A = Like New / Open Box — minimal or no wear',
+    '  B = Good — normal light wear, fully functional',
+    '  C = Fair — heavy visible wear, fully functional',
+    '  D = Parts/Untested — may not work',
+    '',
+    'HTML description structure (use this exact structure):',
+    '<h2>[Item Name] - [One line hook about condition/value]</h2>',
+    '<p>[2-3 sentences: what it is, what it does, why a buyer would want it. Honest and practical.]</p>',
+    '',
+    '<h3>What is Included:</h3>',
+    '<ul>',
+    '[List every included item and accessory — be specific]',
+    '</ul>',
+    '',
+    '<h3>Condition Details:</h3>',
+    '<p>[Honest specific condition — note visible wear locations. If Grade A: minimal wear noted. If Grade D: state clearly not tested or for parts.]</p>',
+    '',
+    '<h3>Tested & Working:</h3>',
+    '<p>[What was tested and confirmed working. For Grade D: state sold as-is for parts or repair, not tested.]</p>',
+    '',
+    '<b>[One closing line — practical use case or value statement. No hype. No "do not miss out". Just honest practical value.]</b>',
+    '',
+    'Return ONLY this JSON, no markdown:',
+    '{"title":"eBay title under 80 chars with brand model key terms — no banned words","condition_box":"2-3 honest sentences for eBay condition field","description_html":"complete HTML using structure above","avg_sold_price":45,"price_low":30,"price_high":65,"suggested_price":48,"accept_price":38,"decline_price":28,"shipping":"GA Ground","item_specifics":{"Brand":"value","Model":"value","Type":"value"}}'
+  ].join('\n');
+}
+// Regenerate just the listing COPY (title/condition/description/pricing) for an existing SKU.
+// Preserves photos, weight, category, item_specifics, SKU and every other field. Never crashes.
+function regenerateListing(sku, userNotes, callback){
+  var itemDir = path.join(DATA_DIR, 'items', String(sku));
+  var lp = path.join(itemDir, 'listing.json');
+  if(!fs.existsSync(lp)){ callback({success:false, error:'Listing not found for SKU ' + sku}); return; }
+  var record; try { record = JSON.parse(fs.readFileSync(lp, 'utf8')); } catch(e){ callback({success:false, error:'Bad listing.json'}); return; }
+  var listing = record.listing || {};
+  var meta = record.meta || {};
+  var idItem = meta.identified_item || {};
+  var vis = record.visionData || {};
+  var itemName = idItem.item_name || listing.title || ('SKU ' + sku);
+  var gradeLetter = String(meta.grade || 'B').toUpperCase();
+  var gradeFull = ({A:'Like New / Open Box', B:'Good', C:'Fair', D:'Parts/Untested'})[gradeLetter] || 'Good';
+  var catName = record.ebay_category_name || idItem.ebay_category_name || (record.ebay_category_id ? ('ID ' + record.ebay_category_id) : '');
+  var includes = idItem.includes || vis.includes || 'See photos';
+  var condNotes = idItem.condition_notes || vis.condition_notes || 'See photos';
+  var sellerNotes = [meta.test_notes, meta.notes].filter(Boolean).join(' | ') || 'None';
+  userNotes = userNotes ? String(userNotes).trim() : '';
+  console.log('[REGEN] SKU ' + sku + ' regenerating with notes: "' + userNotes + '"');
+
+  var sysLines = [
+    buildListingSystemPrompt(),
+    '',
+    'IMPORTANT REGENERATION RULES:',
+    '- Do NOT use any emoji characters (⚠ ✓ ★ etc) anywhere in the title or description',
+    '- Do NOT use special Unicode symbols',
+    '- Do NOT use the phrase "like new", "vintage", "mint", "mint condition"',
+    '- Plain text and standard HTML only'
+  ];
+  if(userNotes){ sysLines.push('Also address this feedback from the seller: ' + userNotes); }
+  var systemPrompt = sysLines.join('\n');
+
+  var userMessage = [
+    'Item: ' + itemName,
+    'Grade: ' + gradeLetter + ' (' + gradeFull + ')',
+    'Category: ' + (catName || 'not specified'),
+    'Includes: ' + includes,
+    'Condition notes: ' + condNotes,
+    'Original seller notes: ' + sellerNotes,
+    'Seller feedback for this regeneration: ' + (userNotes || 'None'),
+    '',
+    'Regenerate the listing. Search eBay sold listings for current pricing. Return the same JSON format.'
+  ].join('\n');
+
+  callClaude({
+    model: 'claude-sonnet-4-5',
+    max_tokens: 2500,
+    system: systemPrompt,
+    tools: [{type:'web_search_20250305', name:'web_search', max_uses:5}],
+    messages: [{role:'user', content: userMessage}]
+  }, function(err, resp){
+    if(err || !resp){ callback({success:false, error:'AI request failed'}); return; }
+    var data = extractFirstJson(extractText(resp.content));
+    if(!data || !data.title){ callback({success:false, error:'Could not parse regenerated listing'}); return; }
+    record.listing = record.listing || {};
+    record.listing.title = String(data.title);
+    if(data.condition_box != null) record.listing.condition_box = String(data.condition_box);
+    if(data.description_html != null) record.listing.description_html = String(data.description_html);
+    if(data.avg_sold_price != null && !isNaN(parseFloat(data.avg_sold_price))) record.listing.avg_sold_price = parseFloat(data.avg_sold_price);
+    if(data.price_low != null && !isNaN(parseFloat(data.price_low))) record.listing.price_low = parseFloat(data.price_low);
+    if(data.price_high != null && !isNaN(parseFloat(data.price_high))) record.listing.price_high = parseFloat(data.price_high);
+    if(data.suggested_price != null && !isNaN(parseFloat(data.suggested_price))) record.listing.suggested_price = parseFloat(data.suggested_price);
+    if(data.accept_price != null && !isNaN(parseFloat(data.accept_price))) record.listing.accept_price = parseFloat(data.accept_price);
+    if(data.decline_price != null && !isNaN(parseFloat(data.decline_price))) record.listing.decline_price = parseFloat(data.decline_price);
+    try { fs.writeFileSync(lp, JSON.stringify(record, null, 2)); } catch(e){ callback({success:false, error:'Write failed'}); return; }
+    console.log('[REGEN] SKU ' + sku + ' complete: "' + record.listing.title + '"');
+    callback({ success:true, title: record.listing.title, condition_box: record.listing.condition_box, description_html: record.listing.description_html, suggested_price: record.listing.suggested_price, accept_price: record.listing.accept_price, decline_price: record.listing.decline_price });
+  });
+}
 function processItem(item, callback) {
   var meta = item.meta;
   var itemDir = item.dir;
@@ -2053,45 +2182,7 @@ function processItem(item, callback) {
     var gradeLetter = String(meta.grade || 'B').toUpperCase();
     var gradeFull = ({A:'Like New / Open Box', B:'Good', C:'Fair', D:'Parts/Untested'})[gradeLetter] || 'Good';
     var confirmedCatName = (confirmedCategoryId && meta.identified_item && meta.identified_item.ebay_category_name) ? meta.identified_item.ebay_category_name : (confirmedCategoryId ? ('ID ' + confirmedCategoryId) : '');
-    var listingSystemPrompt = [
-      'You are an experienced eBay reseller writing a listing for a personal resale account. You have 20+ years of eBay selling experience and know what buyers want to see.',
-      '',
-      'Your job:',
-      '- Search eBay completed/sold listings for accurate current pricing. List just below mid-range of recent sold comps.',
-      '- Write honest, specific, confident copy. No overselling, no underselling. Say what it is and what condition it is in.',
-      '- Clean up any raw seller notes into professional copy regardless of how they were written (fragments, all caps, shorthand — clean it up automatically).',
-      '- Identify and list ALL accessories and included items visible in the photos. Buyers make purchase decisions based on what is included. If a power supply, charger, cable, remote, or accessory is visible, it MUST be listed.',
-      '- Note any visible cosmetic issues honestly — scratches, scuffs, wear marks. Be specific about where they are. Honest condition notes build buyer trust and reduce returns.',
-      '- Include a brief practical description of what the item is and what it is used for (1-2 sentences). Not every buyer knows every product.',
-      '- Do NOT include serial numbers, internal SKUs, or pricing context in the buyer-facing description.',
-      '- Do NOT use these words (eBay policy violation): "like new", "vintage", "mint", "mint condition", "copy", "reproduction", "insurance", "check", "money order"',
-      '',
-      'Grade scale:',
-      '  A = Like New / Open Box — minimal or no wear',
-      '  B = Good — normal light wear, fully functional',
-      '  C = Fair — heavy visible wear, fully functional',
-      '  D = Parts/Untested — may not work',
-      '',
-      'HTML description structure (use this exact structure):',
-      '<h2>[Item Name] - [One line hook about condition/value]</h2>',
-      '<p>[2-3 sentences: what it is, what it does, why a buyer would want it. Honest and practical.]</p>',
-      '',
-      '<h3>What is Included:</h3>',
-      '<ul>',
-      '[List every included item and accessory — be specific]',
-      '</ul>',
-      '',
-      '<h3>Condition Details:</h3>',
-      '<p>[Honest specific condition — note visible wear locations. If Grade A: minimal wear noted. If Grade D: state clearly not tested or for parts.]</p>',
-      '',
-      '<h3>Tested & Working:</h3>',
-      '<p>[What was tested and confirmed working. For Grade D: state sold as-is for parts or repair, not tested.]</p>',
-      '',
-      '<b>[One closing line — practical use case or value statement. No hype. No "do not miss out". Just honest practical value.]</b>',
-      '',
-      'Return ONLY this JSON, no markdown:',
-      '{"title":"eBay title under 80 chars with brand model key terms — no banned words","condition_box":"2-3 honest sentences for eBay condition field","description_html":"complete HTML using structure above","avg_sold_price":45,"price_low":30,"price_high":65,"suggested_price":48,"accept_price":38,"decline_price":28,"shipping":"GA Ground","item_specifics":{"Brand":"value","Model":"value","Type":"value"}}'
-    ].join('\n');
+    var listingSystemPrompt = buildListingSystemPrompt();
 
     // CHANGE 2: structured user message (Quick Lister inputs)
     var promptLines = [
@@ -3432,9 +3523,19 @@ function generateListingsPage(listings, ebayStat){
       +'<button id="btn_t_'+skuStr+'" onclick="cp(this.id.slice(4))" style="padding:8px 16px;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:bold;background:#1565c0;color:#fff;">Copy Title</button>'
       +'<button id="btn_c_'+skuStr+'" onclick="cp(this.id.slice(4))" style="padding:8px 16px;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:bold;background:#37474f;color:#fff;">Copy Condition Box</button>'
       +'<button id="btn_h_'+skuStr+'" onclick="cp(this.id.slice(4))" style="padding:8px 16px;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:bold;background:#2e7d32;color:#fff;">Copy HTML Description</button>'
+      +'<button id="regbtn_'+skuStr+'" onclick="toggleRegen(\''+skuStr+'\')" style="padding:8px 16px;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:bold;background:#37474f;color:#fff;">&#8634; Regenerate</button>'
       +ebayBtn
       +'<span style="display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:bold;color:#444;"><label for="qty_'+skuStr+'">Qty:</label><input id="qty_'+skuStr+'" type="number" min="1" max="99" value="'+quantity+'" style="width:62px;padding:7px 8px;border:1px solid #bbb;border-radius:4px;font-size:13px;"><button onclick="saveQty(\''+skuStr+'\')" style="padding:8px 12px;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:bold;background:#455a64;color:#fff;">Save Qty</button><span id="qtymsg_'+skuStr+'" style="font-size:12px;"></span></span>'
       +'<button onclick="deleteListing(\''+skuStr+'\')" style="padding:8px 16px;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:bold;background:#c62828;color:#fff;">Remove from List</button>'
+      +'</div>'
+      +'<div id="regpanel_'+skuStr+'" style="display:none;margin-bottom:12px;background:#f5f5f5;border:1px solid #ddd;border-radius:6px;padding:10px 12px;">'
+        +'<div style="font-size:12.5px;font-weight:bold;color:#444;margin-bottom:6px;">Anything to fix or add? (optional)</div>'
+        +'<textarea id="regnotes_'+skuStr+'" placeholder="e.g. remove the stylus was missing, add that charger is included, fix the condition notes" style="width:100%;box-sizing:border-box;min-height:54px;padding:6px 8px;border:1px solid #bbb;border-radius:4px;font-size:13px;resize:vertical;"></textarea>'
+        +'<div style="display:flex;align-items:center;gap:14px;margin-top:8px;">'
+          +'<button onclick="doRegen(\''+skuStr+'\')" style="padding:8px 16px;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:bold;background:#2e7d32;color:#fff;">Regenerate Now</button>'
+          +'<span onclick="cancelRegen(\''+skuStr+'\')" style="color:#1565c0;font-size:13px;cursor:pointer;text-decoration:underline;">Cancel</span>'
+          +'<span id="regmsg_'+skuStr+'" style="font-weight:bold;font-size:12.5px;"></span>'
+        +'</div>'
       +'</div>'
       +'<textarea id="t_'+skuStr+'" style="display:none;">'+rawTitle+'</textarea>'
       +'<textarea id="c_'+skuStr+'" style="display:none;">'+condBox+'</textarea>'
@@ -3478,6 +3579,10 @@ function generateListingsPage(listings, ebayStat){
     +'function addSpec(sku){var nameI=document.getElementById("nf_name_"+sku);var valI=document.getElementById("nf_val_"+sku);var msg=document.getElementById("specmsg_"+sku);var name=nameI?nameI.value.trim():"";var val=valI?valI.value:"";if(!name){if(msg){msg.style.color="#c62828";msg.textContent="Enter a field name";}return;}var body={item_specifics:{}};body.item_specifics[name]=val;if(msg){msg.style.color="#8d6e00";msg.textContent="Saving...";}fetch("/api/listings/"+sku,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(function(r){return r.json();}).then(function(d){if(d&&d.success){if(msg){msg.style.color="#2e7d32";msg.textContent="Added \\u2713";}setTimeout(function(){location.reload();},600);}else{if(msg){msg.style.color="#c62828";msg.textContent=(d&&d.error)||"Add failed";}}}).catch(function(){if(msg){msg.style.color="#c62828";msg.textContent="Network error";}});}'
     +'function editTitle(span){if(span.dataset.editing)return;span.dataset.editing="1";var sku=span.getAttribute("data-sku");var cur=span.getAttribute("data-raw")||span.textContent.replace(/^LOT OF \\d+:\\s*/,"");var inp=document.createElement("input");inp.type="text";inp.value=cur;inp.style.cssText="flex:1;min-width:150px;padding:4px 6px;border:1px solid #1565c0;border-radius:3px;font-size:14px;color:#222;";var cnt=document.createElement("span");cnt.style.cssText="font-size:11px;font-weight:bold;margin-left:6px;";function upd(){var n=inp.value.length;cnt.textContent=n+"/80";cnt.style.color=n>80?"#ff5252":"#cfd8dc";}upd();inp.addEventListener("input",upd);span.textContent="";span.style.borderBottom="none";span.appendChild(inp);span.appendChild(cnt);inp.focus();inp.select();var done=false;function save(){if(done)return;done=true;var nv=inp.value;fetch("/api/listings/"+sku,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({title:nv})}).then(function(r){return r.json();}).then(function(d){span.removeAttribute("data-editing");span.style.borderBottom="1px dashed rgba(255,255,255,0.55)";if(d&&d.success){span.setAttribute("data-raw",nv);span.textContent=nv;flashTick(span,true);}else{span.textContent=cur;flashTick(span,false);}}).catch(function(){span.removeAttribute("data-editing");span.style.borderBottom="1px dashed rgba(255,255,255,0.55)";span.textContent=cur;flashTick(span,false);});}inp.addEventListener("blur",save);inp.addEventListener("keydown",function(e){if(e.key==="Enter"){e.preventDefault();inp.blur();}else if(e.key==="Escape"){done=true;span.removeAttribute("data-editing");span.style.borderBottom="1px dashed rgba(255,255,255,0.55)";span.textContent=cur;}});}'
     +'function editCategory(span){if(span.dataset.editing)return;span.dataset.editing="1";var sku=span.getAttribute("data-sku");var cur=span.getAttribute("data-catid")||((span.textContent.match(/\\d+/)||[""])[0]);var msg=document.getElementById("catmsg_"+sku);var prev=span.innerHTML;var inp=document.createElement("input");inp.type="text";inp.inputMode="numeric";inp.value=cur;inp.style.cssText="width:90px;padding:2px 4px;border:1px solid #1565c0;border-radius:3px;font-size:12.5px;";span.textContent="";span.appendChild(inp);inp.focus();inp.select();var done=false;function save(){if(done)return;done=true;var nv=inp.value.trim();span.removeAttribute("data-editing");if(!/^\\d+$/.test(nv)){span.innerHTML=prev;if(msg){msg.style.color="#c62828";msg.textContent="numbers only";}return;}if(msg){msg.style.color="#8d6e00";msg.textContent="Validating...";}fetch("/api/listings/"+sku,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({ebay_category_id:nv})}).then(function(r){return r.json();}).then(function(d){if(d&&d.success){var id=d.ebay_category_id||nv;var nm=d.ebay_category_name?d.ebay_category_name+" ":"";span.setAttribute("data-catid",id);span.textContent=nm+"("+id+")";if(msg){msg.style.color="#2e7d32";msg.textContent="\\u2713";setTimeout(function(){msg.textContent="";},2000);}}else{span.innerHTML=prev;if(msg){msg.style.color="#c62828";msg.textContent=(d&&d.error)?d.error:"failed";}}}).catch(function(){span.innerHTML=prev;if(msg){msg.style.color="#c62828";msg.textContent="error";}});}inp.addEventListener("blur",save);inp.addEventListener("keydown",function(e){if(e.key==="Enter"){e.preventDefault();inp.blur();}else if(e.key==="Escape"){done=true;span.removeAttribute("data-editing");span.innerHTML=prev;}});}'
+    +'function toggleRegen(sku){var pa=document.getElementById("regpanel_"+sku);if(!pa)return;var show=(pa.style.display==="none"||!pa.style.display);pa.style.display=show?"block":"none";if(show){var t=document.getElementById("regnotes_"+sku);if(t)t.focus();}}'
+    +'function cancelRegen(sku){var pa=document.getElementById("regpanel_"+sku);if(pa)pa.style.display="none";var m=document.getElementById("regmsg_"+sku);if(m)m.textContent="";}'
+    +'function applyRegen(sku,d){var tt=document.getElementById("t_"+sku);if(tt&&d.title!=null)tt.value=d.title;var cc=document.getElementById("c_"+sku);if(cc&&d.condition_box!=null)cc.value=d.condition_box;var hh=document.getElementById("h_"+sku);if(hh&&d.description_html!=null)hh.value=d.description_html;var ts=document.getElementById("title_"+sku);if(ts&&d.title!=null){ts.setAttribute("data-raw",d.title);ts.textContent=d.title;}var sg=document.getElementById("sug_"+sku);if(sg&&d.suggested_price!=null)sg.textContent=d.suggested_price;}'
+    +'function doRegen(sku){var inp=document.getElementById("regnotes_"+sku);var notes=inp?inp.value:"";var st=document.getElementById("regmsg_"+sku);var btn=document.getElementById("regbtn_"+sku);if(st){st.style.color="#8d6e00";st.textContent="Regenerating...";}if(btn){btn.disabled=true;btn.innerHTML="Regenerating...";}fetch("/api/regenerate-listing/"+sku,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({notes:notes})}).then(function(r){return r.json();}).then(function(d){if(btn){btn.disabled=false;btn.innerHTML="&#8634; Regenerate";}if(d&&d.success){applyRegen(sku,d);if(st){st.style.color="#2e7d32";st.textContent="Updated \\u2713";}setTimeout(function(){cancelRegen(sku);},1400);}else{if(st){st.style.color="#c62828";st.textContent=(d&&d.error)||"Failed";}}}).catch(function(){if(btn){btn.disabled=false;btn.innerHTML="&#8634; Regenerate";}if(st){st.style.color="#c62828";st.textContent="Network error";}});}'
     +'function setupStrip(strip){function thumbs(){return Array.prototype.slice.call(strip.querySelectorAll(".lp-thumb"));}thumbs().forEach(function(thumb){thumb.style.cursor="grab";thumb.style.touchAction="none";var dragging=false,moved=false,sku=thumb.getAttribute("data-sku");thumb.addEventListener("pointerdown",function(e){if(e.target.closest&&e.target.closest(".thumb-del-btn"))return;e.preventDefault();try{thumb.setPointerCapture(e.pointerId);}catch(_e){}dragging=true;moved=false;});thumb.addEventListener("pointermove",function(e){if(!dragging)return;e.preventDefault();if(!moved){moved=true;thumb.style.opacity="0.7";thumb.style.cursor="grabbing";thumb.style.borderLeft="3px solid #1565c0";}var over=document.elementFromPoint(e.clientX,e.clientY);var t=(over&&over.closest)?over.closest(".lp-thumb"):null;if(t&&t!==thumb&&t.parentNode===strip){var rect=t.getBoundingClientRect();var before=(e.clientX<rect.left+rect.width/2);strip.insertBefore(thumb,before?t:t.nextSibling);}});function end(e){if(!dragging)return;dragging=false;try{thumb.releasePointerCapture(e.pointerId);}catch(_e){}thumb.style.opacity="";thumb.style.cursor="grab";thumb.style.borderLeft="";if(moved){var order=thumbs().map(function(x){return x.getAttribute("data-stem");});savePhotoOrder(sku,order,strip);}else{var im=thumb.querySelector("img");if(im)window.open(im.src);}}thumb.addEventListener("pointerup",end);thumb.addEventListener("pointercancel",function(e){if(dragging){dragging=false;thumb.style.opacity="";thumb.style.cursor="grab";thumb.style.borderLeft="";try{thumb.releasePointerCapture(e.pointerId);}catch(_e){}}});});}'
     +'function initPhotoReorder(){Array.prototype.slice.call(document.querySelectorAll(".lp-photostrip")).forEach(function(s){setupStrip(s);});}'
     +'setInterval(loadQueue,10000);loadQueue();updateBulkCount();initPhotoReorder();'
