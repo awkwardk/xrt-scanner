@@ -1629,8 +1629,256 @@ const server = http.createServer(function(req, res) {
     return;
   }
 
+  // ── BUYER / CONTACT DATABASE (additive — PIN-protected client-side; API returns JSON) ──
+  if(req.method==='GET' && req.url==='/buyers'){
+    res.writeHead(200,{'Content-Type':'text/html; charset=utf-8'});
+    res.end(renderBuyersPage());
+    return;
+  }
+  if(req.method==='GET' && req.url==='/buyers/slip'){
+    res.writeHead(200,{'Content-Type':'text/html; charset=utf-8'});
+    res.end(renderBuyersSlip());
+    return;
+  }
+  if(req.method==='GET' && req.url.split('?')[0]==='/api/buyers/search'){
+    var bq = ''; var qstr = req.url.indexOf('?') >= 0 ? req.url.slice(req.url.indexOf('?')+1) : '';
+    qstr.split('&').forEach(function(p){ var kv = p.split('='); if(kv[0] === 'q'){ try { bq = decodeURIComponent(String(kv[1]||'').replace(/\+/g,' ')); } catch(e){ bq = String(kv[1]||''); } } });
+    sendJSON(res, 200, sortBuyersByDate(readBuyers().filter(function(b){ return buyerMatches(b, bq); })));
+    return;
+  }
+  if(req.method==='GET' && req.url.split('?')[0]==='/api/buyers'){
+    sendJSON(res, 200, sortBuyersByDate(readBuyers()));
+    return;
+  }
+  if(req.method==='POST' && req.url.split('?')[0]==='/api/buyers'){
+    parseBody(req, function(perr, pbody){
+      if(perr || !pbody || typeof pbody !== 'object'){ sendJSON(res,400,{error:'Bad request'}); return; }
+      if(!pbody.name || !String(pbody.name).trim()){ sendJSON(res,400,{error:'Name is required'}); return; }
+      var blist = readBuyers();
+      var b = createBuyerFromBody(pbody);
+      blist.push(b); writeBuyers(blist);
+      console.log('[BUYERS] added "' + b.name + '" (' + blist.length + ' total)');
+      sendJSON(res, 200, b);
+    });
+    return;
+  }
+  if(req.method==='PATCH' && /^\/api\/buyers\/[^/?]+$/.test(req.url.split('?')[0])){
+    var pid = decodeURIComponent(req.url.split('?')[0].split('/').pop());
+    parseBody(req, function(perr, pbody){
+      if(perr || !pbody || typeof pbody !== 'object'){ sendJSON(res,400,{error:'Bad request'}); return; }
+      var blist = readBuyers(); var found = -1;
+      for(var i = 0; i < blist.length; i++){ if(blist[i].id === pid){ found = i; break; } }
+      if(found < 0){ sendJSON(res,404,{error:'Buyer not found'}); return; }
+      var b = blist[found];
+      ['name','ebay_username','email','phone','contact_source','notes'].forEach(function(k){ if(pbody[k] !== undefined) b[k] = String(pbody[k] == null ? '' : pbody[k]); });
+      if(pbody.looking_for !== undefined && Array.isArray(pbody.looking_for)){ b.looking_for = pbody.looking_for.map(function(s){ return String(s).trim(); }).filter(Boolean); }
+      if(pbody.last_contacted !== undefined){ b.last_contacted = pbody.last_contacted; b.contact_count = (parseInt(b.contact_count, 10) || 0) + 1; }
+      blist[found] = b; writeBuyers(blist);
+      console.log('[BUYERS] updated "' + b.name + '"');
+      sendJSON(res, 200, b);
+    });
+    return;
+  }
+  if(req.method==='DELETE' && /^\/api\/buyers\/[^/?]+$/.test(req.url.split('?')[0])){
+    var did = decodeURIComponent(req.url.split('?')[0].split('/').pop());
+    var blist = readBuyers();
+    blist = blist.filter(function(b){ return b.id !== did; });
+    writeBuyers(blist);
+    console.log('[BUYERS] deleted ' + did);
+    sendJSON(res, 200, {success:true});
+    return;
+  }
+
   res.writeHead(404);res.end('Not found');
 });
+
+// ── BUYER / CONTACT DATABASE BACKEND (additive — never crashes) ──
+var BUYERS_FILE = path.join(DATA_DIR, 'buyers.json');
+function readBuyers(){
+  try { if(fs.existsSync(BUYERS_FILE)){ var a = JSON.parse(fs.readFileSync(BUYERS_FILE, 'utf8')); return Array.isArray(a) ? a : []; } } catch(e){ console.log('[BUYERS] read error:', e.message); }
+  return [];
+}
+function writeBuyers(arr){
+  try { fs.writeFileSync(BUYERS_FILE, JSON.stringify(Array.isArray(arr) ? arr : [], null, 2)); return true; }
+  catch(e){ console.log('[BUYERS] write error:', e.message); return false; }
+}
+function sortBuyersByDate(arr){
+  return (Array.isArray(arr) ? arr : []).slice().sort(function(a, b){ return String(b.date_added || '').localeCompare(String(a.date_added || '')); });
+}
+function buyerMatches(b, q){
+  q = String(q == null ? '' : q).toLowerCase().trim();
+  if(!q) return true;
+  var hay = [b.name, b.ebay_username, b.email, b.phone, (Array.isArray(b.looking_for) ? b.looking_for.join(' ') : b.looking_for), b.notes]
+    .map(function(x){ return String(x == null ? '' : x).toLowerCase(); }).join(' | ');
+  return hay.indexOf(q) >= 0;
+}
+function genBuyerId(){ return 'b' + Date.now().toString(36) + '-' + Math.floor(Math.random() * 1000000).toString(36); }
+function createBuyerFromBody(body){
+  return {
+    id: genBuyerId(),
+    name: String(body.name).trim(),
+    ebay_username: body.ebay_username ? String(body.ebay_username).trim() : '',
+    email: body.email ? String(body.email).trim() : '',
+    phone: body.phone ? String(body.phone).trim() : '',
+    contact_source: body.contact_source ? String(body.contact_source) : 'other',
+    looking_for: Array.isArray(body.looking_for) ? body.looking_for.map(function(s){ return String(s).trim(); }).filter(Boolean) : [],
+    notes: body.notes ? String(body.notes) : '',
+    date_added: new Date().toISOString(),
+    last_contacted: null,
+    contact_count: 0
+  };
+}
+// Printable quarter-sheet package insert (2x2 grid, no PIN). Black & white, print-optimized.
+function renderBuyersSlip(){
+  var slip = '<div class="slip">'
+    + '<div><h1>Xtreme Electronic Recycling</h1>'
+    + '<div class="tag">We regularly source electronics, networking gear, business equipment, lab equipment and more.</div></div>'
+    + '<div class="msg">Looking for something specific?<br>Message us on eBay &mdash; we may have it or be getting it in soon.</div>'
+    + '<div class="store">eBay Store: xtremeco-recytech</div>'
+    + '<div class="thanks">We appreciate your business!</div>'
+    + '</div>';
+  return '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Package Slips</title><style>'
+    + '@page{size:letter;margin:0.25in;}'
+    + '*{box-sizing:border-box;}'
+    + "body{font-family:Georgia,'Times New Roman',serif;margin:0;color:#000;}"
+    + '.sheet{display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;}'
+    + '.slip{border:1px solid #000;padding:0.3in;min-height:4.9in;display:flex;flex-direction:column;justify-content:space-between;text-align:center;}'
+    + '.slip h1{font-size:18px;margin:0 0 8px;}'
+    + '.tag{font-size:12px;font-style:italic;line-height:1.4;margin-bottom:16px;}'
+    + '.msg{font-size:15px;font-weight:bold;line-height:1.5;margin-bottom:16px;}'
+    + '.store{font-size:14px;font-weight:bold;margin-bottom:16px;}'
+    + '.thanks{font-size:13px;}'
+    + '@media screen{body{background:#e0e0e0;padding:16px;}.sheet{max-width:8.5in;margin:0 auto;background:#fff;box-shadow:0 1px 6px rgba(0,0,0,0.3);}}'
+    + '@media print{body{background:#fff;}}'
+    + '</style></head><body><div class="sheet">' + slip + slip + slip + slip + '</div></body></html>';
+}
+// Buyer database single-page app (PIN 1090, all CSS+JS inline, mobile-first).
+function renderBuyersPage(){
+  return '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
+  + '<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">'
+  + '<title>Buyer Database</title><style>'
+  + '*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}'
+  + 'body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;background:#eceff1;color:#222;}'
+  + '.wrap{max-width:480px;margin:0 auto;min-height:100vh;}'
+  + '#pin{position:fixed;inset:0;background:#1a2733;color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:100;padding:24px;}'
+  + '#pin h1{font-size:24px;margin-bottom:24px;}'
+  + '.dots{display:flex;gap:16px;margin-bottom:8px;}'
+  + '.dot{width:16px;height:16px;border-radius:50%;border:2px solid #90a4ae;}'
+  + '.dot.on{background:#FFD700;border-color:#FFD700;}'
+  + '#pinErr{height:20px;color:#ff5252;font-size:13px;font-weight:bold;margin-bottom:14px;}'
+  + '.pad{display:grid;grid-template-columns:repeat(3,72px);gap:14px;}'
+  + '.key{height:64px;border-radius:50%;background:rgba(255,255,255,0.1);color:#fff;border:none;font-size:24px;font-weight:bold;cursor:pointer;}'
+  + '.key:active{background:rgba(255,255,255,0.25);}'
+  + '.key.fn{font-size:15px;}'
+  + '.shake{animation:shake 0.4s;}'
+  + '@keyframes shake{0%,100%{transform:translateX(0);}20%,60%{transform:translateX(-10px);}40%,80%{transform:translateX(10px);}}'
+  + '#app{display:none;}'
+  + '.hdr{background:#263238;color:#fff;padding:14px 16px;position:sticky;top:0;z-index:10;}'
+  + '.hdr-row{display:flex;align-items:center;justify-content:space-between;}'
+  + '.hdr h1{font-size:20px;}'
+  + '.addbtn{background:#FFD700;color:#1a1a1a;border:none;width:40px;height:40px;border-radius:50%;font-size:26px;line-height:1;cursor:pointer;font-weight:bold;}'
+  + '.searchbar{position:relative;margin-top:12px;}'
+  + '.searchbar input{width:100%;padding:10px 34px 10px 12px;border:none;border-radius:8px;font-size:14px;}'
+  + '.clearx{position:absolute;right:8px;top:50%;transform:translateY(-50%);background:#90a4ae;color:#fff;border:none;width:22px;height:22px;border-radius:50%;font-size:14px;cursor:pointer;display:none;line-height:1;}'
+  + '.stats{display:flex;gap:8px;padding:12px;}'
+  + '.stat{flex:1;background:#fff;border-radius:8px;padding:10px 6px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,0.1);}'
+  + '.stat .n{font-size:20px;font-weight:bold;color:#263238;display:block;}'
+  + '.stat .l{font-size:10.5px;color:#789;text-transform:uppercase;letter-spacing:0.03em;}'
+  + '.list{padding:0 12px 24px;}'
+  + '.card{background:#fff;border-radius:10px;box-shadow:0 1px 4px rgba(0,0,0,0.12);padding:14px;margin-bottom:12px;}'
+  + '.bname{font-size:16px;font-weight:bold;}'
+  + '.buser{font-size:12.5px;color:#789;margin-left:6px;font-weight:normal;}'
+  + '.pill{display:inline-block;font-size:11px;font-weight:bold;border-radius:20px;padding:3px 10px;margin-top:6px;}'
+  + '.pill.src{background:#eceff1;color:#455a64;}'
+  + '.lf{margin-top:8px;display:flex;flex-wrap:wrap;gap:6px;}'
+  + '.lftag{background:#e8f5e9;color:#2e7d32;font-size:12px;font-weight:bold;border-radius:20px;padding:3px 10px;cursor:pointer;}'
+  + '.row{margin-top:8px;font-size:12.5px;color:#555;display:flex;align-items:center;gap:8px;flex-wrap:wrap;}'
+  + '.copyable{cursor:pointer;border-bottom:1px dashed #1565c0;color:#1565c0;}'
+  + '.mc{background:#2e7d32;color:#fff;border:none;border-radius:6px;padding:5px 10px;font-size:12px;font-weight:bold;cursor:pointer;}'
+  + '.notes{margin-top:8px;font-size:12.5px;color:#444;cursor:pointer;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}'
+  + '.notes.expanded{-webkit-line-clamp:unset;}'
+  + '.cardbtns{margin-top:10px;display:flex;gap:10px;}'
+  + '.cbtn{flex:1;border:none;border-radius:6px;padding:8px;font-size:12.5px;font-weight:bold;cursor:pointer;}'
+  + '.cbtn.edit{background:#37474f;color:#fff;}.cbtn.del{background:#fff;color:#c62828;border:1px solid #c62828;}'
+  + '.empty{text-align:center;padding:50px 20px;color:#789;font-size:14px;}'
+  + '#modal{position:fixed;inset:0;background:rgba(0,0,0,0.45);display:none;z-index:50;align-items:flex-end;}'
+  + '.sheetm{background:#fff;width:100%;max-width:480px;margin:0 auto;border-radius:14px 14px 0 0;padding:18px 16px 24px;max-height:92vh;overflow:auto;}'
+  + '.sheetm h2{font-size:18px;margin-bottom:12px;}'
+  + '.fld{margin-bottom:12px;}'
+  + '.fld label{display:block;font-size:12px;font-weight:bold;color:#555;margin-bottom:4px;}'
+  + '.fld input,.fld select,.fld textarea{width:100%;padding:9px 10px;border:1px solid #ccc;border-radius:6px;font-size:14px;font-family:inherit;}'
+  + '.fld textarea{min-height:64px;resize:vertical;}'
+  + '#mtags{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px;}'
+  + '.mtag{background:#e8f5e9;color:#2e7d32;font-size:12px;font-weight:bold;border-radius:20px;padding:3px 8px;display:inline-flex;align-items:center;gap:6px;}'
+  + '.mtag b{cursor:pointer;color:#1b5e20;}'
+  + '#mErr{color:#c62828;font-size:12.5px;font-weight:bold;min-height:16px;margin-bottom:8px;}'
+  + '.savebtn{width:100%;background:#2e7d32;color:#fff;border:none;border-radius:8px;padding:13px;font-size:15px;font-weight:bold;cursor:pointer;}'
+  + '.cancel{display:block;text-align:center;margin-top:10px;color:#1565c0;font-size:14px;cursor:pointer;}'
+  + '.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#263238;color:#fff;padding:10px 18px;border-radius:20px;font-size:13px;z-index:200;opacity:0;transition:opacity .2s;pointer-events:none;}'
+  + '.toast.show{opacity:1;}'
+  + '</style></head><body>'
+  + '<div id="pin"><h1>Buyer Database</h1><div class="dots"><div class="dot" id="d0"></div><div class="dot" id="d1"></div><div class="dot" id="d2"></div><div class="dot" id="d3"></div></div><div id="pinErr"></div>'
+  + '<div class="pad">'
+  + '<button class="key" onclick="pinPress(\'1\')">1</button><button class="key" onclick="pinPress(\'2\')">2</button><button class="key" onclick="pinPress(\'3\')">3</button>'
+  + '<button class="key" onclick="pinPress(\'4\')">4</button><button class="key" onclick="pinPress(\'5\')">5</button><button class="key" onclick="pinPress(\'6\')">6</button>'
+  + '<button class="key" onclick="pinPress(\'7\')">7</button><button class="key" onclick="pinPress(\'8\')">8</button><button class="key" onclick="pinPress(\'9\')">9</button>'
+  + '<button class="key fn" onclick="pinBack()">&#9003;</button><button class="key" onclick="pinPress(\'0\')">0</button><button class="key fn" onclick="pinEnter()">OK</button>'
+  + '</div></div>'
+  + '<div id="app"><div class="wrap">'
+  + '<div class="hdr"><div class="hdr-row"><h1>Buyer Database</h1><button class="addbtn" onclick="openAdd()">+</button></div>'
+  + '<div class="searchbar"><input id="searchInput" type="text" placeholder="Search by name, item, notes..." oninput="onSearch()"><button class="clearx" id="clearx" onclick="clearSearch()">&times;</button></div></div>'
+  + '<div class="stats"><div class="stat"><span class="n" id="stTotal">0</span><span class="l">Total Buyers</span></div>'
+  + '<div class="stat"><span class="n" id="stMonth">0</span><span class="l">Contacted 30d</span></div>'
+  + '<div class="stat"><span class="n" id="stWant">0</span><span class="l">Want Lists</span></div></div>'
+  + '<div class="list" id="list"></div>'
+  + '</div></div>'
+  + '<div id="modal"><div class="sheetm">'
+  + '<h2 id="mTitle">Add Buyer</h2><div id="mErr"></div>'
+  + '<div class="fld"><label>Name (required)</label><input id="f_name" type="text" placeholder="eBay username or real name"></div>'
+  + '<div class="fld"><label>eBay Username (if different)</label><input id="f_user" type="text" placeholder="optional"></div>'
+  + '<div class="fld"><label>Contact Source</label><select id="f_src"><option value="eBay Messages">eBay Messages</option><option value="email">Email</option><option value="phone">Phone</option><option value="other">Other</option></select></div>'
+  + '<div class="fld"><label>Email</label><input id="f_email" type="text" placeholder="optional"></div>'
+  + '<div class="fld"><label>Phone</label><input id="f_phone" type="text" placeholder="optional"></div>'
+  + '<div class="fld"><label>Looking For</label><div id="mtags"></div><input id="f_tag" type="text" placeholder="e.g. Cisco switches, laptops, printers" onkeydown="tagKey(event)"></div>'
+  + '<div class="fld"><label>Notes</label><textarea id="f_notes" placeholder="any relevant details"></textarea></div>'
+  + '<button class="savebtn" onclick="saveBuyer()">Save</button><span class="cancel" onclick="closeModal()">Cancel</span>'
+  + '</div></div>'
+  + '<div class="toast" id="toast"></div>'
+  + '<script>'
+  + 'var BUYERS=[];var editId=null;var modalTags=[];var PINBUF="";'
+  + 'function esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/\\"/g,"&quot;");}'
+  + 'function hasAccess(){return localStorage.getItem("xrt_buyers_pin")==="1090";}'
+  + 'function updDots(){for(var i=0;i<4;i++){document.getElementById("d"+i).className="dot"+(i<PINBUF.length?" on":"");}}'
+  + 'function pinPress(n){if(PINBUF.length>=4)return;PINBUF+=n;updDots();document.getElementById("pinErr").textContent="";if(PINBUF.length===4)setTimeout(pinEnter,120);}'
+  + 'function pinBack(){PINBUF=PINBUF.slice(0,-1);updDots();}'
+  + 'function pinEnter(){if(PINBUF==="1090"){localStorage.setItem("xrt_buyers_pin","1090");grant();}else{var pn=document.getElementById("pin");pn.classList.add("shake");document.getElementById("pinErr").textContent="Incorrect PIN";setTimeout(function(){pn.classList.remove("shake");},420);PINBUF="";updDots();}}'
+  + 'function grant(){document.getElementById("pin").style.display="none";document.getElementById("app").style.display="block";load();}'
+  + 'function toast(t){var el=document.getElementById("toast");el.textContent=t;el.classList.add("show");setTimeout(function(){el.classList.remove("show");},1500);}'
+  + 'function load(){fetch("/api/buyers").then(function(r){return r.json();}).then(function(d){BUYERS=Array.isArray(d)?d:[];render();}).catch(function(){BUYERS=[];render();});}'
+  + 'function curQ(){var s=document.getElementById("searchInput");return s?s.value.trim().toLowerCase():"";}'
+  + 'function matchB(b,q){if(!q)return true;var hay=[b.name,b.ebay_username,b.email,b.phone,(b.looking_for||[]).join(" "),b.notes].join(" | ").toLowerCase();return hay.indexOf(q)>=0;}'
+  + 'function relDate(iso){if(!iso)return "Never";var d=new Date(iso);if(isNaN(d.getTime()))return "Never";var n=Math.floor((Date.now()-d.getTime())/86400000);if(n<=0)return "Today";if(n===1)return "Yesterday";if(n<30)return n+" days ago";if(n<60)return "1 month ago";if(n<365)return Math.floor(n/30)+" months ago";return Math.floor(n/365)+"y ago";}'
+  + 'function onSearch(){document.getElementById("clearx").style.display=curQ()?"block":"none";render();}'
+  + 'function clearSearch(){var s=document.getElementById("searchInput");s.value="";onSearch();s.focus();}'
+  + 'function tagSearch(t){var s=document.getElementById("searchInput");s.value=t;onSearch();window.scrollTo(0,0);}'
+  + 'function copyText(el){var v=el.getAttribute("data-v")||el.textContent;if(navigator.clipboard){navigator.clipboard.writeText(v).then(function(){toast("Copied");});}else{toast(v);}}'
+  + 'function toggleExpand(el){el.classList.toggle("expanded");}'
+  + 'function renderStats(){document.getElementById("stTotal").textContent=BUYERS.length;var m=0;BUYERS.forEach(function(b){if(b.last_contacted){var d=new Date(b.last_contacted);if(!isNaN(d.getTime())&&(Date.now()-d.getTime())<=2592000000)m++;}});document.getElementById("stMonth").textContent=m;var it={};BUYERS.forEach(function(b){(b.looking_for||[]).forEach(function(x){var k=String(x).trim().toLowerCase();if(k)it[k]=1;});});document.getElementById("stWant").textContent=Object.keys(it).length;}'
+  + 'function cardHtml(b){var srcMap={"eBay Messages":"eBay","email":"Email","phone":"Phone","other":"Other"};var src=srcMap[b.contact_source]||b.contact_source||"Other";var lf=(b.looking_for||[]).map(function(t){return "<span class=\\"lftag\\" onclick=\\"tagSearch(this.textContent)\\">"+esc(t)+"</span>";}).join("");var ci="";if(b.email)ci+="<span class=\\"copyable\\" data-v=\\""+esc(b.email)+"\\" onclick=\\"copyText(this)\\">"+esc(b.email)+"</span>";if(b.phone)ci+="<span class=\\"copyable\\" data-v=\\""+esc(b.phone)+"\\" onclick=\\"copyText(this)\\">"+esc(b.phone)+"</span>";var user=(b.ebay_username&&b.ebay_username!==b.name)?("<span class=\\"buser\\">@"+esc(b.ebay_username)+"</span>"):"";var notes=b.notes?("<div class=\\"notes\\" onclick=\\"toggleExpand(this)\\">"+esc(b.notes)+"</div>"):"";return "<div class=\\"card\\"><div class=\\"bname\\">"+esc(b.name)+user+"</div><div><span class=\\"pill src\\">"+esc(src)+"</span></div>"+(lf?("<div class=\\"lf\\">"+lf+"</div>"):"")+"<div class=\\"row\\"><b>Last:</b> "+relDate(b.last_contacted)+" <button class=\\"mc\\" data-id=\\""+esc(b.id)+"\\" onclick=\\"markContacted(this.dataset.id)\\">Mark Contacted</button> <span style=\\"color:#90a4ae;\\">("+(b.contact_count||0)+")</span></div>"+(ci?("<div class=\\"row\\">"+ci+"</div>"):"")+notes+"<div class=\\"cardbtns\\"><button class=\\"cbtn edit\\" data-id=\\""+esc(b.id)+"\\" onclick=\\"openEdit(this.dataset.id)\\">Edit</button><button class=\\"cbtn del\\" data-id=\\""+esc(b.id)+"\\" onclick=\\"confirmDelete(this.dataset.id)\\">Delete</button></div></div>";}'
+  + 'function render(){renderStats();var q=curQ();var listEl=document.getElementById("list");var shown=BUYERS.filter(function(b){return matchB(b,q);});if(BUYERS.length===0){listEl.innerHTML="<div class=\\"empty\\">No buyers yet. Tap + to add your first contact.</div>";return;}if(shown.length===0){listEl.innerHTML="<div class=\\"empty\\">No matches for \\u201c"+esc(q)+"\\u201d. Try different terms.</div>";return;}listEl.innerHTML=shown.map(cardHtml).join("");}'
+  + 'function findB(id){for(var i=0;i<BUYERS.length;i++){if(BUYERS[i].id===id)return BUYERS[i];}return null;}'
+  + 'function markContacted(id){fetch("/api/buyers/"+id,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({last_contacted:new Date().toISOString()})}).then(function(r){return r.json();}).then(function(d){if(d&&d.id){for(var i=0;i<BUYERS.length;i++){if(BUYERS[i].id===id)BUYERS[i]=d;}render();toast("Contacted marked");}else{toast("Failed");}}).catch(function(){toast("Network error");});}'
+  + 'function renderMTags(){document.getElementById("mtags").innerHTML=modalTags.map(function(t,i){return "<span class=\\"mtag\\">"+esc(t)+" <b onclick=\\"removeTag("+i+")\\">&times;</b></span>";}).join("");}'
+  + 'function removeTag(i){modalTags.splice(i,1);renderMTags();}'
+  + 'function tagKey(e){if(e.key==="Enter"||e.key===","){e.preventDefault();var inp=document.getElementById("f_tag");var v=inp.value.replace(/,$/,"").trim();if(v&&modalTags.indexOf(v)<0){modalTags.push(v);renderMTags();}inp.value="";}}'
+  + 'function openAdd(){editId=null;modalTags=[];document.getElementById("mTitle").textContent="Add Buyer";document.getElementById("mErr").textContent="";document.getElementById("f_name").value="";document.getElementById("f_user").value="";document.getElementById("f_src").value="eBay Messages";document.getElementById("f_email").value="";document.getElementById("f_phone").value="";document.getElementById("f_tag").value="";document.getElementById("f_notes").value="";renderMTags();document.getElementById("modal").style.display="flex";}'
+  + 'function openEdit(id){var b=findB(id);if(!b)return;editId=id;modalTags=(b.looking_for||[]).slice();document.getElementById("mTitle").textContent="Edit Buyer";document.getElementById("mErr").textContent="";document.getElementById("f_name").value=b.name||"";document.getElementById("f_user").value=b.ebay_username||"";document.getElementById("f_src").value=b.contact_source||"other";document.getElementById("f_email").value=b.email||"";document.getElementById("f_phone").value=b.phone||"";document.getElementById("f_tag").value="";document.getElementById("f_notes").value=b.notes||"";renderMTags();document.getElementById("modal").style.display="flex";}'
+  + 'function closeModal(){document.getElementById("modal").style.display="none";}'
+  + 'function saveBuyer(){var name=document.getElementById("f_name").value.trim();if(!name){document.getElementById("mErr").textContent="Name is required";return;}var pend=document.getElementById("f_tag").value.trim();if(pend&&modalTags.indexOf(pend)<0)modalTags.push(pend);var payload={name:name,ebay_username:document.getElementById("f_user").value.trim(),contact_source:document.getElementById("f_src").value,email:document.getElementById("f_email").value.trim(),phone:document.getElementById("f_phone").value.trim(),looking_for:modalTags.slice(),notes:document.getElementById("f_notes").value};var url=editId?("/api/buyers/"+editId):"/api/buyers";var method=editId?"PATCH":"POST";fetch(url,{method:method,headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)}).then(function(r){return r.json();}).then(function(d){if(d&&d.id){closeModal();load();toast(editId?"Saved":"Buyer added");}else{document.getElementById("mErr").textContent=(d&&d.error)||"Save failed";}}).catch(function(){document.getElementById("mErr").textContent="Network error";});}'
+  + 'function confirmDelete(id){var b=findB(id);if(!b)return;if(!confirm("Remove "+b.name+" from buyer database?"))return;fetch("/api/buyers/"+id,{method:"DELETE"}).then(function(r){return r.json();}).then(function(d){if(d&&d.success){BUYERS=BUYERS.filter(function(x){return x.id!==id;});render();toast("Removed");}else{toast("Delete failed");}}).catch(function(){toast("Network error");});}'
+  + 'if(hasAccess()){grant();}else{updDots();}'
+  + '</scr'+'ipt></body></html>';
+}
 
 // ── PICKING APP BACKEND (additive — never crashes, always returns JSON) ──
 function pickDateOnly(dt){
