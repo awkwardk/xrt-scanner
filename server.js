@@ -2072,19 +2072,34 @@ function pullRefreshListings(callback){
   getEbayToken(function(tErr, token){
     if(tErr || !token){ callback({ success:false, error:'eBay not connected', pulled:0, skipped:0, total: readRefreshQueue().queue.length }); return; }
     var now = new Date(), from = new Date(now.getTime() - 90 * 86400000);
-    var slXml = '<?xml version="1.0" encoding="utf-8"?>'
-      + '<GetSellerListRequest xmlns="urn:ebay:apis:eBLBaseComponents">'
-      + '<EndTimeFrom>' + from.toISOString() + '</EndTimeFrom>'
-      + '<EndTimeTo>' + now.toISOString() + '</EndTimeTo>'
-      + '<DetailLevel>ReturnAll</DetailLevel>'
-      + '<IncludeItemSpecifics>true</IncludeItemSpecifics>'
-      + '<Pagination><EntriesPerPage>50</EntriesPerPage><PageNumber>1</PageNumber></Pagination>'
-      + '</GetSellerListRequest>';
-    ebayTradingCall('GetSellerList', slXml, token, function(e, sc, body){
-      if(e){ callback({ success:false, error:e.message, pulled:0, skipped:0, total: readRefreshQueue().queue.length }); return; }
-      var ack = parseXmlTag(body, 'Ack') || '';
-      if(ack !== 'Success' && ack !== 'Warning'){ callback({ success:false, error: (parseEbayErrors(body).join('; ') || ('GetSellerList Ack ' + ack)), pulled:0, skipped:0, total: readRefreshQueue().queue.length }); return; }
-      var ids = parseXmlAll(body, 'Item').map(function(b){ return parseXmlTag(b, 'ItemID'); }).filter(Boolean);
+    // EntriesPerPage 200 (Trading API max); paginate through all pages, collecting all item IDs.
+    function buildSellerListXml(pageNum){
+      return '<?xml version="1.0" encoding="utf-8"?>'
+        + '<GetSellerListRequest xmlns="urn:ebay:apis:eBLBaseComponents">'
+        + '<EndTimeFrom>' + from.toISOString() + '</EndTimeFrom>'
+        + '<EndTimeTo>' + now.toISOString() + '</EndTimeTo>'
+        + '<DetailLevel>ReturnAll</DetailLevel>'
+        + '<IncludeItemSpecifics>true</IncludeItemSpecifics>'
+        + '<Pagination><EntriesPerPage>200</EntriesPerPage><PageNumber>' + pageNum + '</PageNumber></Pagination>'
+        + '</GetSellerListRequest>';
+    }
+    var allIds = [], totalPages = 1;
+    function fetchPage(pageNum){
+      ebayTradingCall('GetSellerList', buildSellerListXml(pageNum), token, function(e, sc, body){
+        if(e){ callback({ success:false, error:e.message, pulled:0, skipped:0, total: readRefreshQueue().queue.length }); return; }
+        var ack = parseXmlTag(body, 'Ack') || '';
+        if(ack !== 'Success' && ack !== 'Warning'){ callback({ success:false, error: (parseEbayErrors(body).join('; ') || ('GetSellerList Ack ' + ack)), pulled:0, skipped:0, total: readRefreshQueue().queue.length }); return; }
+        if(pageNum === 1){
+          var pr = parseXmlTag(body, 'PaginationResult') || '';
+          totalPages = parseInt(parseXmlTag(pr, 'TotalNumberOfPages') || '1', 10) || 1;
+        }
+        parseXmlAll(body, 'Item').map(function(b){ return parseXmlTag(b, 'ItemID'); }).filter(Boolean).forEach(function(id){ allIds.push(id); });
+        console.log('[REFRESH] pulling page ' + pageNum + ' of ' + totalPages + ' (' + allIds.length + ' items so far)');
+        if(pageNum < totalPages){ setTimeout(function(){ fetchPage(pageNum + 1); }, 500); return; }
+        processIds(allIds);
+      });
+    }
+    function processIds(ids){
       var q = readRefreshQueue();
       var existing = {}; q.queue.forEach(function(it){ if(it.original && it.original.item_id) existing[String(it.original.item_id)] = true; });
       var toFetch = ids.filter(function(id){ return !existing[String(id)]; });
@@ -2111,7 +2126,8 @@ function pullRefreshListings(callback){
         });
       }
       nextItem();
-    });
+    }
+    fetchPage(1);
   });
 }
 // AI-generate a completely fresh listing for one queue item. Never references prior history.
