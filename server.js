@@ -1731,6 +1731,14 @@ const server = http.createServer(function(req, res) {
     });
     return;
   }
+  if(req.method==='POST' && req.url.split('?')[0]==='/api/refresh/clear-queue'){
+    var cq = readRefreshQueue();
+    var removed = (cq.queue || []).length;
+    writeRefreshQueue({ daily_limit: cq.daily_limit, post_interval_minutes: cq.post_interval_minutes, last_post_date: null, posted_today: 0, last_post_time: null, queue: [] });
+    console.log('[REFRESH] queue cleared — ' + removed + ' items removed');
+    sendJSON(res,200,{success:true, message:'Queue cleared'});
+    return;
+  }
   if(req.method==='PATCH' && /^\/api\/refresh\/item\/[^/?]+$/.test(req.url.split('?')[0])){
     var ridP = decodeURIComponent(req.url.split('?')[0].split('/').pop());
     parseBody(req, function(perr, pb){
@@ -2412,6 +2420,7 @@ function renderRefreshPage(){
   + '<div class="stat q"><span class="n" id="stTotal">0</span><span class="l">Total Queue</span></div></div></div>'
   + '<div class="ctrls"><div class="btnrow">'
   + '<button class="b blue" id="pullBtn" onclick="pull()">Pull Inactive Listings</button>'
+  + '<button class="b" id="clearBtn" onclick="clearQueue()" style="background:#c62828;color:#fff;">Clear Queue</button>'
   + '<button class="b green" id="genAllBtn" onclick="generateAll()">Generate All</button>'
   + '<button class="b yellow" id="runBtn" onclick="runSchedule()">Run Schedule Now</button>'
   + '</div><div class="setrow">Post per day: <input id="setLimit" type="number" min="1" max="100"> Minutes between posts: <input id="setIv" type="number" min="1" max="60"> <button class="b blue" onclick="saveSettings()">Save Settings</button></div>'
@@ -2465,6 +2474,7 @@ function renderRefreshPage(){
   + '+"<div class=\\"actions\\"><div class=\\"regwrap\\"><button class=\\"linkbtn\\" onclick=\\"regen(\'"+it.id+"\')\\">&#8634; Regenerate</button><input id=\\"rgn_"+it.id+"\\" placeholder=\\"Notes for regeneration (optional)\\"><span id=\\"rgm_"+it.id+"\\" style=\\"font-size:12px;font-weight:bold;\\"></span></div><div>"+actionBtns(it)+"</div></div></div>";}'
   + 'function render(){setSub();renderStats();var listEl=document.getElementById("list");var items=QUEUE.queue.slice();if(TAB!=="all")items=items.filter(function(it){return it.status===TAB||(TAB==="approved"&&it.status==="posting");});if(QUEUE.queue.length===0){listEl.innerHTML="<div class=\\"empty\\">No items in pipeline. Pull inactive listings from eBay to get started.</div>";return;}if(items.length===0){listEl.innerHTML="<div class=\\"empty\\">All items processed.</div>";return;}listEl.innerHTML=items.map(cardHtml).join("");}'
   + 'function pull(){var b=document.getElementById("pullBtn");b.disabled=true;b.textContent="Pulling...";fetch("/api/refresh/pull").then(function(r){return r.json();}).then(function(d){b.disabled=false;b.textContent="Pull Inactive Listings";if(d&&d.success){toast("Pulled "+d.pulled+" listings ("+d.skipped+" skipped)");loadQueue();loadSched();}else{toast((d&&d.error)||"Pull failed");}}).catch(function(){b.disabled=false;b.textContent="Pull Inactive Listings";toast("Network error");});}'
+  + 'function clearQueue(){var n=QUEUE.queue.length;if(!confirm("Clear all "+n+" items from the queue? This cannot be undone. Posted items will not be affected on eBay but their records will be removed from the queue."))return;var b=document.getElementById("clearBtn");b.disabled=true;fetch("/api/refresh/clear-queue",{method:"POST"}).then(function(r){return r.json();}).then(function(d){b.disabled=false;if(d&&d.success){toast("Queue cleared");loadQueue();loadSched();}else{toast((d&&d.error)||"Clear failed");}}).catch(function(){b.disabled=false;toast("Network error");});}'
   + 'function generateAll(){var pend=QUEUE.queue.filter(function(it){return it.status==="pending"&&!it.improved;});if(!pend.length){toast("No pending items to generate");return;}var b=document.getElementById("genAllBtn");var i=0,ok=0,fail=0;function step(){if(i>=pend.length){b.disabled=false;b.textContent="Generate All";toast("Generated "+ok+", failed "+fail);loadQueue();loadSched();return;}var it=pend[i];i++;b.disabled=true;b.textContent="Generating "+i+" of "+pend.length+"...";fetch("/api/refresh/generate/"+it.id,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({notes:""})}).then(function(r){return r.json();}).then(function(d){if(d&&d.success)ok++;else fail++;loadQueue();setTimeout(step,2000);}).catch(function(){fail++;setTimeout(step,2000);});}step();}'
   + 'function runSchedule(){var b=document.getElementById("runBtn");b.disabled=true;fetch("/api/refresh/run-schedule",{method:"POST"}).then(function(r){return r.json();}).then(function(d){b.disabled=false;if(d&&d.posted){toast("Posted 1 ("+(d.remaining||0)+" approved remaining)");}else{toast(d&&d.reason?d.reason:"Nothing posted");}loadQueue();loadSched();}).catch(function(){b.disabled=false;toast("Network error");});}'
   + 'function saveSettings(){var dl=document.getElementById("setLimit").value,iv=document.getElementById("setIv").value;fetch("/api/refresh/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({daily_limit:parseInt(dl,10),post_interval_minutes:parseInt(iv,10)})}).then(function(r){return r.json();}).then(function(d){if(d&&d.success){document.getElementById("setLimit").value=d.daily_limit;document.getElementById("setIv").value=d.post_interval_minutes;toast("Settings saved");loadSched();}else{toast("Save failed");}}).catch(function(){toast("Network error");});}'
