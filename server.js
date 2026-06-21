@@ -2075,34 +2075,38 @@ function parseRefreshGetItem(body, fallbackId){
     };
   } catch(e){ return null; }
 }
-// Pull ended listings: GetSellerList (last 90 days) -> GetItem per item -> store as pending.
+// Pull unsold ended listings: GetMyeBaySelling UnsoldList (last 24h) -> GetItem per item -> store as pending.
 function pullRefreshListings(callback){
   getEbayToken(function(tErr, token){
-    if(tErr || !token){ callback({ success:false, error:'eBay not connected', pulled:0, skipped:0, total: readRefreshQueue().queue.length }); return; }
-    var now = new Date(), from = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-    // EntriesPerPage 200 (Trading API max); paginate through all pages, collecting all item IDs.
-    function buildSellerListXml(pageNum){
+    if(tErr || !token){ callback({ success:false, error:'eBay not connected', pulled:0, skipped_duplicates:0, total: readRefreshQueue().queue.length }); return; }
+    // UnsoldList returns ONLY unsold ended listings natively (DurationInDays 1 = ended in last 24h) — no filtering needed.
+    function buildUnsoldXml(pageNum){
       return '<?xml version="1.0" encoding="utf-8"?>'
-        + '<GetSellerListRequest xmlns="urn:ebay:apis:eBLBaseComponents">'
-        + '<EndTimeFrom>' + from.toISOString() + '</EndTimeFrom>'
-        + '<EndTimeTo>' + now.toISOString() + '</EndTimeTo>'
-        + '<DetailLevel>ReturnAll</DetailLevel>'
-        + '<IncludeItemSpecifics>true</IncludeItemSpecifics>'
+        + '<GetMyeBaySellingRequest xmlns="urn:ebay:apis:eBLBaseComponents">'
+        + '<UnsoldList>'
+        + '<Include>true</Include>'
+        + '<DurationInDays>1</DurationInDays>'
         + '<Pagination><EntriesPerPage>200</EntriesPerPage><PageNumber>' + pageNum + '</PageNumber></Pagination>'
-        + '</GetSellerListRequest>';
+        + '</UnsoldList>'
+        + '<ErrorLanguage>en_US</ErrorLanguage>'
+        + '<WarningLevel>High</WarningLevel>'
+        + '<Version>967</Version>'
+        + '</GetMyeBaySellingRequest>';
     }
     var allIds = [], totalPages = 1;
     function fetchPage(pageNum){
-      ebayTradingCall('GetSellerList', buildSellerListXml(pageNum), token, function(e, sc, body){
-        if(e){ callback({ success:false, error:e.message, pulled:0, skipped:0, total: readRefreshQueue().queue.length }); return; }
+      ebayTradingCall('GetMyeBaySelling', buildUnsoldXml(pageNum), token, function(e, sc, body){
+        if(e){ callback({ success:false, error:e.message, pulled:0, skipped_duplicates:0, total: readRefreshQueue().queue.length }); return; }
         var ack = parseXmlTag(body, 'Ack') || '';
-        if(ack !== 'Success' && ack !== 'Warning'){ callback({ success:false, error: (parseEbayErrors(body).join('; ') || ('GetSellerList Ack ' + ack)), pulled:0, skipped:0, total: readRefreshQueue().queue.length }); return; }
+        if(ack !== 'Success' && ack !== 'Warning'){ callback({ success:false, error: (parseEbayErrors(body).join('; ') || ('GetMyeBaySelling Ack ' + ack)), pulled:0, skipped_duplicates:0, total: readRefreshQueue().queue.length }); return; }
+        var unsold = parseXmlTag(body, 'UnsoldList') || '';
         if(pageNum === 1){
-          var pr = parseXmlTag(body, 'PaginationResult') || '';
+          var pr = parseXmlTag(unsold, 'PaginationResult') || '';
           totalPages = parseInt(parseXmlTag(pr, 'TotalNumberOfPages') || '1', 10) || 1;
         }
-        parseXmlAll(body, 'Item').map(function(b){ return parseXmlTag(b, 'ItemID'); }).filter(Boolean).forEach(function(id){ allIds.push(id); });
-        console.log('[REFRESH] pulling page ' + pageNum + ' of ' + totalPages + ' (' + allIds.length + ' items so far)');
+        var itemArray = parseXmlTag(unsold, 'ItemArray') || unsold;
+        parseXmlAll(itemArray, 'Item').map(function(b){ return parseXmlTag(b, 'ItemID'); }).filter(Boolean).forEach(function(id){ allIds.push(id); });
+        console.log('[REFRESH] pulling page ' + pageNum + ' of ' + totalPages);
         if(pageNum < totalPages){ setTimeout(function(){ fetchPage(pageNum + 1); }, 500); return; }
         processIds(allIds);
       });
@@ -2111,13 +2115,12 @@ function pullRefreshListings(callback){
       var q = readRefreshQueue();
       var existing = {}; q.queue.forEach(function(it){ if(it.original && it.original.item_id) existing[String(it.original.item_id)] = true; });
       var toFetch = ids.filter(function(id){ return !existing[String(id)]; });
-      var skipped = ids.length - toFetch.length, pulled = 0, skippedSold = 0, i = 0;
+      var skippedDup = ids.length - toFetch.length, pulled = 0, i = 0;
       function nextItem(){
         if(i >= toFetch.length){
           writeRefreshQueue(q);
-          console.log('[REFRESH] skipped ' + skippedSold + ' sold items (QuantitySold > 0 or ListingStatus Completed)');
-          console.log('[REFRESH] pulled ' + pulled + ' inactive listings from eBay');
-          callback({ success:true, pulled: pulled, skipped: skipped, skipped_duplicates: skipped, skipped_sold: skippedSold, total: q.queue.length });
+          console.log('[REFRESH] pulled ' + pulled + ' unsold ended listings from eBay');
+          callback({ success:true, pulled: pulled, skipped: skippedDup, skipped_duplicates: skippedDup, total: q.queue.length });
           return;
         }
         var id = toFetch[i]; i++;
@@ -2128,17 +2131,8 @@ function pullRefreshListings(callback){
           + '</GetItemRequest>';
         ebayTradingCall('GetItem', giXml, token, function(ge, gsc, gbody){
           if(!ge){
-            // FIX 1: exclude sold items. Both checks must pass to include: QuantitySold === 0 AND
-            // ListingStatus === 'Ended' (QuantitySold > 0 or ListingStatus 'Completed' = sold -> skip).
-            var ss = parseXmlTag(gbody, 'SellingStatus') || '';
-            var qtySold = parseInt(parseXmlTag(ss, 'QuantitySold') || '0', 10) || 0;
-            var lstStatus = String(parseXmlTag(ss, 'ListingStatus') || '').trim();
-            if(qtySold > 0 || lstStatus !== 'Ended'){
-              skippedSold++;
-            } else {
-              var orig = parseRefreshGetItem(gbody, id);
-              if(orig && orig.item_id){ q.queue.push({ id: genRefreshId(), status:'pending', pulled_at: new Date().toISOString(), approved_at:null, posted_at:null, ebay_item_id:null, original: orig, improved:null, error:null }); pulled++; }
-            }
+            var orig = parseRefreshGetItem(gbody, id);
+            if(orig && orig.item_id){ q.queue.push({ id: genRefreshId(), status:'pending', pulled_at: new Date().toISOString(), approved_at:null, posted_at:null, ebay_item_id:null, original: orig, improved:null, error:null }); pulled++; }
           } else { console.log('[REFRESH] GetItem error for ' + id + ':', ge.message); }
           setTimeout(nextItem, 120);
         });
