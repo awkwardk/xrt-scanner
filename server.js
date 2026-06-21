@@ -2111,12 +2111,13 @@ function pullRefreshListings(callback){
       var q = readRefreshQueue();
       var existing = {}; q.queue.forEach(function(it){ if(it.original && it.original.item_id) existing[String(it.original.item_id)] = true; });
       var toFetch = ids.filter(function(id){ return !existing[String(id)]; });
-      var skipped = ids.length - toFetch.length, pulled = 0, i = 0;
+      var skipped = ids.length - toFetch.length, pulled = 0, skippedSold = 0, i = 0;
       function nextItem(){
         if(i >= toFetch.length){
           writeRefreshQueue(q);
+          console.log('[REFRESH] skipped ' + skippedSold + ' sold items (QuantitySold > 0 or ListingStatus Completed)');
           console.log('[REFRESH] pulled ' + pulled + ' inactive listings from eBay');
-          callback({ success:true, pulled: pulled, skipped: skipped, total: q.queue.length });
+          callback({ success:true, pulled: pulled, skipped: skipped, skipped_duplicates: skipped, skipped_sold: skippedSold, total: q.queue.length });
           return;
         }
         var id = toFetch[i]; i++;
@@ -2127,8 +2128,17 @@ function pullRefreshListings(callback){
           + '</GetItemRequest>';
         ebayTradingCall('GetItem', giXml, token, function(ge, gsc, gbody){
           if(!ge){
-            var orig = parseRefreshGetItem(gbody, id);
-            if(orig && orig.item_id){ q.queue.push({ id: genRefreshId(), status:'pending', pulled_at: new Date().toISOString(), approved_at:null, posted_at:null, ebay_item_id:null, original: orig, improved:null, error:null }); pulled++; }
+            // FIX 1: exclude sold items. Both checks must pass to include: QuantitySold === 0 AND
+            // ListingStatus === 'Ended' (QuantitySold > 0 or ListingStatus 'Completed' = sold -> skip).
+            var ss = parseXmlTag(gbody, 'SellingStatus') || '';
+            var qtySold = parseInt(parseXmlTag(ss, 'QuantitySold') || '0', 10) || 0;
+            var lstStatus = String(parseXmlTag(ss, 'ListingStatus') || '').trim();
+            if(qtySold > 0 || lstStatus !== 'Ended'){
+              skippedSold++;
+            } else {
+              var orig = parseRefreshGetItem(gbody, id);
+              if(orig && orig.item_id){ q.queue.push({ id: genRefreshId(), status:'pending', pulled_at: new Date().toISOString(), approved_at:null, posted_at:null, ebay_item_id:null, original: orig, improved:null, error:null }); pulled++; }
+            }
           } else { console.log('[REFRESH] GetItem error for ' + id + ':', ge.message); }
           setTimeout(nextItem, 120);
         });
@@ -2236,6 +2246,18 @@ function uploadUrlToEbay(imageUrl, token, callback){
   req.on('error', function(e){ callback(e); });
   req.write(bodyStr); req.end();
 }
+// FIX 2: normalize old eBay CDN photo URLs to full resolution so re-upload meets the 500px minimum.
+function cleanEbayPhotoUrl(url){
+  var s = String(url == null ? '' : url);
+  var out = s;
+  // s-l[size].jpg -> s-l1600.jpg (only when a size token precedes the extension)
+  out = out.replace(/(s-l)\d+(\.jpe?g)/i, function(m, p1, ext){ return 's-l1600' + ext; });
+  // $_[code].JPG -> $_57.JPG (eBay full-size code)
+  out = out.replace(/\$_\d+(\.jpe?g)/i, function(m, ext){ return '$_57' + ext; });
+  // thumbs path segment -> images
+  out = out.replace(/\/thumbs\//gi, '/images/');
+  return out;
+}
 // Post one approved (or failed/retry) queue item to eBay as a brand-new listing.
 function postRefreshItem(item, callback){
   getEbayToken(function(tErr, token){
@@ -2251,7 +2273,9 @@ function postRefreshItem(item, callback){
     function nextPhoto(){
       if(pi >= srcPhotos.length || eps.length >= 12){ buildAndPost(); return; }
       var url = srcPhotos[pi]; pi++;
-      uploadUrlToEbay(url, token, function(uerr, epsUrl){
+      var cleanUrl = cleanEbayPhotoUrl(url);
+      if(cleanUrl !== url){ console.log('[REFRESH] cleaned photo URL: ' + url + ' → ' + cleanUrl); }
+      uploadUrlToEbay(cleanUrl, token, function(uerr, epsUrl){
         if(!uerr && epsUrl) eps.push(epsUrl); else console.log('[REFRESH] photo re-upload failed:', uerr ? uerr.message : 'no url');
         setTimeout(nextPhoto, 150);
       });
