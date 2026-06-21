@@ -2071,7 +2071,7 @@ function parseRefreshGetItem(body, fallbackId){
 function pullRefreshListings(callback){
   getEbayToken(function(tErr, token){
     if(tErr || !token){ callback({ success:false, error:'eBay not connected', pulled:0, skipped:0, total: readRefreshQueue().queue.length }); return; }
-    var now = new Date(), from = new Date(now.getTime() - 90 * 86400000);
+    var now = new Date(), from = new Date(now.getTime() - 24 * 60 * 60 * 1000);
     // EntriesPerPage 200 (Trading API max); paginate through all pages, collecting all item IDs.
     function buildSellerListXml(pageNum){
       return '<?xml version="1.0" encoding="utf-8"?>'
