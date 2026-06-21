@@ -1689,6 +1689,113 @@ const server = http.createServer(function(req, res) {
     return;
   }
 
+  // ── INACTIVE LISTING PIPELINE (additive — all JSON, never crashes) ──
+  if(req.method==='GET' && req.url==='/refresh'){
+    res.writeHead(200,{'Content-Type':'text/html; charset=utf-8'});
+    res.end(renderRefreshPage());
+    return;
+  }
+  if(req.method==='GET' && req.url.split('?')[0]==='/api/refresh/pull'){
+    try { pullRefreshListings(function(r){ sendJSON(res,200, r || {success:false, error:'Unknown', pulled:0, skipped:0, total:0}); }); }
+    catch(e){ sendJSON(res,200,{success:false, error:'Pull error', pulled:0, skipped:0, total:0}); }
+    return;
+  }
+  if(req.method==='GET' && req.url.split('?')[0]==='/api/refresh/queue'){
+    sendJSON(res,200, readRefreshQueue());
+    return;
+  }
+  if(req.method==='GET' && req.url.split('?')[0]==='/api/refresh/schedule-status'){
+    sendJSON(res,200, refreshScheduleStatus());
+    return;
+  }
+  if(req.method==='POST' && req.url.split('?')[0]==='/api/refresh/run-schedule'){
+    try { refreshRunSchedule(function(r){ sendJSON(res,200, r || {success:true, posted:0, reason:'Unknown'}); }); }
+    catch(e){ sendJSON(res,200,{success:true, posted:0, reason:'error'}); }
+    return;
+  }
+  if(req.method==='POST' && req.url.split('?')[0]==='/api/refresh/generate-all'){
+    try { refreshGenerateAll(function(r){ sendJSON(res,200, r || {success:true, generated:0, failed:0}); }); }
+    catch(e){ sendJSON(res,200,{success:true, generated:0, failed:0}); }
+    return;
+  }
+  if(req.method==='POST' && req.url.split('?')[0]==='/api/refresh/settings'){
+    parseBody(req, function(perr, pb){
+      if(perr || !pb){ sendJSON(res,400,{success:false, error:'Bad request'}); return; }
+      var q = readRefreshQueue();
+      var dl = parseInt(pb.daily_limit, 10), iv = parseInt(pb.post_interval_minutes, 10);
+      if(!isNaN(dl)){ if(dl < 1) dl = 1; if(dl > 100) dl = 100; q.daily_limit = dl; }
+      if(!isNaN(iv)){ if(iv < 1) iv = 1; if(iv > 60) iv = 60; q.post_interval_minutes = iv; }
+      writeRefreshQueue(q);
+      console.log('[REFRESH] settings: ' + q.daily_limit + '/day, ' + q.post_interval_minutes + 'm spacing');
+      sendJSON(res,200,{success:true, daily_limit: q.daily_limit, post_interval_minutes: q.post_interval_minutes});
+    });
+    return;
+  }
+  if(req.method==='PATCH' && /^\/api\/refresh\/item\/[^/?]+$/.test(req.url.split('?')[0])){
+    var ridP = decodeURIComponent(req.url.split('?')[0].split('/').pop());
+    parseBody(req, function(perr, pb){
+      if(perr || !pb || typeof pb !== 'object'){ sendJSON(res,400,{success:false, error:'Bad request'}); return; }
+      var q = readRefreshQueue(); var it = null;
+      for(var i=0;i<q.queue.length;i++){ if(q.queue[i].id === ridP){ it = q.queue[i]; break; } }
+      if(!it){ sendJSON(res,404,{success:false, error:'Item not found'}); return; }
+      it.improved = it.improved || {};
+      ['title','description_html','condition_box','category_id','condition_id'].forEach(function(k){ if(pb[k] !== undefined) it.improved[k] = String(pb[k] == null ? '' : pb[k]); });
+      ['price','accept_price','decline_price'].forEach(function(k){ if(pb[k] !== undefined){ var n = parseFloat(pb[k]); if(!isNaN(n)) it.improved[k] = n; } });
+      ['weight_lbs','weight_oz','dimensions_length','dimensions_width','dimensions_height'].forEach(function(k){ if(pb[k] !== undefined){ var n = parseFloat(pb[k]); it.improved[k] = isNaN(n) ? 0 : n; } });
+      if(pb.item_specifics !== undefined && pb.item_specifics && typeof pb.item_specifics === 'object' && !Array.isArray(pb.item_specifics)){ it.improved.item_specifics = pb.item_specifics; }
+      if(pb.photos !== undefined && Array.isArray(pb.photos)){ it.improved.photos = pb.photos; }
+      writeRefreshQueue(q);
+      sendJSON(res,200,it);
+    });
+    return;
+  }
+  if(req.method==='POST' && /^\/api\/refresh\/generate\/[^/?]+$/.test(req.url.split('?')[0])){
+    var gid = decodeURIComponent(req.url.split('?')[0].split('/').pop());
+    parseBody(req, function(perr, pb){
+      var notes = (pb && pb.notes != null) ? String(pb.notes) : '';
+      var q = readRefreshQueue(); var it = null;
+      for(var i=0;i<q.queue.length;i++){ if(q.queue[i].id === gid){ it = q.queue[i]; break; } }
+      if(!it){ sendJSON(res,404,{success:false, error:'Item not found'}); return; }
+      try { generateRefreshItem(it, notes, function(r){ sendJSON(res,200, r || {success:false, error:'Unknown'}); }); }
+      catch(e){ sendJSON(res,200,{success:false, error:'Generation error'}); }
+    });
+    return;
+  }
+  if(req.method==='POST' && /^\/api\/refresh\/approve\/[^/?]+$/.test(req.url.split('?')[0])){
+    var apid = decodeURIComponent(req.url.split('?')[0].split('/').pop());
+    var q = readRefreshQueue(); var it = null;
+    for(var i=0;i<q.queue.length;i++){ if(q.queue[i].id === apid){ it = q.queue[i]; break; } }
+    if(!it){ sendJSON(res,404,{success:false, error:'Item not found'}); return; }
+    it.status = 'approved'; it.approved_at = new Date().toISOString(); it.error = null;
+    writeRefreshQueue(q); console.log('[REFRESH] approved ' + apid); sendJSON(res,200,it);
+    return;
+  }
+  if(req.method==='POST' && /^\/api\/refresh\/unapprove\/[^/?]+$/.test(req.url.split('?')[0])){
+    var unid = decodeURIComponent(req.url.split('?')[0].split('/').pop());
+    var q = readRefreshQueue(); var it = null;
+    for(var i=0;i<q.queue.length;i++){ if(q.queue[i].id === unid){ it = q.queue[i]; break; } }
+    if(!it){ sendJSON(res,404,{success:false, error:'Item not found'}); return; }
+    it.status = 'pending';
+    writeRefreshQueue(q); sendJSON(res,200,it);
+    return;
+  }
+  if(req.method==='POST' && /^\/api\/refresh\/remove\/[^/?]+$/.test(req.url.split('?')[0])){
+    var rmid = decodeURIComponent(req.url.split('?')[0].split('/').pop());
+    var q = readRefreshQueue(); q.queue = q.queue.filter(function(it){ return it.id !== rmid; });
+    writeRefreshQueue(q); console.log('[REFRESH] removed ' + rmid); sendJSON(res,200,{success:true});
+    return;
+  }
+  if(req.method==='POST' && /^\/api\/refresh\/post\/[^/?]+$/.test(req.url.split('?')[0])){
+    var poid = decodeURIComponent(req.url.split('?')[0].split('/').pop());
+    var q = readRefreshQueue(); var it = null;
+    for(var i=0;i<q.queue.length;i++){ if(q.queue[i].id === poid){ it = q.queue[i]; break; } }
+    if(!it){ sendJSON(res,404,{success:false, error:'Item not found'}); return; }
+    if(it.status !== 'approved' && it.status !== 'failed'){ sendJSON(res,200,{success:false, error:'Item must be approved before posting'}); return; }
+    try { postRefreshItem(it, function(r){ sendJSON(res,200, r || {success:false, error:'Unknown'}); }); }
+    catch(e){ sendJSON(res,200,{success:false, error:'Post error'}); }
+    return;
+  }
+
   res.writeHead(404);res.end('Not found');
 });
 
@@ -1877,6 +1984,480 @@ function renderBuyersPage(){
   + 'function saveBuyer(){var name=document.getElementById("f_name").value.trim();if(!name){document.getElementById("mErr").textContent="Name is required";return;}var pend=document.getElementById("f_tag").value.trim();if(pend&&modalTags.indexOf(pend)<0)modalTags.push(pend);var payload={name:name,ebay_username:document.getElementById("f_user").value.trim(),contact_source:document.getElementById("f_src").value,email:document.getElementById("f_email").value.trim(),phone:document.getElementById("f_phone").value.trim(),looking_for:modalTags.slice(),notes:document.getElementById("f_notes").value};var url=editId?("/api/buyers/"+editId):"/api/buyers";var method=editId?"PATCH":"POST";fetch(url,{method:method,headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)}).then(function(r){return r.json();}).then(function(d){if(d&&d.id){closeModal();load();toast(editId?"Saved":"Buyer added");}else{document.getElementById("mErr").textContent=(d&&d.error)||"Save failed";}}).catch(function(){document.getElementById("mErr").textContent="Network error";});}'
   + 'function confirmDelete(id){var b=findB(id);if(!b)return;if(!confirm("Remove "+b.name+" from buyer database?"))return;fetch("/api/buyers/"+id,{method:"DELETE"}).then(function(r){return r.json();}).then(function(d){if(d&&d.success){BUYERS=BUYERS.filter(function(x){return x.id!==id;});render();toast("Removed");}else{toast("Delete failed");}}).catch(function(){toast("Network error");});}'
   + 'if(hasAccess()){grant();}else{updDots();}'
+  + '</scr'+'ipt></body></html>';
+}
+
+// ── INACTIVE LISTING PIPELINE BACKEND (additive — never crashes, always returns JSON) ──
+var REFRESH_FILE = path.join(DATA_DIR, 'refresh-queue.json');
+function readRefreshQueue(){
+  var def = { daily_limit:10, post_interval_minutes:5, last_post_date:null, posted_today:0, last_post_time:null, queue:[] };
+  try {
+    if(fs.existsSync(REFRESH_FILE)){
+      var o = JSON.parse(fs.readFileSync(REFRESH_FILE, 'utf8'));
+      if(o && typeof o === 'object'){
+        if(typeof o.daily_limit !== 'number') o.daily_limit = 10;
+        if(typeof o.post_interval_minutes !== 'number') o.post_interval_minutes = 5;
+        if(typeof o.posted_today !== 'number') o.posted_today = 0;
+        if(!Array.isArray(o.queue)) o.queue = [];
+        if(o.last_post_date === undefined) o.last_post_date = null;
+        if(o.last_post_time === undefined) o.last_post_time = null;
+        return o;
+      }
+    }
+  } catch(e){ console.log('[REFRESH] read error:', e.message); }
+  return def;
+}
+function writeRefreshQueue(q){
+  try { fs.writeFileSync(REFRESH_FILE, JSON.stringify(q, null, 2)); return true; }
+  catch(e){ console.log('[REFRESH] write error:', e.message); return false; }
+}
+function genRefreshId(){ return 'r' + Date.now().toString(36) + '-' + Math.floor(Math.random() * 1000000).toString(36); }
+function refreshTodayStr(){ var d = new Date(); return d.getFullYear() + '-' + ('0'+(d.getMonth()+1)).slice(-2) + '-' + ('0'+d.getDate()).slice(-2); }
+function refreshGradeLabel(condId){
+  condId = String(condId == null ? '' : condId);
+  if(condId === '1000' || condId === '1500') return 'A (Like New)';
+  if(condId === '2500') return 'B (Refurbished)';
+  if(condId === '3000') return 'B (Good)';
+  if(condId === '5000') return 'C (Fair)';
+  if(condId === '7000') return 'D (Parts/Repair)';
+  return 'B (Good)';
+}
+function refreshGradeLetter(condId){
+  condId = String(condId == null ? '' : condId);
+  if(condId === '1000' || condId === '1500') return 'A';
+  if(condId === '2500' || condId === '3000') return 'B';
+  if(condId === '5000') return 'C';
+  if(condId === '7000') return 'D';
+  return 'B';
+}
+function refreshDecodeXml(s){ return String(s == null ? '' : s).replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&apos;/g,"'").replace(/&#0?39;/g,"'"); }
+// Generated copy must never reference prior listing history. Warn only (never blocks posting).
+function checkRefreshBannedPhrases(text){
+  var s = ' ' + String(text == null ? '' : text).toLowerCase().replace(/<[^>]+>/g, ' ') + ' ';
+  var found = [];
+  ['previously listed','relisted','now available','listed again','second chance','returned'].forEach(function(p){ if(s.indexOf(p) >= 0 && found.indexOf(p) < 0) found.push(p); });
+  if(/\bback\b/.test(s) && found.indexOf('back') < 0) found.push('back');
+  return found;
+}
+// Parse a GetItem response body into the "original" data shape.
+function parseRefreshGetItem(body, fallbackId){
+  try {
+    var itemId = parseXmlTag(body, 'ItemID') || fallbackId;
+    var title = refreshDecodeXml(parseXmlTag(body, 'Title') || '');
+    var desc = parseXmlTag(body, 'Description') || '';
+    var pics = parseXmlAll(body, 'PictureURL').map(function(u){ return refreshDecodeXml(u); }).filter(Boolean);
+    var primary = parseXmlTag(body, 'PrimaryCategory') || '';
+    var catId = parseXmlTag(primary, 'CategoryID') || parseXmlTag(body, 'CategoryID') || '';
+    var sellingStatus = parseXmlTag(body, 'SellingStatus') || '';
+    var price = parseFloat(parseXmlTag(sellingStatus, 'CurrentPrice') || parseXmlTag(body, 'StartPrice') || '0') || 0;
+    var condId = parseXmlTag(body, 'ConditionID') || '';
+    var isBlock = parseXmlTag(body, 'ItemSpecifics') || '';
+    var specs = {};
+    parseXmlAll(isBlock, 'NameValueList').forEach(function(nv){ var n = refreshDecodeXml(parseXmlTag(nv, 'Name') || ''); var vals = parseXmlAll(nv, 'Value').map(refreshDecodeXml); if(n){ specs[n] = vals.length > 1 ? vals.join(', ') : (vals[0] || ''); } });
+    var pkg = parseXmlTag(body, 'ShippingPackageDetails') || '';
+    return {
+      item_id: itemId, title: title, description_html: desc, photos: pics, category_id: catId,
+      price: price, condition_id: condId, item_specifics: specs,
+      weight_lbs: parseInt(parseXmlTag(pkg, 'WeightMajor') || '0', 10) || 0,
+      weight_oz: parseFloat(parseXmlTag(pkg, 'WeightMinor') || '0') || 0,
+      dimensions_length: parseFloat(parseXmlTag(pkg, 'PackageLength') || '0') || 0,
+      dimensions_width: parseFloat(parseXmlTag(pkg, 'PackageWidth') || '0') || 0,
+      dimensions_height: parseFloat(parseXmlTag(pkg, 'PackageDepth') || '0') || 0,
+      sku: parseXmlTag(body, 'SKU') || null
+    };
+  } catch(e){ return null; }
+}
+// Pull ended listings: GetSellerList (last 90 days) -> GetItem per item -> store as pending.
+function pullRefreshListings(callback){
+  getEbayToken(function(tErr, token){
+    if(tErr || !token){ callback({ success:false, error:'eBay not connected', pulled:0, skipped:0, total: readRefreshQueue().queue.length }); return; }
+    var now = new Date(), from = new Date(now.getTime() - 90 * 86400000);
+    var slXml = '<?xml version="1.0" encoding="utf-8"?>'
+      + '<GetSellerListRequest xmlns="urn:ebay:apis:eBLBaseComponents">'
+      + '<EndTimeFrom>' + from.toISOString() + '</EndTimeFrom>'
+      + '<EndTimeTo>' + now.toISOString() + '</EndTimeTo>'
+      + '<DetailLevel>ReturnAll</DetailLevel>'
+      + '<IncludeItemSpecifics>true</IncludeItemSpecifics>'
+      + '<Pagination><EntriesPerPage>50</EntriesPerPage><PageNumber>1</PageNumber></Pagination>'
+      + '</GetSellerListRequest>';
+    ebayTradingCall('GetSellerList', slXml, token, function(e, sc, body){
+      if(e){ callback({ success:false, error:e.message, pulled:0, skipped:0, total: readRefreshQueue().queue.length }); return; }
+      var ack = parseXmlTag(body, 'Ack') || '';
+      if(ack !== 'Success' && ack !== 'Warning'){ callback({ success:false, error: (parseEbayErrors(body).join('; ') || ('GetSellerList Ack ' + ack)), pulled:0, skipped:0, total: readRefreshQueue().queue.length }); return; }
+      var ids = parseXmlAll(body, 'Item').map(function(b){ return parseXmlTag(b, 'ItemID'); }).filter(Boolean);
+      var q = readRefreshQueue();
+      var existing = {}; q.queue.forEach(function(it){ if(it.original && it.original.item_id) existing[String(it.original.item_id)] = true; });
+      var toFetch = ids.filter(function(id){ return !existing[String(id)]; });
+      var skipped = ids.length - toFetch.length, pulled = 0, i = 0;
+      function nextItem(){
+        if(i >= toFetch.length){
+          writeRefreshQueue(q);
+          console.log('[REFRESH] pulled ' + pulled + ' inactive listings from eBay');
+          callback({ success:true, pulled: pulled, skipped: skipped, total: q.queue.length });
+          return;
+        }
+        var id = toFetch[i]; i++;
+        var giXml = '<?xml version="1.0" encoding="utf-8"?>'
+          + '<GetItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">'
+          + '<ItemID>' + xmlEscape(id) + '</ItemID>'
+          + '<DetailLevel>ReturnAll</DetailLevel><IncludeItemSpecifics>true</IncludeItemSpecifics>'
+          + '</GetItemRequest>';
+        ebayTradingCall('GetItem', giXml, token, function(ge, gsc, gbody){
+          if(!ge){
+            var orig = parseRefreshGetItem(gbody, id);
+            if(orig && orig.item_id){ q.queue.push({ id: genRefreshId(), status:'pending', pulled_at: new Date().toISOString(), approved_at:null, posted_at:null, ebay_item_id:null, original: orig, improved:null, error:null }); pulled++; }
+          } else { console.log('[REFRESH] GetItem error for ' + id + ':', ge.message); }
+          setTimeout(nextItem, 120);
+        });
+      }
+      nextItem();
+    });
+  });
+}
+// AI-generate a completely fresh listing for one queue item. Never references prior history.
+function generateRefreshItem(item, userNotes, callback){
+  try {
+    var orig = item.original || {};
+    var itemName = String(orig.title || 'Item').slice(0, 140);
+    var grade = refreshGradeLabel(orig.condition_id);
+    var specsText = '';
+    try { specsText = Object.keys(orig.item_specifics || {}).map(function(k){ return k + ': ' + orig.item_specifics[k]; }).join('; '); } catch(e){}
+    var sys = buildListingSystemPrompt() + '\n\n' + [
+      'FRESH LISTING RULES — CRITICAL:',
+      '- Write this listing completely from scratch as if this item is being listed for the very first time',
+      '- Do NOT mention, imply, or reference that this item was previously listed, previously available, unsold, or is being relisted in any way — not in the title, not in the description, not in the condition notes, nowhere',
+      "- Do NOT use phrases like 'now available', 'back in stock', 'listed again', 'second chance', or any language that implies prior listing history",
+      '- Research current eBay sold comps and price to sell — use the original price only as a reference point, not as a floor',
+      '- Write the strongest possible title using the top search terms buyers actually use for this item',
+      '- Identify and fill any missing item specifics',
+      "- Write the full HTML description using the XRT format: What's Included, Condition Details, Tested & Working"
+    ].join('\n');
+    if(userNotes && String(userNotes).trim()){ sys += '\nAlso address this feedback from the seller: ' + String(userNotes).trim(); }
+    var userMsg = [
+      'Item: ' + itemName,
+      'Grade: ' + grade,
+      'Category ID: ' + (orig.category_id || ''),
+      'Includes: See photos',
+      'Condition notes: See photos',
+      'Seller notes: ' + (specsText || 'None'),
+      '',
+      'Search eBay sold listings and generate a complete fresh listing JSON.'
+    ].join('\n');
+    callClaude({ model:'claude-sonnet-4-5', max_tokens:2500, system: sys, tools:[{type:'web_search_20250305', name:'web_search', max_uses:5}], messages:[{role:'user', content: userMsg}] }, function(err, resp){
+      if(err || !resp){ callback({ success:false, error:'AI request failed' }); return; }
+      var data = extractFirstJson(extractText(resp.content));
+      if(!data || !data.title){ callback({ success:false, error:'Could not parse generated listing' }); return; }
+      var q = readRefreshQueue(); var it = null;
+      for(var i = 0; i < q.queue.length; i++){ if(q.queue[i].id === item.id){ it = q.queue[i]; break; } }
+      if(!it){ callback({ success:false, error:'Item not found' }); return; }
+      var prev = it.improved || {};
+      var mergedSpecs = {};
+      Object.keys(orig.item_specifics || {}).forEach(function(k){ mergedSpecs[k] = orig.item_specifics[k]; });
+      if(prev.item_specifics && typeof prev.item_specifics === 'object'){ Object.keys(prev.item_specifics).forEach(function(k){ mergedSpecs[k] = prev.item_specifics[k]; }); }
+      if(data.item_specifics && typeof data.item_specifics === 'object'){ Object.keys(data.item_specifics).forEach(function(k){ var v = data.item_specifics[k]; mergedSpecs[k] = Array.isArray(v) ? v.join(', ') : v; }); }
+      function num(v, fb){ var n = parseFloat(v); return (v != null && !isNaN(n)) ? n : fb; }
+      it.improved = {
+        title: String(data.title),
+        description_html: data.description_html ? String(data.description_html) : (prev.description_html || ''),
+        condition_box: data.condition_box ? String(data.condition_box) : (prev.condition_box || ''),
+        photos: (prev.photos && prev.photos.length) ? prev.photos : (orig.photos || []),
+        category_id: prev.category_id || orig.category_id || '',
+        price: num(data.suggested_price, (prev.price != null ? prev.price : orig.price)),
+        accept_price: num(data.accept_price, (prev.accept_price != null ? prev.accept_price : null)),
+        decline_price: num(data.decline_price, (prev.decline_price != null ? prev.decline_price : null)),
+        condition_id: prev.condition_id || orig.condition_id || '',
+        item_specifics: mergedSpecs,
+        weight_lbs: (prev.weight_lbs != null) ? prev.weight_lbs : (orig.weight_lbs || 0),
+        weight_oz: (prev.weight_oz != null) ? prev.weight_oz : (orig.weight_oz || 0),
+        dimensions_length: (prev.dimensions_length != null) ? prev.dimensions_length : (orig.dimensions_length || 0),
+        dimensions_width: (prev.dimensions_width != null) ? prev.dimensions_width : (orig.dimensions_width || 0),
+        dimensions_height: (prev.dimensions_height != null) ? prev.dimensions_height : (orig.dimensions_height || 0)
+      };
+      it.status = 'approved'; it.approved_at = new Date().toISOString(); it.error = null;
+      var banned = checkRefreshBannedPhrases((it.improved.title || '') + ' ' + (it.improved.description_html || '') + ' ' + (it.improved.condition_box || ''));
+      if(banned.length){ console.log('[REFRESH] WARNING relist-language in generated listing for "' + orig.title + '": ' + banned.join(', ')); }
+      writeRefreshQueue(q);
+      console.log('[REFRESH] generated fresh listing for ' + orig.title);
+      callback({ success:true, item: it });
+    });
+  } catch(e){ callback({ success:false, error:'Generation error' }); }
+}
+function refreshGenerateAll(callback){
+  var q = readRefreshQueue();
+  var pend = q.queue.filter(function(it){ return it.status === 'pending' && !it.improved; });
+  var generated = 0, failed = 0, i = 0;
+  function nextGen(){
+    if(i >= pend.length){ callback({ success:true, generated: generated, failed: failed }); return; }
+    var item = pend[i]; i++;
+    generateRefreshItem(item, '', function(r){ if(r && r.success) generated++; else failed++; setTimeout(nextGen, 2000); });
+  }
+  nextGen();
+}
+// Re-upload an arbitrary image URL through the existing Media API pipeline (createImageFromUrl
+// + getImage). Reuses getEbayImageEps for the getImage step. Returns the fresh EPS URL.
+function uploadUrlToEbay(imageUrl, token, callback){
+  var bodyStr = JSON.stringify({ imageUrl: imageUrl });
+  var options = { hostname:'apim.ebay.com', path:'/commerce/media/v1_beta/image/create_image_from_url', method:'POST',
+    headers:{ 'Authorization':'Bearer ' + token, 'Content-Type':'application/json', 'X-EBAY-C-MARKETPLACE-ID':'EBAY_US', 'Content-Length': Buffer.byteLength(bodyStr) } };
+  var req = https.request(options, function(resp){
+    var d = ''; resp.on('data', function(c){ d += c; });
+    resp.on('end', function(){
+      var loc = (resp.headers && resp.headers.location) ? String(resp.headers.location) : '';
+      var imageId = loc ? loc.split('?')[0].split('/').filter(Boolean).pop() : '';
+      if(!imageId){ try { var cj = d ? JSON.parse(d) : {}; imageId = cj.imageId || (cj.image && cj.image.imageId) || ''; } catch(e){} }
+      if(!(resp.statusCode >= 200 && resp.statusCode < 300) || !imageId){ callback(new Error('createImageFromUrl HTTP ' + resp.statusCode)); return; }
+      getEbayImageEps(imageId, token, callback);
+    });
+  });
+  req.on('error', function(e){ callback(e); });
+  req.write(bodyStr); req.end();
+}
+// Post one approved (or failed/retry) queue item to eBay as a brand-new listing.
+function postRefreshItem(item, callback){
+  getEbayToken(function(tErr, token){
+    if(tErr || !token){ callback({ success:false, error:'eBay not connected' }); return; }
+    var q = readRefreshQueue(); var it = null;
+    for(var i = 0; i < q.queue.length; i++){ if(q.queue[i].id === item.id){ it = q.queue[i]; break; } }
+    if(!it){ callback({ success:false, error:'Item not found' }); return; }
+    if(it.status !== 'approved' && it.status !== 'failed'){ callback({ success:false, error:'Item must be approved before posting' }); return; }
+    it.status = 'posting'; it.error = null; writeRefreshQueue(q);
+    var imp = it.improved || {}, orig = it.original || {};
+    var srcPhotos = (imp.photos && imp.photos.length) ? imp.photos : (orig.photos || []);
+    var eps = [], pi = 0;
+    function nextPhoto(){
+      if(pi >= srcPhotos.length || eps.length >= 12){ buildAndPost(); return; }
+      var url = srcPhotos[pi]; pi++;
+      uploadUrlToEbay(url, token, function(uerr, epsUrl){
+        if(!uerr && epsUrl) eps.push(epsUrl); else console.log('[REFRESH] photo re-upload failed:', uerr ? uerr.message : 'no url');
+        setTimeout(nextPhoto, 150);
+      });
+    }
+    function buildAndPost(){
+      var condId = String(imp.condition_id || orig.condition_id || '3000');
+      var gradeLetter = refreshGradeLetter(condId);
+      var allDims = (parseFloat(imp.dimensions_length) > 0 && parseFloat(imp.dimensions_width) > 0 && parseFloat(imp.dimensions_height) > 0);
+      var newSku = orig.sku || ('XR-' + Date.now().toString(36));
+      var record = {
+        sku: newSku, grade: gradeLetter, meta: { grade: gradeLetter, quantity: 1 },
+        shipping_tier: { finalLbs: parseInt(imp.weight_lbs != null ? imp.weight_lbs : orig.weight_lbs, 10) || 0, finalOz: parseFloat(imp.weight_oz != null ? imp.weight_oz : orig.weight_oz) || 0, boxSize: allDims ? (imp.dimensions_length + 'x' + imp.dimensions_width + 'x' + imp.dimensions_height) : null, tier: 0 },
+        listing: {
+          title: imp.title || orig.title || ('SKU ' + newSku),
+          description_html: imp.description_html || orig.description_html || '',
+          condition_box: imp.condition_box || '',
+          suggested_price: imp.price || orig.price || 0, avg_sold_price: imp.price || orig.price || 0,
+          category_id: imp.category_id || orig.category_id || 293,
+          item_specifics: imp.item_specifics || orig.item_specifics || {},
+          custom_sku: newSku, quantity: 1, parts_repair: gradeLetter === 'D'
+        }
+      };
+      var policies = readEbayPolicies();
+      var triedPolicies = false, refreshed = false;
+      function attempt(){
+        var opts = { pictureUrls: eps, categoryId: record.listing.category_id, conditionId: condId, policies: policies };
+        var xml = buildAddItemXml(record, opts);
+        ebayTradingCall('AddItem', xml, token, function(e, sc, body){
+          if(e){ finishFail(e.message); return; }
+          if(sc === 401 && !refreshed){ refreshed = true; refreshEbayToken(function(rE, nt){ if(!rE && nt) token = nt; attempt(); }); return; }
+          var ack = parseXmlTag(body, 'Ack') || '';
+          var itemId = parseXmlTag(body, 'ItemID');
+          if((ack === 'Success' || ack === 'Warning') && itemId){ finishOk(itemId); return; }
+          var msgs = parseEbayErrors(body);
+          var blob = (msgs.join(' ') + ' ' + ebayErrorCodes(body).join(' ')).toLowerCase();
+          if(/business polic|opted in|seller profile|21919456/.test(blob) && !triedPolicies){ triedPolicies = true; fetchEbayPolicies(function(pe, pol){ if(!pe && pol) policies = pol; attempt(); }); return; }
+          parseXmlAll(body, 'Errors').forEach(function(er){ console.log('[REFRESH] AddItem error ' + (parseXmlTag(er, 'ErrorCode') || '?') + ': ' + (parseXmlTag(er, 'ShortMessage') || '') + ' — ' + (parseXmlTag(er, 'LongMessage') || '')); });
+          finishFail(msgs.join(' | ') || ('AddItem Ack ' + ack));
+        });
+      }
+      function finishOk(itemId){
+        var q2 = readRefreshQueue();
+        for(var j = 0; j < q2.queue.length; j++){ if(q2.queue[j].id === item.id){ q2.queue[j].status = 'posted'; q2.queue[j].ebay_item_id = itemId; q2.queue[j].posted_at = new Date().toISOString(); q2.queue[j].error = null; q2.queue[j].improved = q2.queue[j].improved || {}; if(eps.length) q2.queue[j].improved.photos = eps; } }
+        writeRefreshQueue(q2);
+        console.log('[REFRESH] posted "' + record.listing.title + '" → eBay ' + itemId);
+        callback({ success:true, ebay_item_id: itemId });
+      }
+      function finishFail(msg){
+        var q2 = readRefreshQueue();
+        for(var j = 0; j < q2.queue.length; j++){ if(q2.queue[j].id === item.id){ q2.queue[j].status = 'failed'; q2.queue[j].error = String(msg).slice(0, 500); } }
+        writeRefreshQueue(q2);
+        console.log('[REFRESH] failed to post "' + record.listing.title + '": ' + msg);
+        callback({ success:false, error: String(msg).slice(0, 500) });
+      }
+      attempt();
+    }
+    nextPhoto();
+  });
+}
+function refreshScheduleStatus(){
+  var q = readRefreshQueue();
+  var posted = (q.last_post_date === refreshTodayStr()) ? (q.posted_today || 0) : 0;
+  var approved = q.queue.filter(function(it){ return it.status === 'approved'; });
+  var canByLimit = posted < (q.daily_limit || 10);
+  var canByInterval = true, nextEligible = null;
+  if(q.last_post_time){
+    var elapsed = (Date.now() - new Date(q.last_post_time).getTime()) / 60000;
+    if(elapsed < (q.post_interval_minutes || 5)){ canByInterval = false; nextEligible = new Date(new Date(q.last_post_time).getTime() + (q.post_interval_minutes || 5) * 60000).toISOString(); }
+  }
+  var can = canByLimit && canByInterval;
+  var reason = !canByLimit ? ('Daily limit reached (' + posted + '/' + (q.daily_limit || 10) + ')')
+    : !canByInterval ? ('Waiting ' + (q.post_interval_minutes || 5) + 'm between posts')
+    : approved.length === 0 ? 'No approved items ready to post' : 'Ready to post';
+  return { due: can && approved.length > 0, can_post_now: can, reason: reason, posted_today: posted, daily_limit: q.daily_limit || 10, approved_count: approved.length, next_post_eligible: nextEligible, post_interval_minutes: q.post_interval_minutes || 5 };
+}
+function refreshRunSchedule(callback){
+  var st = refreshScheduleStatus();
+  if(!st.due){ callback({ success:true, posted:0, reason: st.reason }); return; }
+  var q = readRefreshQueue();
+  if(q.last_post_date !== refreshTodayStr()){ q.posted_today = 0; q.last_post_date = refreshTodayStr(); writeRefreshQueue(q); }
+  var approved = q.queue.filter(function(it){ return it.status === 'approved'; }).sort(function(a, b){ return String(a.approved_at || '').localeCompare(String(b.approved_at || '')); });
+  var target = approved[0];
+  if(!target){ callback({ success:true, posted:0, reason:'No approved items' }); return; }
+  postRefreshItem(target, function(result){
+    if(result && result.success){
+      var q2 = readRefreshQueue();
+      q2.last_post_time = new Date().toISOString(); q2.last_post_date = refreshTodayStr(); q2.posted_today = (q2.posted_today || 0) + 1;
+      writeRefreshQueue(q2);
+      var remaining = q2.queue.filter(function(it){ return it.status === 'approved'; }).length;
+      if(q2.posted_today >= q2.daily_limit){ console.log('[REFRESH SCHEDULE] daily limit reached (' + q2.posted_today + '/' + q2.daily_limit + ')'); }
+      callback({ success:true, posted:1, remaining: remaining, ebay_item_id: result.ebay_item_id, title: (target.improved && target.improved.title) || (target.original && target.original.title) || 'item' });
+    } else { callback({ success:true, posted:0, reason: (result && result.error) || 'Post failed' }); }
+  });
+}
+// Auto-poster: every 60s post one due item; post_interval_minutes spacing is enforced in the
+// schedule logic. Wrapped so it never crashes the server.
+try {
+  setInterval(function(){
+    try {
+      refreshRunSchedule(function(r){
+        if(r && r.posted){ var q = readRefreshQueue(); console.log('[REFRESH SCHEDULE] auto-posted "' + (r.title || 'item') + '" (' + q.posted_today + '/' + q.daily_limit + ' today)'); }
+      });
+    } catch(e){ console.log('[REFRESH SCHEDULE] tick error:', e.message); }
+  }, 60000);
+} catch(e){ console.log('[REFRESH SCHEDULE] init error:', e.message); }
+
+// Inactive Listing Pipeline single-page app (all CSS+JS inline). XRT theme.
+function renderRefreshPage(){
+  return '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
+  + '<meta name="viewport" content="width=device-width,initial-scale=1">'
+  + '<title>Inactive Listing Pipeline</title><style>'
+  + '*{box-sizing:border-box;margin:0;padding:0;}'
+  + 'body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;background:#eceff1;color:#222;}'
+  + '.wrap{max-width:820px;margin:0 auto;}'
+  + '.hdr{background:#1a1a1a;color:#fff;padding:14px 16px;position:sticky;top:0;z-index:10;}'
+  + '.hdr h1{font-size:20px;}.hdr h1 b{color:#FFD700;}.hdr .sub{font-size:12px;color:#aaa;margin-top:2px;}'
+  + '.stats{display:flex;gap:8px;margin-top:12px;}'
+  + '.stat{flex:1;text-align:center;background:rgba(255,255,255,0.08);border-radius:8px;padding:6px 2px;}'
+  + '.stat .n{font-size:18px;font-weight:bold;display:block;}.stat .l{font-size:10px;color:#bbb;text-transform:uppercase;}'
+  + '.stat.p .n{color:#cfd8dc;}.stat.a .n{color:#a5d6a7;}.stat.t .n{color:#90caf9;}.stat.q .n{color:#fff;}'
+  + '.ctrls{background:#fff;padding:12px 16px;border-bottom:1px solid #ddd;}'
+  + '.btnrow{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px;}'
+  + '.b{border:none;border-radius:6px;padding:9px 14px;font-size:13px;font-weight:bold;cursor:pointer;}'
+  + '.b.blue{background:#1565c0;color:#fff;}.b.green{background:#2e7d32;color:#fff;}.b.yellow{background:#FFD700;color:#1a1a1a;}.b:disabled{opacity:0.6;cursor:default;}'
+  + '.setrow{display:flex;gap:10px;flex-wrap:wrap;align-items:center;font-size:13px;color:#444;}'
+  + '.setrow input{width:62px;padding:6px;border:1px solid #bbb;border-radius:4px;font-size:13px;}'
+  + '#schedInfo{font-size:12px;color:#789;margin-top:6px;}'
+  + '.tabs{display:flex;background:#fff;border-bottom:1px solid #ddd;position:sticky;top:0;}'
+  + '.tab{flex:1;text-align:center;padding:11px 4px;font-size:13px;font-weight:bold;color:#789;cursor:pointer;border-bottom:3px solid transparent;}'
+  + '.tab.active{color:#1565c0;border-bottom-color:#1565c0;}'
+  + '.list{padding:12px;}'
+  + '.card{background:#fff;border-radius:10px;box-shadow:0 1px 4px rgba(0,0,0,0.12);padding:14px;margin-bottom:14px;}'
+  + '.topbar{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;}'
+  + '.badge{font-size:11px;font-weight:bold;border-radius:20px;padding:3px 10px;color:#fff;}'
+  + '.badge.pending{background:#90a4ae;}.badge.approved{background:#2e7d32;}.badge.posting{background:#f9a825;color:#1a1a1a;animation:pulse 1s infinite;}.badge.posted{background:#1565c0;}.badge.failed{background:#c62828;}'
+  + '@keyframes pulse{50%{opacity:0.5;}}'
+  + '.rm{background:none;border:none;color:#c62828;font-size:20px;cursor:pointer;line-height:1;}'
+  + '.errln{color:#c62828;font-size:12px;margin-top:4px;}'
+  + '.photos{display:flex;gap:6px;margin:8px 0;flex-wrap:wrap;align-items:center;}'
+  + '.photos img{height:60px;border-radius:6px;border:1px solid #e0e0e0;object-fit:cover;}'
+  + '.morep{font-size:12px;color:#789;}'
+  + '.field{margin-top:8px;font-size:13px;color:#333;}'
+  + '.field b{color:#555;}.editable{cursor:pointer;border-bottom:1px dashed #1565c0;color:#1565c0;}'
+  + '.ititle{font-size:16px;font-weight:bold;cursor:pointer;}'
+  + '.price{font-size:16px;font-weight:bold;cursor:pointer;}.subprice{font-size:11px;color:#789;}'
+  + '.spectags{display:flex;flex-wrap:wrap;gap:6px;margin-top:4px;}'
+  + '.spectag{background:#eceff1;border-radius:16px;padding:3px 8px;font-size:12px;display:inline-flex;gap:6px;align-items:center;}'
+  + '.spectag .v{cursor:pointer;color:#1565c0;}.spectag .x{cursor:pointer;color:#c62828;font-weight:bold;}'
+  + '.linkbtn{background:#37474f;color:#fff;border:none;border-radius:6px;padding:6px 10px;font-size:12px;font-weight:bold;cursor:pointer;}'
+  + '.actions{margin-top:12px;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;}'
+  + '.regwrap{display:flex;gap:6px;align-items:center;flex-wrap:wrap;}'
+  + '.regwrap input{padding:6px 8px;border:1px solid #bbb;border-radius:4px;font-size:12.5px;min-width:180px;}'
+  + '.empty{text-align:center;padding:50px 20px;color:#789;}'
+  + '#descModal{position:fixed;inset:0;background:rgba(0,0,0,0.5);display:none;z-index:60;align-items:center;justify-content:center;padding:16px;}'
+  + '.descbox{background:#fff;border-radius:10px;max-width:680px;width:100%;max-height:90vh;display:flex;flex-direction:column;}'
+  + '.descbody{padding:16px;overflow:auto;flex:1;}'
+  + '.descbody textarea{width:100%;min-height:260px;font-family:monospace;font-size:12px;padding:8px;border:1px solid #ccc;border-radius:6px;}'
+  + '.descfoot{padding:12px 16px;border-top:1px solid #eee;display:flex;gap:10px;justify-content:flex-end;}'
+  + '.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#263238;color:#fff;padding:10px 18px;border-radius:20px;font-size:13px;z-index:200;opacity:0;transition:opacity .2s;pointer-events:none;}'
+  + '.toast.show{opacity:1;}'
+  + '</style></head><body><div class="wrap">'
+  + '<div class="hdr"><h1>Inactive Listing <b>Pipeline</b></h1><div class="sub" id="subDate">&nbsp;</div>'
+  + '<div class="stats"><div class="stat p"><span class="n" id="stPend">0</span><span class="l">Pending</span></div>'
+  + '<div class="stat a"><span class="n" id="stApp">0</span><span class="l">Approved</span></div>'
+  + '<div class="stat t"><span class="n" id="stPosted">0</span><span class="l">Posted Today</span></div>'
+  + '<div class="stat q"><span class="n" id="stTotal">0</span><span class="l">Total Queue</span></div></div></div>'
+  + '<div class="ctrls"><div class="btnrow">'
+  + '<button class="b blue" id="pullBtn" onclick="pull()">Pull Inactive Listings</button>'
+  + '<button class="b green" id="genAllBtn" onclick="generateAll()">Generate All</button>'
+  + '<button class="b yellow" id="runBtn" onclick="runSchedule()">Run Schedule Now</button>'
+  + '</div><div class="setrow">Post per day: <input id="setLimit" type="number" min="1" max="100"> Minutes between posts: <input id="setIv" type="number" min="1" max="60"> <button class="b blue" onclick="saveSettings()">Save Settings</button></div>'
+  + '<div id="schedInfo">Loading schedule...</div></div>'
+  + '<div class="tabs"><div class="tab active" data-tab="all" onclick="setTab(\'all\')">All</div><div class="tab" data-tab="pending" onclick="setTab(\'pending\')">Pending</div><div class="tab" data-tab="approved" onclick="setTab(\'approved\')">Approved</div><div class="tab" data-tab="posted" onclick="setTab(\'posted\')">Posted</div></div>'
+  + '<div class="list" id="list"></div></div>'
+  + '<div id="descModal"><div class="descbox"><div class="descbody" id="descBody"></div><div class="descfoot" id="descFoot"></div></div></div>'
+  + '<div class="toast" id="toast"></div>'
+  + '<script>'
+  + 'var QUEUE={queue:[]};var TAB="all";var descId=null;'
+  + 'function esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/\\"/g,"&quot;");}'
+  + 'function toast(t){var el=document.getElementById("toast");el.textContent=t;el.classList.add("show");setTimeout(function(){el.classList.remove("show");},1800);}'
+  + 'function findItem(id){for(var i=0;i<QUEUE.queue.length;i++){if(QUEUE.queue[i].id===id)return QUEUE.queue[i];}return null;}'
+  + 'function dispOf(it){var o=it.original||{};var m=it.improved||{};function pick(k,dz){return (m[k]!=null&&m[k]!=="")?m[k]:(o[k]!=null?o[k]:dz);}return {title:m.title||o.title||"",price:(m.price!=null?m.price:o.price)||0,accept_price:m.accept_price,decline_price:m.decline_price,category_id:m.category_id||o.category_id||"",condition_id:m.condition_id||o.condition_id||"",item_specifics:(m.item_specifics&&Object.keys(m.item_specifics).length)?m.item_specifics:(o.item_specifics||{}),weight_lbs:pick("weight_lbs",0),weight_oz:pick("weight_oz",0),dimensions_length:pick("dimensions_length",0),dimensions_width:pick("dimensions_width",0),dimensions_height:pick("dimensions_height",0),description_html:m.description_html||o.description_html||"",photos:(m.photos&&m.photos.length)?m.photos:(o.photos||[])};}'
+  + 'function condLabel(c){var m={"1000":"New","1500":"Like New / Open Box","2500":"Seller Refurbished","3000":"Used - Good","5000":"Used - Fair","7000":"For Parts / Not Working"};return m[String(c)]||("Condition "+(c||"?"));}'
+  + 'function patchItem(id,body,cb){fetch("/api/refresh/item/"+id,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(function(r){return r.json();}).then(function(d){if(d&&d.id){if(cb)cb(true);}else{toast((d&&d.error)||"Save failed");if(cb)cb(false);}}).catch(function(){toast("Network error");if(cb)cb(false);});}'
+  + 'function setSub(){var n=new Date();var WD=["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];var MO=["January","February","March","April","May","June","July","August","September","October","November","December"];document.getElementById("subDate").textContent=WD[n.getDay()]+", "+MO[n.getMonth()]+" "+n.getDate();}'
+  + 'function loadQueue(){fetch("/api/refresh/queue").then(function(r){return r.json();}).then(function(d){QUEUE=(d&&Array.isArray(d.queue))?d:{queue:[]};if(document.getElementById("setLimit").value==="")document.getElementById("setLimit").value=QUEUE.daily_limit;if(document.getElementById("setIv").value==="")document.getElementById("setIv").value=QUEUE.post_interval_minutes;render();}).catch(function(){QUEUE={queue:[]};render();});}'
+  + 'function loadSched(){fetch("/api/refresh/schedule-status").then(function(r){return r.json();}).then(function(s){var nx=s.next_post_eligible?(" | Next eligible: "+new Date(s.next_post_eligible).toLocaleTimeString()):"";document.getElementById("schedInfo").textContent=s.reason+" ("+s.posted_today+"/"+s.daily_limit+" today, "+s.approved_count+" approved)"+nx;document.getElementById("stPosted").textContent=s.posted_today;}).catch(function(){});}'
+  + 'function setTab(t){TAB=t;var ts=document.querySelectorAll(".tab");for(var i=0;i<ts.length;i++){ts[i].classList.toggle("active",ts[i].getAttribute("data-tab")===t);}render();}'
+  + 'function renderStats(){var p=0,a=0;QUEUE.queue.forEach(function(it){if(it.status==="pending")p++;else if(it.status==="approved")a++;});document.getElementById("stPend").textContent=p;document.getElementById("stApp").textContent=a;document.getElementById("stTotal").textContent=QUEUE.queue.length;}'
+  + 'function startEdit(host,fields,onSave){if(host.dataset.editing)return;host.dataset.editing="1";var prev=host.innerHTML;host.innerHTML="";var wrap=document.createElement("span");wrap.style.cssText="display:inline-flex;flex-wrap:wrap;gap:4px;align-items:center;";var inputs={};fields.forEach(function(f){var el;if(f.type==="select"){el=document.createElement("select");(f.options||[]).forEach(function(o){var op=document.createElement("option");op.value=o.v;op.textContent=o.l;if(String(o.v)===String(f.value))op.selected=true;el.appendChild(op);});}else{el=document.createElement("input");el.type=f.type||"text";el.value=(f.value==null?"":f.value);if(f.placeholder)el.placeholder=f.placeholder;}el.style.cssText="padding:3px 5px;border:1px solid #1565c0;border-radius:3px;font-size:13px;"+(f.width?("width:"+f.width+";"):"");inputs[f.key]=el;wrap.appendChild(el);if(f.counter){var c=document.createElement("span");c.style.cssText="font-size:11px;font-weight:bold;";var u=function(){var n=el.value.length;c.textContent=n+"/80";c.style.color=n>80?"#c62828":"#789";};u();el.addEventListener("input",u);wrap.appendChild(c);}});var sv=document.createElement("button");sv.textContent="Save";sv.style.cssText="background:#2e7d32;color:#fff;border:none;border-radius:4px;padding:4px 8px;font-size:12px;font-weight:bold;cursor:pointer;";var cn=document.createElement("span");cn.textContent="Cancel";cn.style.cssText="color:#789;font-size:12px;cursor:pointer;";wrap.appendChild(sv);wrap.appendChild(cn);host.appendChild(wrap);var first=wrap.querySelector("input,select");if(first){first.focus();if(first.select)first.select();}function doSave(){var v={};fields.forEach(function(f){v[f.key]=inputs[f.key].value;});host.removeAttribute("data-editing");onSave(v);}sv.addEventListener("click",doSave);cn.addEventListener("click",function(){host.innerHTML=prev;host.removeAttribute("data-editing");});wrap.addEventListener("keydown",function(e){if(e.key==="Enter"&&e.target.tagName!=="SELECT"){e.preventDefault();doSave();}else if(e.key==="Escape"){host.innerHTML=prev;host.removeAttribute("data-editing");}});}'
+  + 'function eTitle(id,h){startEdit(h,[{key:"title",value:dispOf(findItem(id)).title,width:"260px",counter:true}],function(v){patchItem(id,{title:v.title},loadQueue);});}'
+  + 'function ePrice(id,h){var d=dispOf(findItem(id));startEdit(h,[{key:"price",value:d.price,type:"number",width:"80px"},{key:"accept_price",value:(d.accept_price||""),type:"number",width:"80px",placeholder:"accept"},{key:"decline_price",value:(d.decline_price||""),type:"number",width:"80px",placeholder:"decline"}],function(v){patchItem(id,{price:v.price,accept_price:v.accept_price,decline_price:v.decline_price},loadQueue);});}'
+  + 'function eCat(id,h){startEdit(h,[{key:"category_id",value:dispOf(findItem(id)).category_id,width:"110px"}],function(v){patchItem(id,{category_id:v.category_id},loadQueue);});}'
+  + 'function eCond(id,h){var d=dispOf(findItem(id));startEdit(h,[{key:"condition_id",type:"select",value:d.condition_id,options:[{v:"1500",l:"Like New / Open Box"},{v:"2500",l:"Seller Refurbished"},{v:"3000",l:"Used - Good"},{v:"5000",l:"Used - Fair"},{v:"7000",l:"For Parts / Not Working"}]}],function(v){patchItem(id,{condition_id:v.condition_id},loadQueue);});}'
+  + 'function eWt(id,h){var d=dispOf(findItem(id));startEdit(h,[{key:"weight_lbs",value:d.weight_lbs,type:"number",width:"60px",placeholder:"lbs"},{key:"weight_oz",value:d.weight_oz,type:"number",width:"60px",placeholder:"oz"}],function(v){patchItem(id,{weight_lbs:v.weight_lbs,weight_oz:v.weight_oz},loadQueue);});}'
+  + 'function eDim(id,h){var d=dispOf(findItem(id));startEdit(h,[{key:"dimensions_length",value:d.dimensions_length,type:"number",width:"50px",placeholder:"L"},{key:"dimensions_width",value:d.dimensions_width,type:"number",width:"50px",placeholder:"W"},{key:"dimensions_height",value:d.dimensions_height,type:"number",width:"50px",placeholder:"H"}],function(v){patchItem(id,{dimensions_length:v.dimensions_length,dimensions_width:v.dimensions_width,dimensions_height:v.dimensions_height},loadQueue);});}'
+  + 'function curSpecs(id){var d=dispOf(findItem(id));var o={};Object.keys(d.item_specifics||{}).forEach(function(k){o[k]=d.item_specifics[k];});return o;}'
+  + 'function rmSpec(id,k){var s=curSpecs(id);delete s[k];patchItem(id,{item_specifics:s},loadQueue);}'
+  + 'function eSpecVal(id,k,h){startEdit(h,[{key:"v",value:h.textContent,width:"140px"}],function(v){var s=curSpecs(id);s[k]=v.v;patchItem(id,{item_specifics:s},loadQueue);});}'
+  + 'function addSpec(id){var kEl=document.getElementById("nsk_"+id),vEl=document.getElementById("nsv_"+id);var k=kEl?kEl.value.trim():"";var v=vEl?vEl.value:"";if(!k){toast("Enter a field name");return;}var s=curSpecs(id);s[k]=v;patchItem(id,{item_specifics:s},loadQueue);}'
+  + 'function openDesc(id){descId=id;var d=dispOf(findItem(id));document.getElementById("descBody").innerHTML=d.description_html||"<em>No description</em>";document.getElementById("descFoot").innerHTML="<button class=\\"linkbtn\\" onclick=\\"descEdit()\\">Edit HTML</button><button class=\\"linkbtn\\" style=\\"background:#90a4ae;\\" onclick=\\"closeDesc()\\">Close</button>";document.getElementById("descModal").style.display="flex";}'
+  + 'function descEdit(){var d=dispOf(findItem(descId));document.getElementById("descBody").innerHTML="<textarea id=\\"descTa\\"></textarea>";document.getElementById("descTa").value=d.description_html||"";document.getElementById("descFoot").innerHTML="<button class=\\"linkbtn\\" style=\\"background:#2e7d32;\\" onclick=\\"saveDesc()\\">Save</button><button class=\\"linkbtn\\" style=\\"background:#90a4ae;\\" onclick=\\"closeDesc()\\">Close</button>";}'
+  + 'function saveDesc(){var ta=document.getElementById("descTa");if(!ta)return;patchItem(descId,{description_html:ta.value},function(ok){if(ok){toast("Description saved");closeDesc();loadQueue();}});}'
+  + 'function closeDesc(){document.getElementById("descModal").style.display="none";descId=null;}'
+  + 'function photoStrip(d){if(!d.photos.length)return "";var t=d.photos.slice(0,3).map(function(u){return "<img src=\\""+esc(u)+"\\">";}).join("");var more=d.photos.length>3?("<span class=\\"morep\\">+"+(d.photos.length-3)+" more</span>"):"";return "<div class=\\"photos\\">"+t+more+"</div>";}'
+  + 'function specHtml(it){var d=dispOf(it);var tags=Object.keys(d.item_specifics||{}).map(function(k){var v=d.item_specifics[k];v=Array.isArray(v)?v.join(", "):v;return "<span class=\\"spectag\\"><b>"+esc(k)+":</b> <span class=\\"v\\" onclick=\\"eSpecVal(\'"+it.id+"\',\'"+esc(k).replace(/\'/g,"")+"\',this)\\">"+esc(v)+"</span> <span class=\\"x\\" onclick=\\"rmSpec(\'"+it.id+"\',\'"+esc(k).replace(/\'/g,"")+"\')\\">&times;</span></span>";}).join("");return "<div class=\\"field\\"><b>Item Specifics:</b><div class=\\"spectags\\">"+tags+"</div><div style=\\"margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;\\"><input id=\\"nsk_"+it.id+"\\" placeholder=\\"Field\\" style=\\"padding:5px;border:1px solid #bbb;border-radius:4px;font-size:12px;width:110px;\\"><input id=\\"nsv_"+it.id+"\\" placeholder=\\"Value\\" style=\\"padding:5px;border:1px solid #bbb;border-radius:4px;font-size:12px;width:110px;\\"><button class=\\"linkbtn\\" style=\\"background:#455a64;\\" onclick=\\"addSpec(\'"+it.id+"\')\\">+ Add Specific</button></div></div>";}'
+  + 'function actionBtns(it){var id=it.id;if(it.status==="pending")return "<button class=\\"b green\\" onclick=\\"approve(\'"+id+"\')\\">Approve</button>";if(it.status==="approved")return "<button class=\\"b yellow\\" onclick=\\"postNow(\'"+id+"\')\\">Post Now</button> <span style=\\"color:#789;font-size:12px;cursor:pointer;\\" onclick=\\"unapprove(\'"+id+"\')\\">Unapprove</span>";if(it.status==="posted")return "<a href=\\"https://www.ebay.com/itm/"+(it.ebay_item_id||"")+"\\" target=\\"_blank\\" class=\\"linkbtn\\" style=\\"background:#1565c0;text-decoration:none;\\">View on eBay &rarr;</a>";if(it.status==="failed")return "<button class=\\"b\\" style=\\"background:#e65100;color:#fff;\\" onclick=\\"postNow(\'"+id+"\')\\">Retry</button>";if(it.status==="posting")return "<span style=\\"color:#f9a825;font-weight:bold;\\">Posting...</span>";return "";}'
+  + 'function cardHtml(it){var d=dispOf(it);var badge="<span class=\\"badge "+it.status+"\\">"+it.status.toUpperCase()+(it.status==="posted"&&it.ebay_item_id?(" #"+it.ebay_item_id):"")+"</span>";var err=(it.status==="failed"&&it.error)?("<div class=\\"errln\\">"+esc(it.error)+"</div>"):"";var dims=(d.dimensions_length>0&&d.dimensions_width>0&&d.dimensions_height>0)?(d.dimensions_length+" x "+d.dimensions_width+" x "+d.dimensions_height+" in"):"Dimensions not set";var sub=((d.accept_price!=null)||(d.decline_price!=null))?("<div class=\\"subprice\\">Accept: $"+(d.accept_price!=null?d.accept_price:"-")+" | Decline: $"+(d.decline_price!=null?d.decline_price:"-")+"</div>"):"";'
+  + 'return "<div class=\\"card\\"><div class=\\"topbar\\"><div>"+badge+err+"</div><button class=\\"rm\\" onclick=\\"removeItem(\'"+it.id+"\')\\">&times;</button></div>"'
+  + '+photoStrip(d)'
+  + '+"<div class=\\"ititle\\" onclick=\\"eTitle(\'"+it.id+"\',this)\\">"+esc(d.title||"(no title)")+"</div>"'
+  + '+"<div class=\\"field\\"><span class=\\"price\\" onclick=\\"ePrice(\'"+it.id+"\',this)\\">$"+d.price+"</span>"+sub+"</div>"'
+  + '+"<div class=\\"field\\"><b>Category:</b> <span class=\\"editable\\" onclick=\\"eCat(\'"+it.id+"\',this)\\">"+esc(d.category_id||"set")+"</span></div>"'
+  + '+"<div class=\\"field\\"><b>Condition:</b> <span class=\\"editable\\" onclick=\\"eCond(\'"+it.id+"\',this)\\">"+esc(condLabel(d.condition_id))+"</span></div>"'
+  + '+"<div class=\\"field\\"><b>Weight:</b> <span class=\\"editable\\" onclick=\\"eWt(\'"+it.id+"\',this)\\">"+d.weight_lbs+" lbs "+d.weight_oz+" oz</span></div>"'
+  + '+"<div class=\\"field\\"><b>Dimensions:</b> <span class=\\"editable\\" onclick=\\"eDim(\'"+it.id+"\',this)\\">"+dims+"</span></div>"'
+  + '+specHtml(it)'
+  + '+"<div class=\\"field\\"><b>Description:</b> <button class=\\"linkbtn\\" onclick=\\"openDesc(\'"+it.id+"\')\\">Preview / Edit</button></div>"'
+  + '+"<div class=\\"actions\\"><div class=\\"regwrap\\"><button class=\\"linkbtn\\" onclick=\\"regen(\'"+it.id+"\')\\">&#8634; Regenerate</button><input id=\\"rgn_"+it.id+"\\" placeholder=\\"Notes for regeneration (optional)\\"><span id=\\"rgm_"+it.id+"\\" style=\\"font-size:12px;font-weight:bold;\\"></span></div><div>"+actionBtns(it)+"</div></div></div>";}'
+  + 'function render(){setSub();renderStats();var listEl=document.getElementById("list");var items=QUEUE.queue.slice();if(TAB!=="all")items=items.filter(function(it){return it.status===TAB||(TAB==="approved"&&it.status==="posting");});if(QUEUE.queue.length===0){listEl.innerHTML="<div class=\\"empty\\">No items in pipeline. Pull inactive listings from eBay to get started.</div>";return;}if(items.length===0){listEl.innerHTML="<div class=\\"empty\\">All items processed.</div>";return;}listEl.innerHTML=items.map(cardHtml).join("");}'
+  + 'function pull(){var b=document.getElementById("pullBtn");b.disabled=true;b.textContent="Pulling...";fetch("/api/refresh/pull").then(function(r){return r.json();}).then(function(d){b.disabled=false;b.textContent="Pull Inactive Listings";if(d&&d.success){toast("Pulled "+d.pulled+" listings ("+d.skipped+" skipped)");loadQueue();loadSched();}else{toast((d&&d.error)||"Pull failed");}}).catch(function(){b.disabled=false;b.textContent="Pull Inactive Listings";toast("Network error");});}'
+  + 'function generateAll(){var pend=QUEUE.queue.filter(function(it){return it.status==="pending"&&!it.improved;});if(!pend.length){toast("No pending items to generate");return;}var b=document.getElementById("genAllBtn");var i=0,ok=0,fail=0;function step(){if(i>=pend.length){b.disabled=false;b.textContent="Generate All";toast("Generated "+ok+", failed "+fail);loadQueue();loadSched();return;}var it=pend[i];i++;b.disabled=true;b.textContent="Generating "+i+" of "+pend.length+"...";fetch("/api/refresh/generate/"+it.id,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({notes:""})}).then(function(r){return r.json();}).then(function(d){if(d&&d.success)ok++;else fail++;loadQueue();setTimeout(step,2000);}).catch(function(){fail++;setTimeout(step,2000);});}step();}'
+  + 'function runSchedule(){var b=document.getElementById("runBtn");b.disabled=true;fetch("/api/refresh/run-schedule",{method:"POST"}).then(function(r){return r.json();}).then(function(d){b.disabled=false;if(d&&d.posted){toast("Posted 1 ("+(d.remaining||0)+" approved remaining)");}else{toast(d&&d.reason?d.reason:"Nothing posted");}loadQueue();loadSched();}).catch(function(){b.disabled=false;toast("Network error");});}'
+  + 'function saveSettings(){var dl=document.getElementById("setLimit").value,iv=document.getElementById("setIv").value;fetch("/api/refresh/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({daily_limit:parseInt(dl,10),post_interval_minutes:parseInt(iv,10)})}).then(function(r){return r.json();}).then(function(d){if(d&&d.success){document.getElementById("setLimit").value=d.daily_limit;document.getElementById("setIv").value=d.post_interval_minutes;toast("Settings saved");loadSched();}else{toast("Save failed");}}).catch(function(){toast("Network error");});}'
+  + 'function regen(id){var inp=document.getElementById("rgn_"+id);var notes=inp?inp.value:"";var m=document.getElementById("rgm_"+id);if(m){m.style.color="#8d6e00";m.textContent="Regenerating...";}fetch("/api/refresh/generate/"+id,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({notes:notes})}).then(function(r){return r.json();}).then(function(d){if(d&&d.success){toast("Listing regenerated");loadQueue();loadSched();}else{if(m){m.style.color="#c62828";m.textContent=(d&&d.error)||"Failed";}}}).catch(function(){if(m){m.style.color="#c62828";m.textContent="Network error";}});}'
+  + 'function approve(id){fetch("/api/refresh/approve/"+id,{method:"POST"}).then(function(r){return r.json();}).then(function(){toast("Approved");loadQueue();loadSched();}).catch(function(){toast("Network error");});}'
+  + 'function unapprove(id){fetch("/api/refresh/unapprove/"+id,{method:"POST"}).then(function(r){return r.json();}).then(function(){loadQueue();loadSched();}).catch(function(){toast("Network error");});}'
+  + 'function postNow(id){toast("Posting...");fetch("/api/refresh/post/"+id,{method:"POST"}).then(function(r){return r.json();}).then(function(d){if(d&&d.success){toast("Posted to eBay #"+d.ebay_item_id);}else{toast((d&&d.error)||"Post failed");}loadQueue();loadSched();}).catch(function(){toast("Network error");loadQueue();});}'
+  + 'function removeItem(id){var it=findItem(id);var t=it?dispOf(it).title:"this item";if(!confirm("Remove \\""+t+"\\" from the pipeline?"))return;fetch("/api/refresh/remove/"+id,{method:"POST"}).then(function(r){return r.json();}).then(function(){toast("Removed");loadQueue();loadSched();}).catch(function(){toast("Network error");});}'
+  + 'loadQueue();loadSched();setInterval(loadSched,30000);'
   + '</scr'+'ipt></body></html>';
 }
 
