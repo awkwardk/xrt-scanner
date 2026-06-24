@@ -1670,7 +1670,7 @@ const server = http.createServer(function(req, res) {
       for(var i = 0; i < blist.length; i++){ if(blist[i].id === pid){ found = i; break; } }
       if(found < 0){ sendJSON(res,404,{error:'Buyer not found'}); return; }
       var b = blist[found];
-      ['name','ebay_username','email','phone','contact_source','notes'].forEach(function(k){ if(pbody[k] !== undefined) b[k] = String(pbody[k] == null ? '' : pbody[k]); });
+      ['name','ebay_username','email','phone','contact_source','notes','company'].forEach(function(k){ if(pbody[k] !== undefined) b[k] = String(pbody[k] == null ? '' : pbody[k]); });
       if(pbody.looking_for !== undefined && Array.isArray(pbody.looking_for)){ b.looking_for = pbody.looking_for.map(function(s){ return String(s).trim(); }).filter(Boolean); }
       if(pbody.last_contacted !== undefined){ b.last_contacted = pbody.last_contacted; b.contact_count = (parseInt(b.contact_count, 10) || 0) + 1; }
       blist[found] = b; writeBuyers(blist);
@@ -1836,12 +1836,74 @@ function createBuyerFromBody(body){
     email: body.email ? String(body.email).trim() : '',
     phone: body.phone ? String(body.phone).trim() : '',
     contact_source: body.contact_source ? String(body.contact_source) : 'other',
+    company: body.company ? String(body.company).trim() : '',
     looking_for: Array.isArray(body.looking_for) ? body.looking_for.map(function(s){ return String(s).trim(); }).filter(Boolean) : [],
     notes: body.notes ? String(body.notes) : '',
     date_added: new Date().toISOString(),
     last_contacted: null,
     contact_count: 0
   };
+}
+// Auto-populate the buyers DB from pick orders whose shipping address carries a company name (business buyers).
+// Best-effort and additive: runs in the background after orders are collected, never throws, never blocks the pick list.
+function autoPopulateBuyersFromOrders(orders){
+  try {
+    if(!Array.isArray(orders) || !orders.length) return;
+    var todayIso = new Date().toISOString();
+    var todayDate = todayIso.slice(0, 10);
+    var blist = readBuyers();
+    var changed = false;
+    orders.forEach(function(order){
+      try {
+        if(!order || typeof order !== 'object') return;
+        var fsi = Array.isArray(order.fulfillmentStartInstructions) ? order.fulfillmentStartInstructions[0] : null;
+        var shipTo = (fsi && fsi.shippingStep && fsi.shippingStep.shipTo) ? fsi.shippingStep.shipTo : null;
+        var companyName = (shipTo && shipTo.companyName) ? String(shipTo.companyName).trim() : '';
+        if(!companyName) return; // not a business buyer — skip this order entirely
+        var fullName = (shipTo && shipTo.fullName) ? String(shipTo.fullName).trim() : '';
+        var ebayUsername = (order.buyer && order.buyer.username) ? String(order.buyer.username).trim() : '';
+        var ca = (shipTo && shipTo.contactAddress) ? shipTo.contactAddress : {};
+        var address = [ca.addressLine1, ca.addressLine2, ca.city, ca.stateOrProvince, ca.postalCode, ca.countryCode]
+          .map(function(x){ return String(x == null ? '' : x).trim(); }).filter(Boolean).join(', ');
+        var li = (Array.isArray(order.lineItems) && order.lineItems[0]) ? order.lineItems[0] : {};
+        var itemTitle = li.title ? String(li.title) : '';
+        var itemSKU = li.sku ? String(li.sku) : '';
+        var orderId = order.orderId ? String(order.orderId) : '';
+        var existing = null;
+        if(ebayUsername){
+          for(var i = 0; i < blist.length; i++){ if(blist[i] && String(blist[i].ebay_username || '') === ebayUsername){ existing = blist[i]; break; } }
+        }
+        if(existing){
+          existing.last_contacted = todayIso;
+          existing.contact_count = (parseInt(existing.contact_count, 10) || 0) + 1;
+          var repeatNote = todayDate + ' — Repeat purchase: ' + itemTitle + ' (Order ' + orderId + ')';
+          existing.notes = (existing.notes && String(existing.notes).trim()) ? (existing.notes + '\n' + repeatNote) : repeatNote;
+          if(!existing.company || !String(existing.company).trim()){ existing.company = companyName; }
+          changed = true;
+          console.log('[BUYERS] updated repeat business buyer: ' + companyName + ' / ' + ebayUsername);
+        } else {
+          var firstNote = todayDate + ' — First purchase: ' + itemTitle + ' (Order ' + orderId + ') | Address: ' + address;
+          blist.push({
+            id: genBuyerId(),
+            name: fullName,
+            ebay_username: ebayUsername,
+            email: '',
+            phone: '',
+            contact_source: 'eBay Order',
+            looking_for: [],
+            notes: firstNote,
+            company: companyName,
+            date_added: todayIso,
+            last_contacted: todayIso,
+            contact_count: 1
+          });
+          changed = true;
+          console.log('[BUYERS] auto-added business buyer: ' + companyName + ' / ' + ebayUsername);
+        }
+      } catch(inner){ console.log('[BUYERS] auto-populate error: ' + inner.message); }
+    });
+    if(changed){ writeBuyers(blist); }
+  } catch(e){ console.log('[BUYERS] auto-populate error: ' + e.message); }
 }
 // Printable quarter-sheet package insert (2x2 grid, no PIN). Black & white, print-optimized.
 function renderBuyersSlip(){
@@ -1903,6 +1965,7 @@ function renderBuyersPage(){
   + '.card{background:#fff;border-radius:10px;box-shadow:0 1px 4px rgba(0,0,0,0.12);padding:14px;margin-bottom:12px;}'
   + '.bname{font-size:16px;font-weight:bold;}'
   + '.buser{font-size:12.5px;color:#789;margin-left:6px;font-weight:normal;}'
+  + '.bcompany{font-size:12.5px;color:#789;margin-top:2px;}'
   + '.pill{display:inline-block;font-size:11px;font-weight:bold;border-radius:20px;padding:3px 10px;margin-top:6px;}'
   + '.pill.src{background:#eceff1;color:#455a64;}'
   + '.lf{margin-top:8px;display:flex;flex-wrap:wrap;gap:6px;}'
@@ -1950,6 +2013,7 @@ function renderBuyersPage(){
   + '<div id="modal"><div class="sheetm">'
   + '<h2 id="mTitle">Add Buyer</h2><div id="mErr"></div>'
   + '<div class="fld"><label>Name (required)</label><input id="f_name" type="text" placeholder="eBay username or real name"></div>'
+  + '<div class="fld"><label>Company Name (optional)</label><input id="f_company" type="text" placeholder="e.g. Acme Corp"></div>'
   + '<div class="fld"><label>eBay Username (if different)</label><input id="f_user" type="text" placeholder="optional"></div>'
   + '<div class="fld"><label>Contact Source</label><select id="f_src"><option value="eBay Messages">eBay Messages</option><option value="email">Email</option><option value="phone">Phone</option><option value="other">Other</option></select></div>'
   + '<div class="fld"><label>Email</label><input id="f_email" type="text" placeholder="optional"></div>'
@@ -1979,17 +2043,17 @@ function renderBuyersPage(){
   + 'function copyText(el){var v=el.getAttribute("data-v")||el.textContent;if(navigator.clipboard){navigator.clipboard.writeText(v).then(function(){toast("Copied");});}else{toast(v);}}'
   + 'function toggleExpand(el){el.classList.toggle("expanded");}'
   + 'function renderStats(){document.getElementById("stTotal").textContent=BUYERS.length;var m=0;BUYERS.forEach(function(b){if(b.last_contacted){var d=new Date(b.last_contacted);if(!isNaN(d.getTime())&&(Date.now()-d.getTime())<=2592000000)m++;}});document.getElementById("stMonth").textContent=m;var it={};BUYERS.forEach(function(b){(b.looking_for||[]).forEach(function(x){var k=String(x).trim().toLowerCase();if(k)it[k]=1;});});document.getElementById("stWant").textContent=Object.keys(it).length;}'
-  + 'function cardHtml(b){var srcMap={"eBay Messages":"eBay","email":"Email","phone":"Phone","other":"Other"};var src=srcMap[b.contact_source]||b.contact_source||"Other";var lf=(b.looking_for||[]).map(function(t){return "<span class=\\"lftag\\" onclick=\\"tagSearch(this.textContent)\\">"+esc(t)+"</span>";}).join("");var ci="";if(b.email)ci+="<span class=\\"copyable\\" data-v=\\""+esc(b.email)+"\\" onclick=\\"copyText(this)\\">"+esc(b.email)+"</span>";if(b.phone)ci+="<span class=\\"copyable\\" data-v=\\""+esc(b.phone)+"\\" onclick=\\"copyText(this)\\">"+esc(b.phone)+"</span>";var user=(b.ebay_username&&b.ebay_username!==b.name)?("<span class=\\"buser\\">@"+esc(b.ebay_username)+"</span>"):"";var notes=b.notes?("<div class=\\"notes\\" onclick=\\"toggleExpand(this)\\">"+esc(b.notes)+"</div>"):"";return "<div class=\\"card\\"><div class=\\"bname\\">"+esc(b.name)+user+"</div><div><span class=\\"pill src\\">"+esc(src)+"</span></div>"+(lf?("<div class=\\"lf\\">"+lf+"</div>"):"")+"<div class=\\"row\\"><b>Last:</b> "+relDate(b.last_contacted)+" <button class=\\"mc\\" data-id=\\""+esc(b.id)+"\\" onclick=\\"markContacted(this.dataset.id)\\">Mark Contacted</button> <span style=\\"color:#90a4ae;\\">("+(b.contact_count||0)+")</span></div>"+(ci?("<div class=\\"row\\">"+ci+"</div>"):"")+notes+"<div class=\\"cardbtns\\"><button class=\\"cbtn edit\\" data-id=\\""+esc(b.id)+"\\" onclick=\\"openEdit(this.dataset.id)\\">Edit</button><button class=\\"cbtn del\\" data-id=\\""+esc(b.id)+"\\" onclick=\\"confirmDelete(this.dataset.id)\\">Delete</button></div></div>";}'
+  + 'function cardHtml(b){var srcMap={"eBay Messages":"eBay","email":"Email","phone":"Phone","other":"Other"};var src=srcMap[b.contact_source]||b.contact_source||"Other";var lf=(b.looking_for||[]).map(function(t){return "<span class=\\"lftag\\" onclick=\\"tagSearch(this.textContent)\\">"+esc(t)+"</span>";}).join("");var ci="";if(b.email)ci+="<span class=\\"copyable\\" data-v=\\""+esc(b.email)+"\\" onclick=\\"copyText(this)\\">"+esc(b.email)+"</span>";if(b.phone)ci+="<span class=\\"copyable\\" data-v=\\""+esc(b.phone)+"\\" onclick=\\"copyText(this)\\">"+esc(b.phone)+"</span>";var user=(b.ebay_username&&b.ebay_username!==b.name)?("<span class=\\"buser\\">@"+esc(b.ebay_username)+"</span>"):"";var notes=b.notes?("<div class=\\"notes\\" onclick=\\"toggleExpand(this)\\">"+esc(b.notes)+"</div>"):"";var comp=b.company?("<div class=\\"bcompany\\">Company: "+esc(b.company)+"</div>"):"";return "<div class=\\"card\\"><div class=\\"bname\\">"+esc(b.name)+user+"</div>"+comp+"<div><span class=\\"pill src\\">"+esc(src)+"</span></div>"+(lf?("<div class=\\"lf\\">"+lf+"</div>"):"")+"<div class=\\"row\\"><b>Last:</b> "+relDate(b.last_contacted)+" <button class=\\"mc\\" data-id=\\""+esc(b.id)+"\\" onclick=\\"markContacted(this.dataset.id)\\">Mark Contacted</button> <span style=\\"color:#90a4ae;\\">("+(b.contact_count||0)+")</span></div>"+(ci?("<div class=\\"row\\">"+ci+"</div>"):"")+notes+"<div class=\\"cardbtns\\"><button class=\\"cbtn edit\\" data-id=\\""+esc(b.id)+"\\" onclick=\\"openEdit(this.dataset.id)\\">Edit</button><button class=\\"cbtn del\\" data-id=\\""+esc(b.id)+"\\" onclick=\\"confirmDelete(this.dataset.id)\\">Delete</button></div></div>";}'
   + 'function render(){renderStats();var q=curQ();var listEl=document.getElementById("list");var shown=BUYERS.filter(function(b){return matchB(b,q);});if(BUYERS.length===0){listEl.innerHTML="<div class=\\"empty\\">No buyers yet. Tap + to add your first contact.</div>";return;}if(shown.length===0){listEl.innerHTML="<div class=\\"empty\\">No matches for \\u201c"+esc(q)+"\\u201d. Try different terms.</div>";return;}listEl.innerHTML=shown.map(cardHtml).join("");}'
   + 'function findB(id){for(var i=0;i<BUYERS.length;i++){if(BUYERS[i].id===id)return BUYERS[i];}return null;}'
   + 'function markContacted(id){fetch("/api/buyers/"+id,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({last_contacted:new Date().toISOString()})}).then(function(r){return r.json();}).then(function(d){if(d&&d.id){for(var i=0;i<BUYERS.length;i++){if(BUYERS[i].id===id)BUYERS[i]=d;}render();toast("Contacted marked");}else{toast("Failed");}}).catch(function(){toast("Network error");});}'
   + 'function renderMTags(){document.getElementById("mtags").innerHTML=modalTags.map(function(t,i){return "<span class=\\"mtag\\">"+esc(t)+" <b onclick=\\"removeTag("+i+")\\">&times;</b></span>";}).join("");}'
   + 'function removeTag(i){modalTags.splice(i,1);renderMTags();}'
   + 'function tagKey(e){if(e.key==="Enter"||e.key===","){e.preventDefault();var inp=document.getElementById("f_tag");var v=inp.value.replace(/,$/,"").trim();if(v&&modalTags.indexOf(v)<0){modalTags.push(v);renderMTags();}inp.value="";}}'
-  + 'function openAdd(){editId=null;modalTags=[];document.getElementById("mTitle").textContent="Add Buyer";document.getElementById("mErr").textContent="";document.getElementById("f_name").value="";document.getElementById("f_user").value="";document.getElementById("f_src").value="eBay Messages";document.getElementById("f_email").value="";document.getElementById("f_phone").value="";document.getElementById("f_tag").value="";document.getElementById("f_notes").value="";renderMTags();document.getElementById("modal").style.display="flex";}'
-  + 'function openEdit(id){var b=findB(id);if(!b)return;editId=id;modalTags=(b.looking_for||[]).slice();document.getElementById("mTitle").textContent="Edit Buyer";document.getElementById("mErr").textContent="";document.getElementById("f_name").value=b.name||"";document.getElementById("f_user").value=b.ebay_username||"";document.getElementById("f_src").value=b.contact_source||"other";document.getElementById("f_email").value=b.email||"";document.getElementById("f_phone").value=b.phone||"";document.getElementById("f_tag").value="";document.getElementById("f_notes").value=b.notes||"";renderMTags();document.getElementById("modal").style.display="flex";}'
+  + 'function openAdd(){editId=null;modalTags=[];document.getElementById("mTitle").textContent="Add Buyer";document.getElementById("mErr").textContent="";document.getElementById("f_name").value="";document.getElementById("f_company").value="";document.getElementById("f_user").value="";document.getElementById("f_src").value="eBay Messages";document.getElementById("f_email").value="";document.getElementById("f_phone").value="";document.getElementById("f_tag").value="";document.getElementById("f_notes").value="";renderMTags();document.getElementById("modal").style.display="flex";}'
+  + 'function openEdit(id){var b=findB(id);if(!b)return;editId=id;modalTags=(b.looking_for||[]).slice();document.getElementById("mTitle").textContent="Edit Buyer";document.getElementById("mErr").textContent="";document.getElementById("f_name").value=b.name||"";document.getElementById("f_company").value=b.company||"";document.getElementById("f_user").value=b.ebay_username||"";document.getElementById("f_src").value=b.contact_source||"other";document.getElementById("f_email").value=b.email||"";document.getElementById("f_phone").value=b.phone||"";document.getElementById("f_tag").value="";document.getElementById("f_notes").value=b.notes||"";renderMTags();document.getElementById("modal").style.display="flex";}'
   + 'function closeModal(){document.getElementById("modal").style.display="none";}'
-  + 'function saveBuyer(){var name=document.getElementById("f_name").value.trim();if(!name){document.getElementById("mErr").textContent="Name is required";return;}var pend=document.getElementById("f_tag").value.trim();if(pend&&modalTags.indexOf(pend)<0)modalTags.push(pend);var payload={name:name,ebay_username:document.getElementById("f_user").value.trim(),contact_source:document.getElementById("f_src").value,email:document.getElementById("f_email").value.trim(),phone:document.getElementById("f_phone").value.trim(),looking_for:modalTags.slice(),notes:document.getElementById("f_notes").value};var url=editId?("/api/buyers/"+editId):"/api/buyers";var method=editId?"PATCH":"POST";fetch(url,{method:method,headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)}).then(function(r){return r.json();}).then(function(d){if(d&&d.id){closeModal();load();toast(editId?"Saved":"Buyer added");}else{document.getElementById("mErr").textContent=(d&&d.error)||"Save failed";}}).catch(function(){document.getElementById("mErr").textContent="Network error";});}'
+  + 'function saveBuyer(){var name=document.getElementById("f_name").value.trim();if(!name){document.getElementById("mErr").textContent="Name is required";return;}var pend=document.getElementById("f_tag").value.trim();if(pend&&modalTags.indexOf(pend)<0)modalTags.push(pend);var payload={name:name,company:document.getElementById("f_company").value.trim(),ebay_username:document.getElementById("f_user").value.trim(),contact_source:document.getElementById("f_src").value,email:document.getElementById("f_email").value.trim(),phone:document.getElementById("f_phone").value.trim(),looking_for:modalTags.slice(),notes:document.getElementById("f_notes").value};var url=editId?("/api/buyers/"+editId):"/api/buyers";var method=editId?"PATCH":"POST";fetch(url,{method:method,headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)}).then(function(r){return r.json();}).then(function(d){if(d&&d.id){closeModal();load();toast(editId?"Saved":"Buyer added");}else{document.getElementById("mErr").textContent=(d&&d.error)||"Save failed";}}).catch(function(){document.getElementById("mErr").textContent="Network error";});}'
   + 'function confirmDelete(id){var b=findB(id);if(!b)return;if(!confirm("Remove "+b.name+" from buyer database?"))return;fetch("/api/buyers/"+id,{method:"DELETE"}).then(function(r){return r.json();}).then(function(d){if(d&&d.success){BUYERS=BUYERS.filter(function(x){return x.id!==id;});render();toast("Removed");}else{toast("Delete failed");}}).catch(function(){toast("Network error");});}'
   + 'if(hasAccess()){grant();}else{updDots();}'
   + '</scr'+'ipt></body></html>';
@@ -2589,6 +2653,8 @@ function fetchPickOrders(callback){
           return;
         }
         var items = buildPickItems(j.orders);
+        // Additive, best-effort: auto-add/update business buyers (company name present) from these orders. Never blocks the response.
+        try { autoPopulateBuyersFromOrders(j.orders); } catch(e){ console.log('[BUYERS] auto-populate error: ' + e.message); }
         var counts = { overdue:0, today:0, upcoming:0 };
         items.forEach(function(it){ if(counts[it.status] != null) counts[it.status]++; });
         console.log('[PICK] fetched ' + items.length + ' orders | ' + counts.overdue + ' overdue | ' + counts.today + ' today | ' + counts.upcoming + ' upcoming');
