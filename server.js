@@ -593,6 +593,51 @@ function callClaude(payload, callback) {
   req.write(body);
   req.end();
 }
+// Build Anthropic image content blocks from a listing's photo list. Only eBay CDN (i.ebayimg.com)
+// URLs are used — those are already uploaded and publicly reachable; local/temp URLs are skipped so
+// the API never fails on an inaccessible URL. Capped at 6 images; when there are more than 6 CDN
+// photos, the first 5 plus the last photo are sent.
+function buildClaudePhotoBlocks(photos){
+  var urls = (Array.isArray(photos) ? photos : []).map(function(p){
+    if(p && typeof p === 'object') return String(p.url || p.src || p.href || '');
+    return String(p == null ? '' : p);
+  }).filter(function(u){ return u.indexOf('i.ebayimg.com') >= 0; });
+  if(!urls.length) return [];
+  var pick;
+  if(urls.length <= 6){ pick = urls.slice(); }
+  else { pick = urls.slice(0, 5); pick.push(urls[urls.length - 1]); }
+  return pick.slice(0, 6).map(function(u){ return { type:'image', source:{ type:'url', url: u } }; });
+}
+// Call Claude with the item's CDN photos as image blocks ahead of the text prompt so Sonnet can write
+// the listing from what it observes. If no CDN photos are available, sends the text-only prompt. If the
+// image-included call fails (e.g. a photo URL was inaccessible), falls back to a text-only call once so
+// listing generation never breaks because of a photo. basePayload is everything except `messages`.
+function callClaudeWithPhotos(basePayload, textPrompt, photos, sku, callback){
+  function clonePayload(){ var p = {}; for(var k in basePayload){ if(Object.prototype.hasOwnProperty.call(basePayload, k)) p[k] = basePayload[k]; } return p; }
+  function textOnly(){ var p = clonePayload(); p.messages = [{ role:'user', content: textPrompt }]; callClaude(p, callback); }
+  var blocks = [];
+  try { blocks = buildClaudePhotoBlocks(photos); } catch(e){ blocks = []; }
+  if(!blocks.length){ textOnly(); return; }
+  var content = blocks.concat([{ type:'text', text: textPrompt }]);
+  var p2 = clonePayload(); p2.messages = [{ role:'user', content: content }];
+  var fellBack = false;
+  try {
+    callClaude(p2, function(err, resp){
+      // Let rate-limit / overload responses pass straight through so existing retry logic still applies.
+      if(isClaudeRateLimited(resp)){ callback(err, resp); return; }
+      if((err || (resp && resp.error)) && !fellBack){
+        fellBack = true;
+        console.log('[LISTING] image-assisted generation failed for SKU ' + sku + ', falling back to text-only: ' + (err ? err.message : (resp && resp.error ? resp.error.message : 'unknown')));
+        textOnly();
+        return;
+      }
+      callback(err, resp);
+    });
+  } catch(e){
+    console.log('[LISTING] image-assisted generation failed for SKU ' + sku + ', falling back to text-only: ' + e.message);
+    textOnly();
+  }
+}
 // True when Anthropic signals a rate limit / overload (429 or rate_limit_error)
 function isClaudeRateLimited(resp){
   if(!resp) return false;
@@ -2235,7 +2280,9 @@ function generateRefreshItem(item, userNotes, callback){
       '',
       'Search eBay sold listings and generate a complete fresh listing JSON.'
     ].join('\n');
-    callClaude({ model:'claude-sonnet-4-5', max_tokens:2500, system: sys, tools:[{type:'web_search_20250305', name:'web_search', max_uses:5}], messages:[{role:'user', content: userMsg}] }, function(err, resp){
+    var prevImp = item.improved || {};
+    var refreshPhotoUrls = (prevImp.photos && prevImp.photos.length) ? prevImp.photos : (orig.photos || []);
+    callClaudeWithPhotos({ model:'claude-sonnet-4-5', max_tokens:2500, system: sys, tools:[{type:'web_search_20250305', name:'web_search', max_uses:5}] }, userMsg, refreshPhotoUrls, (orig.item_id || item.id || ''), function(err, resp){
       if(err || !resp){ callback({ success:false, error:'AI request failed' }); return; }
       var data = extractFirstJson(extractText(resp.content));
       if(!data || !data.title){ callback({ success:false, error:'Could not parse generated listing' }); return; }
@@ -2964,6 +3011,24 @@ function buildListingSystemPrompt(){
     '',
     '<b>[One closing line — practical use case or value statement. No hype. No "do not miss out". Just honest practical value.]</b>',
     '',
+    'PHOTO ANALYSIS INSTRUCTIONS:',
+    'You have been provided with photos of this item taken during processing. Use these photos to:',
+    '',
+    '1. WHAT\'S INCLUDED — Look carefully at the first photo which shows the item with all accessories laid out. List every item you can see: cables, power supplies, chargers, remotes, manuals, mounting hardware, cases, or any other accessories. Be specific — say \'AC power adapter with barrel connector\' not just \'power supply\'.',
+    '',
+    '2. CONDITION DETAILS — Look at the detail photos for:',
+    '   - Scratches, scuffs, or wear marks (note exact location: \'scratch on top left corner of lid\', not just \'scratched\')',
+    '   - Screen condition if visible',
+    '   - Port and connector condition',
+    '   - Any cracks, dents, or physical damage',
+    '   - Labels, asset tags, or markings that affect appearance',
+    '',
+    '3. MODEL AND BRAND — Look for any labels, stickers, or markings that show the exact model number, part number, brand name, or specifications. Use what you can read directly from the photos — this is more accurate than guessing from the item name alone.',
+    '',
+    '4. TESTED AND WORKING — If a testing/working photo is present (showing a screen on, power light, or output), describe specifically what was confirmed working.',
+    '',
+    'Write all condition and includes information from what you actually observe in the photos. If something is not clearly visible in the photos, say so rather than assuming. Do not fabricate details you cannot see.',
+    '',
     'Return ONLY this JSON, no markdown:',
     '{"title":"eBay title under 80 chars with brand model key terms — no banned words","condition_box":"2-3 honest sentences for eBay condition field","description_html":"complete HTML using structure above","avg_sold_price":45,"price_low":30,"price_high":65,"suggested_price":48,"accept_price":38,"decline_price":28,"shipping":"GA Ground","item_specifics":{"Brand":"value","Model":"value","Type":"value"}}'
   ].join('\n');
@@ -3013,13 +3078,13 @@ function regenerateListing(sku, userNotes, callback){
     'Regenerate the listing. Search eBay sold listings for current pricing. Return the same JSON format.'
   ].join('\n');
 
-  callClaude({
+  var regenPhotoUrls = (listing && Array.isArray(listing.photos)) ? listing.photos : [];
+  callClaudeWithPhotos({
     model: 'claude-sonnet-4-5',
     max_tokens: 2500,
     system: systemPrompt,
-    tools: [{type:'web_search_20250305', name:'web_search', max_uses:5}],
-    messages: [{role:'user', content: userMessage}]
-  }, function(err, resp){
+    tools: [{type:'web_search_20250305', name:'web_search', max_uses:5}]
+  }, userMessage, regenPhotoUrls, sku, function(err, resp){
     if(err || !resp){ callback({success:false, error:'AI request failed'}); return; }
     var data = extractFirstJson(extractText(resp.content));
     if(!data || !data.title){ callback({success:false, error:'Could not parse regenerated listing'}); return; }
@@ -3207,15 +3272,18 @@ function processItem(item, callback) {
     // FIX 2: required-aspects fetch gates the listing-generation AI (see below)
     function runListingClaude(){
     var listingPrompt = promptLines.join('\n');
+    // Processor-flow photos live on local disk at generation time (not yet on eBay CDN), so this is
+    // normally empty and the call falls back to text-only. Wired through the same photo-assisted path
+    // for consistency; CDN (i.ebayimg.com) URLs are used automatically when present.
+    var listingPhotoUrls = Array.isArray(meta.ebay_photo_urls) ? meta.ebay_photo_urls : [];
 
-    // ── Step 2: listing write with web_search ──
-    callClaude({
+    // ── Step 2: listing write with web_search (photos passed as images when on eBay CDN) ──
+    callClaudeWithPhotos({
       model: 'claude-sonnet-4-5',
       max_tokens: 2500,
       system: listingSystemPrompt,
-      tools: [{type:'web_search_20250305', name:'web_search', max_uses:5}],
-      messages:[{role:'user', content: listingPrompt}]
-    }, function(err2, resp2) {
+      tools: [{type:'web_search_20250305', name:'web_search', max_uses:5}]
+    }, listingPrompt, listingPhotoUrls, sku, function(err2, resp2) {
       // Rate limited — do not save a fallback listing; signal the queue to pause + retry
       if(isClaudeRateLimited(resp2)){ callback({sku:sku, meta:meta, rateLimited:true}); return; }
       var listing = {};
