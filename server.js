@@ -527,12 +527,15 @@ function callGemini(options, body, callback) {
 }
 
 function callOpenRouter(payload, callback) {
-  var body = JSON.stringify({
+  var payloadObj = {
     model: payload.model,
     max_tokens: payload.max_tokens || 1000,
     messages: payload.messages,
     temperature: 0.1
-  });
+  };
+  // Additive: pass an OpenRouter web-search plugin config when provided (used by the Spec Verifier).
+  if(payload.plugins) payloadObj.plugins = payload.plugins;
+  var body = JSON.stringify(payloadObj);
 
   var options = {
     hostname: 'openrouter.ai',
@@ -3063,9 +3066,9 @@ function processQueue(){
     listingQueue.shift();
     delete failedItems[sku];
     console.log('[QUEUE] Completed SKU', sku, '| pending', listingQueue.length);
-    // ADDITIVE: run the parallel Gemini + Checker dual pipeline OFF the critical path so it
-    // never blocks Sonnet generation or eBay posting (hard rules 7 & 8). Fire-and-forget.
-    try { runDualPipeline(sku, function(){}); } catch(e){ console.log('[QUEUE] SKU ' + sku + ' dual pipeline error: ' + e.message); }
+    // ADDITIVE: run the post-generation pipeline (Spec Verifier -> Checker) OFF the critical path
+    // so it never blocks the listing appearing or eBay posting (hard rules 5 & 6). Fire-and-forget.
+    try { runDualPipeline(sku, function(){}); } catch(e){ console.log('[PIPELINE] SKU ' + sku + ' post-gen error: ' + e.message); }
     queueProcessing = false;
     setTimeout(processQueue, QUEUE_GAP_MS); // 8s gap between API calls
   });
@@ -3443,6 +3446,12 @@ function checkListing(sku, listing, photos, pipeline, callback){
       '3. TITLE — Does the title match what the item actually appears to be based on labels, branding, and appearance visible in the photos?',
       '4. SPECS — If a specs screen (BIOS, device info, settings) is visible in any photo, do the specs in the listing match what the screen shows?',
       '5. WEIGHT PLAUSIBILITY — Given the item\'s apparent size and type in the photos, does the shipping tier seem plausible? Flag if something appears obviously wrong.',
+      '6. TITLE ACCURACY — Review the title against what you can observe in the photos:',
+      '   - Does the brand name in the title match visible branding on the item in the photos?',
+      '   - Does the model number in the title match any visible labels or nameplates in the photos?',
+      '   - Are there any specs in the title that directly CONTRADICT what is visible in photos? (e.g. title says "Black" but item is clearly gray)',
+      '   - Note any title specs that CANNOT be verified from the photos alone — these may have come from research and should be flagged for awareness.',
+      '   Do not flag unverifiable specs as errors — just note them as "verified by research, not visible in photos" so the seller is aware.',
       '',
       'Describe each issue found in plain language.',
       'If no issues found, say PASS.',
@@ -3463,7 +3472,7 @@ function checkListing(sku, listing, photos, pipeline, callback){
         '{',
         '  "verdict": "PASS" | "WARN" | "FLAG",',
         '  "issues": [',
-        '    { "type": "includes" | "condition" | "title" | "specs" | "weight", "description": "specific issue description", "fixable": true | false }',
+        '    { "type": "includes" | "condition" | "title" | "title_claim" | "specs" | "weight", "description": "specific issue description", "fixable": true | false }',
         '  ],',
         '  "summary": "one sentence summary of findings"',
         '}',
@@ -3591,43 +3600,172 @@ function saveDualRecord(sku, mutate){
 // The existing Sonnet generation has ALREADY run (processItem wrote record.listing). This
 // builds the sonnet view, runs Gemini generation, then runs the Checker on both results
 // (in parallel), applying any fixable corrections. Saves both onto the record. Never throws.
+// ── CHANGE 2: SPEC VERIFIER — web-search fact-check of the listing's claims ──
+// Runs AFTER Gemini generation and BEFORE the Checker. Two calls (search, then JSON extraction),
+// the same grounding/JSON split the buyer finder uses. Applies SURGICAL corrections to the wrong
+// values in title / description / item specifics, stores a report at listing.spec_verifier, and
+// works for ANY item type (not just computers). Never blocks the pipeline; returns the listing
+// unchanged on any failure and never throws.
+function verifySpecs(sku, listing, pipeline, callback){
+  callback = typeof callback === 'function' ? callback : function(){};
+  pipeline = pipeline || '';
+  try {
+    if(!OPENROUTER_KEY || !listing){ console.log('[SPEC] SKU ' + sku + ' verifier skipped (no key or listing)'); callback(listing); return; }
+    var spec = (listing.item_specifics && typeof listing.item_specifics === 'object' && !Array.isArray(listing.item_specifics)) ? listing.item_specifics : {};
+    var brand = '', model = '';
+    Object.keys(spec).forEach(function(k){
+      if(/^brand$/i.test(k)) brand = Array.isArray(spec[k]) ? spec[k].join(', ') : String(spec[k]);
+      if(/^(model|mpn)$/i.test(k) && !model) model = Array.isArray(spec[k]) ? spec[k].join(', ') : String(spec[k]);
+    });
+    var descExcerpt = stripHtmlExcerpt(listing.description_html, 800);
+    var specStr = '{}'; try { specStr = JSON.stringify(spec); } catch(e){ specStr = '{}'; }
+
+    var sys1 = [
+      'You are a fact-checker verifying product specifications for an eBay listing. Your job is to find and correct any factual errors in the listing\'s claims.',
+      '',
+      'You will check ANY type of item — electronics, medical equipment, industrial gear, lab instruments, printers, audio equipment, cameras, networking gear, or anything else. Do not limit yourself to computer specifications.',
+      '',
+      'For ANY item, extract and verify:',
+      '- All measurements and dimensions mentioned (screen size, weight capacity, paper width, etc.)',
+      '- All performance specs (speed, resolution, capacity, output, frequency, wattage, etc.)',
+      '- All version or model-specific claims (firmware, protocol version, format support, etc.)',
+      '- All compatibility claims (connector types, media types, supported formats, etc.)',
+      '- The model number itself — confirm it exists and matches the described item',
+      '',
+      'Search for this specific item and verify each claim against manufacturer documentation, spec sheets, product pages, or reliable technical sources.',
+      '',
+      'If a claim is correct: note it as verified.',
+      'If a claim is wrong: note the correct value.',
+      'If a claim cannot be confirmed: note it as unverified.',
+      '',
+      'Be thorough but focused — only check claims that are actually in the listing, do not add new specs.'
+    ].join('\n');
+
+    var user1 = [
+      'Item: ' + (listing.title || ''),
+      'Brand: ' + (brand || 'unknown'),
+      'Model: ' + (model || 'unknown'),
+      '',
+      'TITLE TO VERIFY:',
+      (listing.title || ''),
+      '',
+      'DESCRIPTION CLAIMS TO VERIFY:',
+      descExcerpt,
+      '',
+      'ITEM SPECIFICS TO VERIFY:',
+      specStr,
+      '',
+      'Search for this item and verify all factual claims above.'
+    ].join('\n');
+
+    // ── Call 1: extract + search (OpenRouter native web search, same tool as the buyer finder) ──
+    callOpenRouter({
+      model: 'google/gemini-2.5-flash',
+      max_tokens: 1500,
+      plugins: [{ id:'web', engine:'native', max_results:5, search_context_size:'medium' }],
+      messages: [ { role:'system', content: sys1 }, { role:'user', content: user1 } ]
+    }, function(e1, analysis){
+      if(e1 || !analysis){ console.log('[SPEC] SKU ' + sku + ' verifier failed: ' + (e1 ? e1.message : 'empty search response')); callback(listing); return; }
+
+      // ── Call 2: extract corrections into JSON (no web search) ──
+      var user2 = 'Based on this fact-check:\n' + analysis + '\n\nReturn ONLY this JSON:\n' + [
+        '{',
+        '  "verified_claims": ["list of claims confirmed correct"],',
+        '  "corrections": [',
+        '    { "location": "title" | "description" | "item_specifics", "field": "what field or spec this is", "wrong_value": "what the listing said", "correct_value": "what it should be", "source": "where you found the correct value" }',
+        '  ],',
+        '  "unverified_claims": [',
+        '    { "claim": "the spec or claim that could not be confirmed", "reason": "why it could not be verified" }',
+        '  ],',
+        '  "item_confirmed": true | false',
+        '}',
+        '',
+        'item_confirmed = true means the item identity itself (model number, brand, item type) was confirmed to exist and match the listing. false means the item could not be found or does not match.',
+        '',
+        'Return only JSON, no other text.'
+      ].join('\n');
+      callOpenRouter({
+        model: 'google/gemini-2.5-flash', max_tokens: 1200,
+        messages: [ { role:'system', content:'Extract the fact-check findings into JSON.' }, { role:'user', content: user2 } ]
+      }, function(e2, jsonText){
+        if(e2 || !jsonText){ console.log('[SPEC] SKU ' + sku + ' verifier failed: ' + (e2 ? e2.message : 'empty extraction')); callback(listing); return; }
+        var parsed = parseGeminiJson(jsonText) || {};
+        var corrections = Array.isArray(parsed.corrections) ? parsed.corrections : [];
+        var unverified = Array.isArray(parsed.unverified_claims) ? parsed.unverified_claims : [];
+        var verified = Array.isArray(parsed.verified_claims) ? parsed.verified_claims : [];
+        var applied = [];
+        corrections.forEach(function(c){
+          if(!c || c.correct_value == null) return;
+          var loc = String(c.location || '').toLowerCase();
+          var wrong = (c.wrong_value == null) ? '' : String(c.wrong_value);
+          var right = String(c.correct_value);
+          if(loc === 'title' && wrong && listing.title && String(listing.title).indexOf(wrong) >= 0){
+            listing.title = String(listing.title).split(wrong).join(right);
+            applied.push(c); console.log('[SPEC] SKU ' + sku + ' corrected title: ' + wrong + ' → ' + right);
+          } else if(loc === 'description' && wrong && listing.description_html && String(listing.description_html).indexOf(wrong) >= 0){
+            listing.description_html = String(listing.description_html).split(wrong).join(right);
+            applied.push(c); console.log('[SPEC] SKU ' + sku + ' corrected description: ' + wrong + ' → ' + right);
+          } else if(loc === 'item_specifics'){
+            if(!listing.item_specifics || typeof listing.item_specifics !== 'object' || Array.isArray(listing.item_specifics)) listing.item_specifics = {};
+            var field = c.field ? String(c.field) : '';
+            var key = field;
+            Object.keys(listing.item_specifics).forEach(function(k){ if(field && k.toLowerCase() === field.toLowerCase()) key = k; });
+            if(key){ listing.item_specifics[key] = right; applied.push(c); console.log('[SPEC] SKU ' + sku + ' corrected ' + key + ': ' + (wrong || '(blank)') + ' → ' + right); }
+          }
+        });
+        listing.spec_verifier = {
+          corrections_made: applied,
+          unverified_claims: unverified,
+          verified_claims: verified,
+          item_confirmed: (parsed.item_confirmed === true)
+        };
+        console.log('[SPEC] SKU ' + sku + ' verified — ' + applied.length + ' corrections, ' + unverified.length + ' unverified claims');
+        callback(listing);
+      });
+    });
+  } catch(e){ console.log('[SPEC] SKU ' + sku + ' verifier failed: ' + e.message); callback(listing); }
+}
+
+// ── CHANGE 1: SINGLE GEMINI PIPELINE ──
+// Generation now happens in processItem (Gemini Flash), which writes record.listing. This
+// post-generation stage runs the Spec Verifier (web-search accuracy check) and then the Checker
+// (photo vs listing), applying corrections to record.listing in place. Legacy dual-test records
+// (record.gemini present but record.listing empty) fall back to record.gemini. Never blocks.
+// The Anthropic Sonnet generator is NOT used here (kept in the file only for the regenerate route).
 function runDualPipeline(sku, callback){
   callback = typeof callback === 'function' ? callback : function(){};
   var itemDir = path.join(DATA_DIR, 'items', String(sku));
   var lp = path.join(itemDir, 'listing.json');
   var record;
   try { record = JSON.parse(fs.readFileSync(lp, 'utf8')); }
-  catch(e){ console.log('[QUEUE] SKU ' + sku + ' dual pipeline skipped (no listing.json)'); callback(); return; }
-  if(!record || !record.listing){ callback(); return; }
-  console.log('[QUEUE] SKU ' + sku + ' running dual pipeline generation');
-
-  var sonnetView = dualPipelineView(record.listing, 'sonnet', 'complete');
-  record._regenNotes = '';
+  catch(e){ console.log('[PIPELINE] SKU ' + sku + ' skipped (no listing.json)'); callback(); return; }
+  if(!record){ callback(); return; }
+  // Backward compat: if record.listing is empty but a dual-test gemini result exists, use gemini.
+  if((!record.listing || !record.listing.title) && record.gemini && record.gemini.title){
+    record.listing = record.listing || {};
+    ['title','condition_box','description_html','avg_sold_price','price_low','price_high','suggested_price','accept_price','decline_price','item_specifics','is_lot','lot_quantity'].forEach(function(k){ if(record.gemini[k] !== undefined && record.listing[k] === undefined) record.listing[k] = record.gemini[k]; });
+  }
+  if(!record.listing){ callback(); return; }
+  console.log('[PIPELINE] SKU ' + sku + ' using Gemini Flash single pipeline');
 
   buildDualPhotoBlocksForRecord(record, itemDir, function(orBlocks){
-    generateListingGemini(sku, record, orBlocks, function(geminiListing){
-      var geminiView = geminiListing ? dualPipelineView(geminiListing, 'gemini', 'complete') : dualPipelineView({}, 'gemini', 'failed');
-
-      var pending = 2, sonnetChecker = null, geminiChecker = null;
-      function finish(){
-        pending--;
-        if(pending > 0) return;
-        sonnetView.checker = sonnetChecker;
-        geminiView.checker = geminiChecker;
+    // Stage: Spec Verifier (web-search accuracy) — mutates record.listing in place.
+    verifySpecs(sku, record.listing, 'gemini', function(){
+      // Stage: Checker (photo vs listing) — mutates record.listing in place, returns a report.
+      checkListing(sku, record.listing, orBlocks, 'gemini', function(chk){
+        // Re-read fresh and merge the corrected copy fields + reports (preserves scaffolding + any
+        // concurrent user edits to shipping/category/etc).
         saveDualRecord(sku, function(rec){
-          rec.sonnet = sonnetView;
-          rec.gemini = geminiView;
-          rec.dual_pipeline = true;
+          rec.listing = rec.listing || {};
+          ['title','condition_box','description_html','item_specifics','avg_sold_price','price_low','price_high','suggested_price','accept_price','decline_price','spec_verifier'].forEach(function(k){ if(record.listing[k] !== undefined) rec.listing[k] = record.listing[k]; });
+          rec.listing.checker = chk;
+          rec.single_pipeline = 'gemini';
         });
         try { loadListings(); } catch(e){}
-        var sv = sonnetChecker ? sonnetChecker.verdict : 'UNKNOWN';
-        var gv = geminiChecker ? geminiChecker.verdict : (geminiListing ? 'UNKNOWN' : 'FAILED');
-        console.log('[QUEUE] SKU ' + sku + ' dual pipeline complete — Sonnet: ' + sv + ' | Gemini: ' + gv);
+        var spec = record.listing.spec_verifier || {};
+        console.log('[PIPELINE] SKU ' + sku + ' complete — Checker: ' + (chk ? chk.verdict : 'UNKNOWN') + ' | Spec: ' + ((spec.corrections_made && spec.corrections_made.length) ? (spec.corrections_made.length + ' fixed') : (spec.item_confirmed ? 'verified' : 'see report')));
         callback();
-      }
-      checkListing(sku, sonnetView, orBlocks, 'sonnet', function(r){ sonnetChecker = r; finish(); });
-      if(geminiListing){ checkListing(sku, geminiView, orBlocks, 'gemini', function(r){ geminiChecker = r; finish(); }); }
-      else { geminiChecker = { verdict:'UNKNOWN', error:'generation failed' }; finish(); }
+      });
     });
   });
 }
@@ -3855,19 +3993,25 @@ function processItem(item, callback) {
     // FIX 2: required-aspects fetch gates the listing-generation AI (see below)
     function runListingClaude(){
     var listingPrompt = promptLines.join('\n');
-    // CHANGE 2: pass ALL item photos (except the scale/weight photo) to Sonnet as base64 local files.
-    // FIX 1: photos are compressed for Sonnet (async) before the call; originals on disk are untouched.
+    // CHANGE 1 (Gemini single pipeline): new items are generated by Gemini Flash via OpenRouter.
+    // The Anthropic Sonnet listing generator (callClaudeWithImageBlocks / callClaude) is kept in the
+    // file for the regenerate route but is NO LONGER called automatically for new items. Photos are
+    // still compressed via buildLocalPhotoBase64Blocks, then converted to OpenRouter image_url blocks.
     buildLocalPhotoBase64Blocks(itemDir, photoCount, weightIdx, meta.testingPhotos, sku, function(listingPhotoBlocks){
-    console.log('[LISTING] SKU ' + sku + ' generating with ' + listingPhotoBlocks.length + ' photos (base64)');
+    var _orBlocks = toOpenRouterImageBlocks(listingPhotoBlocks);
+    console.log('[PIPELINE] SKU ' + sku + ' using Gemini Flash single pipeline');
+    console.log('[LISTING] SKU ' + sku + ' generating with ' + _orBlocks.length + ' photos (Gemini)');
 
-    // ── Step 2: listing write with web_search (photos passed as base64 images) ──
-    callClaudeWithImageBlocks({
-      model: 'claude-sonnet-4-5',
+    // ── Step 2: listing write via Gemini Flash (photos passed as base64 image_url blocks) ──
+    callOpenRouter({
+      model: 'google/gemini-2.5-flash',
       max_tokens: 2500,
-      system: listingSystemPrompt,
-      tools: [{type:'web_search_20250305', name:'web_search', max_uses:5}]
-    }, listingPrompt, listingPhotoBlocks, sku, function(err2, resp2) {
-      // Rate limited — do not save a fallback listing; signal the queue to pause + retry
+      messages: [ { role:'system', content: listingSystemPrompt }, { role:'user', content: _orBlocks.concat([{ type:'text', text: listingPrompt }]) } ]
+    }, function(gErr, gText) {
+      // Synthesize an Anthropic-shaped response so the assembly code below stays unchanged.
+      var resp2 = { content: [ { type:'text', text: (gText || '') } ] };
+      // Rate limited — do not save a fallback listing; signal the queue to pause + retry (Gemini path
+      // never sets this, but the guard is preserved so behavior is identical for any future change).
       if(isClaudeRateLimited(resp2)){ callback({sku:sku, meta:meta, rateLimited:true}); return; }
       var listing = {};
       var listingText = resp2 ? extractText(resp2.content) : '';
@@ -4943,6 +5087,65 @@ function sanitizeForFilename(s){
   return String(s||'').replace(/[^a-z0-9]+/gi,'-').replace(/^-+|-+$/g,'').slice(0,40) || 'item';
 }
 
+// ── CHANGE 4: Checker + Spec Verifier badges (and click-to-open report panels) for a card ──
+// Reads listing.checker (photo vs listing) and listing.spec_verifier (research accuracy). Both
+// badges show on every card; records without these fields simply show "Not run" (backward compat).
+function renderListingBadges(sku, listing){
+  listing = listing || {};
+  var skuStr = String(sku);
+  function esc(s){ return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+  var chk = listing.checker || null;
+  var spec = listing.spec_verifier || null;
+
+  // Checker badge (photos vs listing)
+  var cv = (chk && chk.verdict) ? String(chk.verdict).toUpperCase() : 'UNKNOWN';
+  var cmap = { PASS:['#2e7d32', '&#9989; PASS'], WARN:['#f9a825', '&#9888; WARN'], FLAG:['#c62828', '&#128680; FLAG'], UNKNOWN:['#757575', '&#10067; Not run'] };
+  var cm = cmap[cv] || cmap.UNKNOWN;
+  var checkerBadge = '<span onclick="toggleCardChecker(\'' + skuStr + '\')" title="Checker — photos vs listing. Click for report." style="display:inline-block;cursor:pointer;background:' + cm[0] + ';color:#fff;padding:3px 10px;border-radius:11px;font-size:12px;font-weight:bold;">Checker: ' + cm[1] + '</span>';
+
+  // Spec Verifier badge (research accuracy)
+  var sColor, sLabel;
+  if(!spec){ sColor = '#757575'; sLabel = '&#10067; Not run'; }
+  else {
+    var nCorr = (spec.corrections_made && spec.corrections_made.length) || 0;
+    var nUnv = (spec.unverified_claims && spec.unverified_claims.length) || 0;
+    if(nCorr > 0){ sColor = '#1565c0'; sLabel = '&#128295; Fixed ' + nCorr + ' spec' + (nCorr === 1 ? '' : 's'); }
+    else if(nUnv > 0){ sColor = '#f9a825'; sLabel = '&#9888; Unverified'; }
+    else if(spec.item_confirmed){ sColor = '#2e7d32'; sLabel = '&#9989; Verified'; }
+    else { sColor = '#f9a825'; sLabel = '&#9888; Unverified'; }
+  }
+  var specBadge = '<span onclick="toggleCardSpec(\'' + skuStr + '\')" title="Spec Verifier — research accuracy. Click for report." style="display:inline-block;cursor:pointer;background:' + sColor + ';color:#fff;padding:3px 10px;border-radius:11px;font-size:12px;font-weight:bold;">Spec Verifier: ' + sLabel + '</span>';
+
+  // Checker report panel
+  var cpan = '<div id="chkpanel_' + skuStr + '" style="display:none;margin:0 16px 8px;background:#fafafa;border:1px solid #e0e0e0;border-radius:6px;padding:10px 12px;font-size:12.5px;color:#444;">';
+  if(chk){
+    cpan += '<div style="font-weight:bold;margin-bottom:4px;">' + esc(chk.summary || (chk.error ? ('Checker unavailable: ' + chk.error) : 'Checker report')) + '</div>';
+    var issues = Array.isArray(chk.issues) ? chk.issues : [];
+    var corr = Array.isArray(chk.corrections_made) ? chk.corrections_made : [];
+    var cnf = Array.isArray(chk.could_not_fix) ? chk.could_not_fix : [];
+    if(issues.length){ cpan += '<div style="font-weight:bold;color:#8d6e00;margin-top:6px;">Issues found:</div><ul style="margin:4px 0 4px 18px;">'; issues.forEach(function(x){ cpan += '<li>[' + esc(x.type || 'issue') + '] ' + esc(x.description || '') + (x.fixable ? '' : ' <span style="color:#c62828;">(not auto-fixable)</span>') + '</li>'; }); cpan += '</ul>'; }
+    if(corr.length){ cpan += '<div style="font-weight:bold;color:#2e7d32;margin-top:6px;">Corrections made automatically:</div><ul style="margin:4px 0 4px 18px;">'; corr.forEach(function(c){ cpan += '<li>' + esc(c) + '</li>'; }); cpan += '</ul>'; }
+    if(cnf.length){ cpan += '<div style="font-weight:bold;color:#c62828;margin-top:6px;">Could not fix (needs your attention):</div><ul style="margin:4px 0 4px 18px;">'; cnf.forEach(function(c){ cpan += '<li>' + esc(c) + '</li>'; }); cpan += '</ul>'; }
+    if(!issues.length && !corr.length && !cnf.length){ cpan += '<div style="color:#2e7d32;">No issues found.</div>'; }
+  } else { cpan += '<div style="color:#757575;">Checker has not run for this listing yet.</div>'; }
+  cpan += '</div>';
+
+  // Spec Verifier report panel
+  var span = '<div id="specpanel_' + skuStr + '" style="display:none;margin:0 16px 8px;background:#fafafa;border:1px solid #e0e0e0;border-radius:6px;padding:10px 12px;font-size:12.5px;color:#444;">';
+  if(spec){
+    span += '<div style="font-weight:bold;margin-bottom:4px;">Item confirmed: ' + (spec.item_confirmed ? '<span style="color:#2e7d32;">Yes</span>' : '<span style="color:#c62828;">No</span>') + '</div>';
+    var scorr = Array.isArray(spec.corrections_made) ? spec.corrections_made : [];
+    var sunv = Array.isArray(spec.unverified_claims) ? spec.unverified_claims : [];
+    var sver = Array.isArray(spec.verified_claims) ? spec.verified_claims : [];
+    if(scorr.length){ span += '<div style="font-weight:bold;color:#1565c0;margin-top:6px;">Corrections made:</div><ul style="margin:4px 0 4px 18px;">'; scorr.forEach(function(c){ span += '<li>[' + esc(c.location || '') + (c.field ? (' / ' + esc(c.field)) : '') + '] ' + esc(c.wrong_value == null ? '(blank)' : c.wrong_value) + ' &rarr; ' + esc(c.correct_value) + (c.source ? (' <span style="color:#888;">(' + esc(c.source) + ')</span>') : '') + '</li>'; }); span += '</ul>'; }
+    if(sunv.length){ span += '<div style="font-weight:bold;color:#8d6e00;margin-top:6px;">Unverified claims:</div><ul style="margin:4px 0 4px 18px;">'; sunv.forEach(function(u){ span += '<li>' + esc((u && u.claim) ? u.claim : u) + ((u && u.reason) ? (' <span style="color:#888;">— ' + esc(u.reason) + '</span>') : '') + '</li>'; }); span += '</ul>'; }
+    span += '<div style="margin-top:6px;color:#2e7d32;">Verified claims: ' + sver.length + '</div>';
+  } else { span += '<div style="color:#757575;">Spec Verifier has not run for this listing yet.</div>'; }
+  span += '</div>';
+
+  return '<div style="padding:8px 16px;background:#fff;border-bottom:1px solid #eee;display:flex;flex-wrap:wrap;gap:8px;align-items:center;">' + checkerBadge + specBadge + '</div>' + cpan + span;
+}
+
 // ── DUAL PIPELINE (ADDITIVE): render a shared header + two pipeline cards for one SKU ──
 // Gemini card (teal/blue accent) and Sonnet card (purple accent) side by side, each with a
 // checker badge/report, per-pipeline title/price editing, Regenerate, and List on eBay. The
@@ -5143,10 +5346,13 @@ function generateListingsPage(listings, ebayStat){
   ebayStat = ebayStat || {connected:false};
   var colors=['#1565c0','#2e7d32','#e65100','#6a1b9a','#00838f','#c62828','#37474f','#558b2f'];
   var cards = listings.map(function(r, i) {
-    // ADDITIVE: dual-pipeline records render TWO comparable cards (Gemini + Sonnet) under a
-    // shared header. Legacy single-pipeline records fall through to the original card below,
-    // completely unchanged (full backward compatibility).
-    if(r && r.gemini && r.sonnet){ return buildDualCardHtml(r, i, colors, ebayStat); }
+    // CHANGE 1: single Gemini pipeline — always render ONE card. buildDualCardHtml is kept in the
+    // file but is no longer called. Backward compat for legacy dual-test records: if record.listing
+    // is empty but a gemini result exists, fill the missing copy fields from record.gemini.
+    if((!r.listing || !r.listing.title) && r.gemini && r.gemini.title){
+      r.listing = r.listing || {};
+      ['title','condition_box','description_html','avg_sold_price','price_low','price_high','suggested_price','accept_price','decline_price','item_specifics','is_lot','lot_quantity','checker','spec_verifier'].forEach(function(k){ if(r.listing[k] === undefined && r.gemini[k] !== undefined) r.listing[k] = r.gemini[k]; });
+    }
     var sku = r.sku;
     var meta = r.meta||{};
     var listing = r.listing||{};
@@ -5325,6 +5531,7 @@ function generateListingsPage(listings, ebayStat){
       +'</div>'
       +belowFlag
       +conflictFlag
+      +renderListingBadges(skuStr, listing)
       +'<div style="background:#f5f5f5;border-bottom:1px solid #ddd;padding:8px 16px;font-size:12.5px;color:#444;display:flex;flex-wrap:wrap;gap:6px 18px;">'
       +'<span><b>Suggest:</b> $<span id="sug_'+skuStr+'" onclick="editSuggest(\''+skuStr+'\')" style="cursor:pointer;border-bottom:1px dashed #1565c0;color:#1565c0;" title="Click to edit listing price">'+suggest+'</span> <span id="sugmsg_'+skuStr+'" style="font-weight:bold;"></span></span>'
       +'<span><b>Accept:</b> $'+accept+'</span>'
@@ -5421,6 +5628,8 @@ function generateListingsPage(listings, ebayStat){
     +'function initPhotoReorder(){Array.prototype.slice.call(document.querySelectorAll(".lp-photostrip")).forEach(function(s){setupStrip(s);});}'
     +'function bulkPick(cb){if(cb.checked){var same=document.querySelectorAll(".bulkSel[value=\\""+cb.value+"\\"]");Array.prototype.forEach.call(same,function(o){if(o!==cb)o.checked=false;});}updateBulkCount();}'
     +'function toggleChecker(pl,sku){var p=document.getElementById("cpanel_"+pl+"_"+sku);if(!p)return;p.style.display=(p.style.display==="none"||!p.style.display)?"block":"none";}'
+    +'function toggleCardChecker(sku){var p=document.getElementById("chkpanel_"+sku);if(!p)return;p.style.display=(p.style.display==="none"||!p.style.display)?"block":"none";}'
+    +'function toggleCardSpec(sku){var p=document.getElementById("specpanel_"+sku);if(!p)return;p.style.display=(p.style.display==="none"||!p.style.display)?"block":"none";}'
     +'function editTitlePipe(span){if(span.dataset.editing)return;span.dataset.editing="1";var sku=span.getAttribute("data-sku");var pl=span.getAttribute("data-pipeline");var cur=span.getAttribute("data-raw")||span.textContent.replace(/^LOT OF \\d+:\\s*/,"");var inp=document.createElement("input");inp.type="text";inp.value=cur;inp.style.cssText="width:100%;box-sizing:border-box;padding:3px 5px;border:1px solid #1565c0;border-radius:3px;font-size:14px;color:#222;";span.textContent="";span.appendChild(inp);inp.focus();inp.select();var done=false;function save(){if(done)return;done=true;var nv=inp.value;fetch("/api/listings/"+sku,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({title:nv,pipeline:pl})}).then(function(r){return r.json();}).then(function(d){span.removeAttribute("data-editing");if(d&&d.success){span.setAttribute("data-raw",nv);span.textContent=(nv);var ta=document.getElementById("t_"+pl+"_"+sku);if(ta)ta.value=nv;flashTick(span,true);}else{span.textContent=cur;flashTick(span,false);}}).catch(function(){span.removeAttribute("data-editing");span.textContent=cur;flashTick(span,false);});}inp.addEventListener("blur",save);inp.addEventListener("keydown",function(e){if(e.key==="Enter"){e.preventDefault();inp.blur();}else if(e.key==="Escape"){done=true;span.removeAttribute("data-editing");span.textContent=cur;}});}'
     +'function editSuggestPipe(span){if(!span||span.dataset.editing)return;span.dataset.editing="1";var sku=span.getAttribute("data-sku");var pl=span.getAttribute("data-pipeline");var cur=parseFloat(span.textContent)||0;var inp=document.createElement("input");inp.type="number";inp.min="0";inp.step="0.01";inp.value=cur;inp.style.cssText="width:80px;padding:2px 4px;border:1px solid #1565c0;border-radius:3px;font-size:12.5px;";span.textContent="";span.appendChild(inp);inp.focus();inp.select();var done=false;function save(){if(done)return;done=true;var nv=parseFloat(inp.value);var msg=document.getElementById("sugmsg_"+pl+"_"+sku);if(isNaN(nv)||nv<=0){span.textContent=cur;span.removeAttribute("data-editing");if(msg){msg.style.color="#c62828";msg.textContent="invalid";}return;}fetch("/api/listings/"+sku,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({suggest_price:nv,pipeline:pl})}).then(function(r){return r.json();}).then(function(d){if(d&&d.success){span.textContent=nv;if(msg){msg.style.color="#2e7d32";msg.textContent="\\u2713";setTimeout(function(){msg.textContent="";},1500);}}else{span.textContent=cur;if(msg){msg.style.color="#c62828";msg.textContent=(d&&d.error)||"failed";}}span.removeAttribute("data-editing");}).catch(function(){span.textContent=cur;span.removeAttribute("data-editing");if(msg){msg.style.color="#c62828";msg.textContent="error";}});}inp.addEventListener("blur",save);inp.addEventListener("keydown",function(e){if(e.key==="Enter"){e.preventDefault();inp.blur();}else if(e.key==="Escape"){done=true;span.textContent=cur;span.removeAttribute("data-editing");}});}'
     +'function toggleRegenPipe(sku,pl){var pa=document.getElementById("regpanel_"+pl+"_"+sku);if(!pa)return;var show=(pa.style.display==="none"||!pa.style.display);pa.style.display=show?"block":"none";if(show){var t=document.getElementById("regnotes_"+pl+"_"+sku);if(t)t.focus();}}'
