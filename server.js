@@ -533,8 +533,9 @@ function callOpenRouter(payload, callback) {
     messages: payload.messages,
     temperature: 0.1
   };
-  // Additive: pass an OpenRouter web-search plugin config when provided (used by the Spec Verifier).
-  if(payload.plugins) payloadObj.plugins = payload.plugins;
+  // Additive: pass an OpenRouter web-search tool when provided (used by the Spec Verifier).
+  // Matches the buyer finder's confirmed-working format: body.tools = [{type:'openrouter:web_search',...}]
+  if(payload.tools) payloadObj.tools = payload.tools;
   var body = JSON.stringify(payloadObj);
 
   var options = {
@@ -3662,7 +3663,7 @@ function verifySpecs(sku, listing, pipeline, callback){
     callOpenRouter({
       model: 'google/gemini-2.5-flash',
       max_tokens: 1500,
-      plugins: [{ id:'web', engine:'native', max_results:5, search_context_size:'medium' }],
+      tools: [{ type: 'openrouter:web_search', parameters: { engine: 'native', max_results: 5, search_context_size: 'medium' } }],
       messages: [ { role:'system', content: sys1 }, { role:'user', content: user1 } ]
     }, function(e1, analysis){
       if(e1 || !analysis){ console.log('[SPEC] SKU ' + sku + ' verifier failed: ' + (e1 ? e1.message : 'empty search response')); callback(listing); return; }
