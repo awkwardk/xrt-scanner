@@ -1313,8 +1313,59 @@ const server = http.createServer(function(req, res) {
     var rgSku = req.url.split('?')[0].split('/').pop();
     parseBody(req, function(rerr, rbody){
       var userNotes = (rbody && rbody.notes != null) ? String(rbody.notes) : '';
-      try { regenerateListing(rgSku, userNotes, function(result){ sendJSON(res, 200, result || {success:false, error:'Unknown error'}); }); }
+      // ADDITIVE: optional pipeline param — regenerates only that pipeline's listing and re-runs
+      // the Checker. Defaults to "sonnet" so existing Regenerate buttons keep working unchanged.
+      var rgPipeline = (rbody && rbody.pipeline === 'gemini') ? 'gemini' : 'sonnet';
+      try { regenerateListingPipeline(rgSku, rgPipeline, userNotes, function(result){ sendJSON(res, 200, result || {success:false, error:'Unknown error'}); }); }
       catch(e){ sendJSON(res, 200, {success:false, error:'Regeneration error'}); }
+    });
+    return;
+  }
+
+  // ── DUAL PIPELINE (ADDITIVE): full record for one SKU (both gemini + sonnet + checkers) ──
+  if(req.method==='GET' && /^\/api\/listings\/dual\/\d+$/.test(req.url.split('?')[0])){
+    var dlSku = req.url.split('?')[0].split('/').pop();
+    var dlp = path.join(DATA_DIR, 'items', String(dlSku), 'listing.json');
+    if(!fs.existsSync(dlp)){ sendJSON(res, 404, {success:false, error:'Listing not found for SKU ' + dlSku}); return; }
+    var drec; try { drec = JSON.parse(fs.readFileSync(dlp, 'utf8')); }
+    catch(e){ sendJSON(res, 500, {success:false, error:'Bad listing.json'}); return; }
+    sendJSON(res, 200, { success:true, sku: drec.sku, listing: drec.listing || null, gemini: drec.gemini || null, sonnet: drec.sonnet || null, listed_pipeline: drec.listed_pipeline || null, dual_pipeline: !!drec.dual_pipeline });
+    return;
+  }
+
+  // ── DUAL PIPELINE (ADDITIVE): mark the OTHER pipeline superseded once one is listed ──
+  // Body: { listed_pipeline: "gemini" | "sonnet" }. Also syncs the chosen pipeline's copy into
+  // record.listing so the (unchanged) eBay posting path publishes the selected version.
+  if(req.method==='POST' && /^\/api\/listings\/supersede\/\d+\/(gemini|sonnet)$/.test(req.url.split('?')[0])){
+    var spParts = req.url.split('?')[0].split('/');
+    var spSku = spParts[4]; var spPathPipe = spParts[5];
+    parseBody(req, function(sperr, spbody){
+      var listed = (spbody && (spbody.listed_pipeline === 'gemini' || spbody.listed_pipeline === 'sonnet')) ? spbody.listed_pipeline : spPathPipe;
+      var other = (listed === 'gemini') ? 'sonnet' : 'gemini';
+      var slp = path.join(DATA_DIR, 'items', String(spSku), 'listing.json');
+      if(!fs.existsSync(slp)){ sendJSON(res, 404, {success:false, error:'Listing not found for SKU ' + spSku}); return; }
+      var srec; try { srec = JSON.parse(fs.readFileSync(slp, 'utf8')); }
+      catch(e){ sendJSON(res, 500, {success:false, error:'Bad listing.json'}); return; }
+      srec.listed_pipeline = listed;
+      if(srec[other] && typeof srec[other] === 'object'){ srec[other].status = 'superseded'; }
+      if(srec[listed] && typeof srec[listed] === 'object'){
+        srec[listed].status = 'complete';
+        // Sync chosen pipeline copy into record.listing (used by createEbayListing).
+        srec.listing = srec.listing || {};
+        var chosen = srec[listed];
+        if(chosen.title != null) srec.listing.title = chosen.title;
+        if(chosen.condition_box != null) srec.listing.condition_box = chosen.condition_box;
+        if(chosen.description_html != null) srec.listing.description_html = chosen.description_html;
+        if(chosen.suggested_price != null) srec.listing.suggested_price = chosen.suggested_price;
+        if(chosen.accept_price != null) srec.listing.accept_price = chosen.accept_price;
+        if(chosen.decline_price != null) srec.listing.decline_price = chosen.decline_price;
+        if(chosen.item_specifics && typeof chosen.item_specifics === 'object') srec.listing.item_specifics = chosen.item_specifics;
+      }
+      try { fs.writeFileSync(slp, JSON.stringify(srec, null, 2)); }
+      catch(e){ sendJSON(res, 500, {success:false, error:'Write failed'}); return; }
+      try { loadListings(); } catch(e){}
+      console.log('[SUPERSEDE] SKU ' + spSku + ' listed via ' + listed + ' — ' + other + ' superseded');
+      sendJSON(res, 200, { success:true, listed_pipeline: listed, superseded: other });
     });
     return;
   }
@@ -1338,14 +1389,17 @@ const server = http.createServer(function(req, res) {
         pRec.meta = pRec.meta || {};
         pRec.meta.quantity = q;
       }
-      // FIX 3: editable Suggest price — this is the actual eBay listing price
+      // FIX 3: editable Suggest price — this is the actual eBay listing price.
+      // ADDITIVE: an optional `pipeline` targets a dual-pipeline card (gemini/sonnet).
       if(parsed.suggest_price !== undefined){
         var np = parseFloat(parsed.suggest_price);
         if(isNaN(np) || np <= 0){ sendJSON(res,400,{success:false, error:'Price must be greater than 0'}); return; }
+        var pPipe = (parsed.pipeline === 'gemini' || parsed.pipeline === 'sonnet') ? parsed.pipeline : null;
+        if(pPipe && pRec[pPipe]){ pRec[pPipe].suggested_price = np; }
         pRec.listing = pRec.listing || {};
         var oldp = pRec.listing.suggested_price;
-        pRec.listing.suggested_price = np;
-        console.log('[LISTING] SKU ' + pSku + ' price override: $' + (oldp == null ? '?' : oldp) + ' → $' + np);
+        if(!pPipe || pPipe === 'sonnet'){ pRec.listing.suggested_price = np; }
+        console.log('[LISTING] SKU ' + pSku + ' price override' + (pPipe ? ' (' + pPipe + ')' : '') + ': $' + (oldp == null ? '?' : oldp) + ' → $' + np);
       }
       // CHANGE 1: editable Dimensions (box LxWxH). Stored on the listing and mirrored to the
       // shipping tier so it flows into the AddItem ShippingPackageDetails. Empty allowed.
@@ -1396,10 +1450,13 @@ const server = http.createServer(function(req, res) {
         }
       }
       // CHANGE 1: editable title (sync). Stored as-is; createEbayListing auto-truncates >80 at publish.
+      // ADDITIVE: an optional `pipeline` targets a dual-pipeline card (gemini/sonnet).
       if(parsed.title !== undefined){
-        pRec.listing = pRec.listing || {};
-        pRec.listing.title = String(parsed.title == null ? '' : parsed.title);
-        console.log('[LISTING] SKU ' + pSku + ' title updated: "' + pRec.listing.title + '"');
+        var tPipe = (parsed.pipeline === 'gemini' || parsed.pipeline === 'sonnet') ? parsed.pipeline : null;
+        var tVal = String(parsed.title == null ? '' : parsed.title);
+        if(tPipe && pRec[tPipe]){ pRec[tPipe].title = tVal; }
+        if(!tPipe || tPipe === 'sonnet'){ pRec.listing = pRec.listing || {}; pRec.listing.title = tVal; }
+        console.log('[LISTING] SKU ' + pSku + ' title updated' + (tPipe ? ' (' + tPipe + ')' : '') + ': "' + tVal + '"');
       }
       function finishPatch(extra){
         try { fs.writeFileSync(pLp, JSON.stringify(pRec, null, 2)); }
@@ -3006,6 +3063,9 @@ function processQueue(){
     listingQueue.shift();
     delete failedItems[sku];
     console.log('[QUEUE] Completed SKU', sku, '| pending', listingQueue.length);
+    // ADDITIVE: run the parallel Gemini + Checker dual pipeline OFF the critical path so it
+    // never blocks Sonnet generation or eBay posting (hard rules 7 & 8). Fire-and-forget.
+    try { runDualPipeline(sku, function(){}); } catch(e){ console.log('[QUEUE] SKU ' + sku + ' dual pipeline error: ' + e.message); }
     queueProcessing = false;
     setTimeout(processQueue, QUEUE_GAP_MS); // 8s gap between API calls
   });
@@ -3231,6 +3291,397 @@ function regenerateListing(sku, userNotes, callback){
   });
   });
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// DUAL PIPELINE (ADDITIVE) — parallel Gemini Flash listing generation + a Checker
+// agent, running ALONGSIDE the existing Anthropic Sonnet pipeline. Every function
+// below is new and self-contained. It never mutates the existing Sonnet generation
+// logic, and a Gemini/Checker failure never blocks Sonnet generation or eBay posting.
+// All OpenRouter calls reuse the existing OPENROUTER_KEY variable.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Convert Anthropic-style base64 image blocks -> OpenRouter/OpenAI image_url blocks.
+// (`b.source.data` is already a base64 string, so no re-encoding is performed here.)
+function toOpenRouterImageBlocks(anthropicBlocks){
+  return (Array.isArray(anthropicBlocks) ? anthropicBlocks : []).filter(function(b){
+    return b && b.source && b.source.data;
+  }).map(function(b){
+    return { type:'image_url', image_url:{ url:'data:' + (b.source.media_type || 'image/jpeg') + ';base64,' + b.source.data } };
+  });
+}
+
+// Build up-to-6 OpenRouter image blocks for a SKU using the SAME selection logic as
+// buildLocalPhotoBase64Blocks (scale/weight photo excluded, testing photos included). Async.
+function buildOpenRouterPhotoBlocks(itemDir, photoCount, weightIdx, testingPhotos, sku, callback){
+  buildLocalPhotoBase64Blocks(itemDir, photoCount, weightIdx, testingPhotos, sku, function(blocks){
+    callback(toOpenRouterImageBlocks(blocks));
+  });
+}
+
+// Build OpenRouter photo blocks for a whole listing record (counts photos on disk).
+function buildDualPhotoBlocksForRecord(record, itemDir, cb){
+  var photoCount = 0;
+  while(fs.existsSync(path.join(itemDir, 'photo_' + (photoCount + 1) + '.jpg'))) photoCount++;
+  var weightIdx = (record.meta && record.meta.weightPhotoIndex) || record.weightPhotoIndex || null;
+  var testingPhotos = (record.meta && record.meta.testingPhotos) || record.testingPhotos || [];
+  buildOpenRouterPhotoBlocks(itemDir, photoCount, weightIdx, testingPhotos, record.sku, cb);
+}
+
+// Defensive JSON parse for Gemini output — strips ```json ... ``` fences before parsing.
+function parseGeminiJson(text){
+  if(!text) return null;
+  var s = String(text).trim();
+  s = s.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
+  var parsed = extractFirstJson(s);
+  if(parsed) return parsed;
+  try { return JSON.parse(s); } catch(e){ return null; }
+}
+
+// Plain-text excerpt from an HTML description (tags stripped).
+function stripHtmlExcerpt(html, n){
+  return String(html == null ? '' : html).replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim().slice(0, n || 500);
+}
+
+// The SAME user-message shape the Sonnet pipeline uses (item name, grade, category,
+// includes, condition notes, seller notes, photo-analysis instructions), assembled
+// from a listing record so both pipelines are directly comparable.
+function buildDualUserMessage(record, userNotes){
+  record = record || {};
+  var listing = record.listing || {};
+  var meta = record.meta || {};
+  var idItem = meta.identified_item || {};
+  var vis = record.visionData || {};
+  var itemName = idItem.item_name || listing.title || ('SKU ' + record.sku);
+  var gradeLetter = String(meta.grade || 'B').toUpperCase();
+  var gradeFull = ({A:'Like New / Open Box', B:'Good', C:'Fair', D:'Parts/Untested'})[gradeLetter] || 'Good';
+  var catName = record.ebay_category_name || idItem.ebay_category_name || (record.ebay_category_id ? ('ID ' + record.ebay_category_id) : '');
+  var includes = idItem.includes || vis.includes || 'See photos';
+  var condNotes = idItem.condition_notes || vis.condition_notes || 'See photos';
+  var sellerNotes = [meta.test_notes, meta.notes].filter(Boolean).join(' | ') || 'None';
+  var qty = (meta.quantity && meta.quantity > 1) ? meta.quantity : ((record.quantity && record.quantity > 1) ? record.quantity : 1);
+  var lines = [
+    'Item identified as: ' + itemName,
+    'Quantity: ' + qty + ' (' + (qty > 1 ? 'selling as a lot' : 'single item') + ')',
+    'Grade: ' + gradeLetter + ' (' + gradeFull + ')',
+    'Category: ' + (catName || 'not specified'),
+    'Includes (what is being sold): ' + includes,
+    'Seller condition notes: ' + condNotes,
+    'Seller testing notes: ' + sellerNotes,
+    ''
+  ];
+  if(userNotes){ lines.push('Also address this feedback from the seller: ' + userNotes); lines.push(''); }
+  lines.push('Look at the photos provided and generate a complete listing for this item. Use the photos as your primary source of truth for what the item is, what is included, and what condition it is in. Use the seller notes to add any details the photos may not show clearly.');
+  lines.push('');
+  lines.push('Base pricing on eBay sold/completed comps for this exact item with these specifications. Return ONLY the listing JSON described in the system prompt, no markdown.');
+  return lines.join('\n');
+}
+
+// ── COMPONENT 1: Gemini Flash listing generator (via OpenRouter) ──
+// Uses the SAME system prompt as Sonnet so output is identical/comparable. Photos are
+// passed as base64 image_url blocks. Returns the parsed listing JSON with pipeline:'gemini'
+// added, or null on any failure. Never throws.
+function generateListingGemini(sku, itemData, photos, callback){
+  callback = typeof callback === 'function' ? callback : function(){};
+  try {
+    if(!OPENROUTER_KEY){ console.log('[GEMINI] SKU ' + sku + ' generation failed: OPENROUTER_KEY not set'); callback(null); return; }
+    var photoBlocks = Array.isArray(photos) ? photos : [];
+    console.log('[GEMINI] SKU ' + sku + ' generating listing with ' + photoBlocks.length + ' photos');
+    var systemPrompt = buildListingSystemPrompt();
+    var userMessage = buildDualUserMessage(itemData, itemData && itemData._regenNotes);
+    var content = photoBlocks.concat([{ type:'text', text: userMessage }]);
+    callOpenRouter({
+      model: 'google/gemini-2.5-flash',
+      max_tokens: 2500,
+      messages: [
+        { role:'system', content: systemPrompt },
+        { role:'user', content: content }
+      ]
+    }, function(err, text){
+      if(err || !text){ console.log('[GEMINI] SKU ' + sku + ' generation failed: ' + (err ? err.message : 'empty response')); callback(null); return; }
+      var parsed = parseGeminiJson(text);
+      if(!parsed || !parsed.title){ console.log('[GEMINI] SKU ' + sku + ' generation failed: could not parse listing JSON'); callback(null); return; }
+      parsed.pipeline = 'gemini';
+      console.log('[GEMINI] SKU ' + sku + ' complete: "' + String(parsed.title).slice(0, 80) + '"');
+      callback(parsed);
+    });
+  } catch(e){
+    console.log('[GEMINI] SKU ' + sku + ' generation failed: ' + e.message);
+    callback(null);
+  }
+}
+
+// ── COMPONENT 2: Checker agent (via OpenRouter/Gemini Flash) ──
+// Two-stage (vision analysis, then JSON extraction) plus an optional fix stage — the same
+// grounding/JSON split the buyer finder uses. Mutates the passed `listing` object in place
+// when corrections are applied. Always returns a result object; never throws.
+function checkListing(sku, listing, photos, pipeline, callback){
+  callback = typeof callback === 'function' ? callback : function(){};
+  pipeline = pipeline || '';
+  function fail(msg){ console.log('[CHECKER] SKU ' + sku + ' ' + pipeline + ' error: ' + msg); callback({ verdict:'UNKNOWN', error: msg }); }
+  try {
+    if(!OPENROUTER_KEY){ fail('OPENROUTER_KEY not set'); return; }
+    if(!listing){ fail('no listing provided'); return; }
+    var photoBlocks = Array.isArray(photos) ? photos : [];
+    var title = String(listing.title || '');
+    var condition = String(listing.condition_box || '');
+    var descExcerpt = stripHtmlExcerpt(listing.description_html, 500);
+    var specStr = '{}'; try { specStr = JSON.stringify(listing.item_specifics || {}); } catch(e){ specStr = '{}'; }
+
+    // ── Stage 1: analysis (with vision, no JSON requirement) ──
+    var stage1User = [
+      'Review this listing against the photos provided.',
+      '',
+      'LISTING TO CHECK:',
+      'Title: ' + title,
+      'Condition: ' + condition,
+      'Description excerpt: ' + descExcerpt,
+      'Item Specifics: ' + specStr,
+      '',
+      'Check for these specific issues:',
+      '1. INCLUDES — Does the listing claim accessories or items that are NOT visible in the first photo? Does it miss accessories that ARE clearly visible?',
+      '2. CONDITION — Does the condition description match the visible wear, damage, or cosmetic issues in the photos? Is it more optimistic or more pessimistic than reality?',
+      '3. TITLE — Does the title match what the item actually appears to be based on labels, branding, and appearance visible in the photos?',
+      '4. SPECS — If a specs screen (BIOS, device info, settings) is visible in any photo, do the specs in the listing match what the screen shows?',
+      '5. WEIGHT PLAUSIBILITY — Given the item\'s apparent size and type in the photos, does the shipping tier seem plausible? Flag if something appears obviously wrong.',
+      '',
+      'Describe each issue found in plain language.',
+      'If no issues found, say PASS.',
+      'Be specific — cite which photo showed what.'
+    ].join('\n');
+    var stage1Content = photoBlocks.concat([{ type:'text', text: stage1User }]);
+    callOpenRouter({
+      model:'google/gemini-2.5-flash', max_tokens:1200,
+      messages:[
+        { role:'system', content:'You are a quality control expert reviewing an eBay listing against the actual photos of the item. Your job is to find any discrepancies between what the listing says and what is actually visible in the photos.' },
+        { role:'user', content: stage1Content }
+      ]
+    }, function(e1, analysis){
+      if(e1 || !analysis){ fail('stage 1 (analysis) failed: ' + (e1 ? e1.message : 'empty response')); return; }
+
+      // ── Stage 2: extraction (no vision, JSON only) ──
+      var stage2User = 'Based on this quality check analysis:\n' + analysis + '\n\nReturn ONLY this JSON:\n' + [
+        '{',
+        '  "verdict": "PASS" | "WARN" | "FLAG",',
+        '  "issues": [',
+        '    { "type": "includes" | "condition" | "title" | "specs" | "weight", "description": "specific issue description", "fixable": true | false }',
+        '  ],',
+        '  "summary": "one sentence summary of findings"',
+        '}',
+        '',
+        'PASS = no issues found',
+        'WARN = minor issues that may not affect sale',
+        'FLAG = significant issues that should be corrected',
+        '',
+        'Return only the JSON, no other text.'
+      ].join('\n');
+      callOpenRouter({
+        model:'google/gemini-2.5-flash', max_tokens:1000,
+        messages:[
+          { role:'system', content:'Extract the quality check findings into JSON.' },
+          { role:'user', content: stage2User }
+        ]
+      }, function(e2, jsonText){
+        if(e2 || !jsonText){ fail('stage 2 (extraction) failed: ' + (e2 ? e2.message : 'empty response')); return; }
+        var parsed = parseGeminiJson(jsonText) || {};
+        var verdict = String(parsed.verdict || 'UNKNOWN').toUpperCase();
+        if(['PASS','WARN','FLAG'].indexOf(verdict) < 0) verdict = 'UNKNOWN';
+        var issues = Array.isArray(parsed.issues) ? parsed.issues : [];
+        var summary = String(parsed.summary || '');
+        var result = { verdict: verdict, issues: issues, summary: summary, corrections_made: [], could_not_fix: [], listing_updated: false };
+        console.log('[CHECKER] SKU ' + sku + ' ' + pipeline + ' — verdict: ' + verdict);
+
+        var fixable = issues.filter(function(x){ return x && x.fixable === true; });
+        var needsFix = (verdict === 'WARN' || verdict === 'FLAG') && fixable.length > 0;
+        if(!needsFix){ callback(result); return; }
+
+        // ── Stage 3: fix (no vision — the Stage 1 analysis is the context) ──
+        var fixList = fixable.map(function(x, idx){ return (idx + 1) + '. [' + (x.type || 'issue') + '] ' + (x.description || ''); }).join('\n');
+        var stage3User = [
+          'Original listing:',
+          'Title: ' + title,
+          'Condition box: ' + condition,
+          'Description: ' + String(listing.description_html || ''),
+          'Item specifics: ' + specStr,
+          '',
+          'Quality control found these fixable issues:',
+          fixList,
+          '',
+          'Correct only the flagged issues. Return the complete corrected listing as JSON in exactly this format:',
+          '{',
+          '  "title": string,',
+          '  "condition_box": string,',
+          '  "description_html": string,',
+          '  "item_specifics": object,',
+          '  "corrections_made": ["list of what was changed"],',
+          '  "could_not_fix": ["list of unfixable issues if any"]',
+          '}',
+          '',
+          'Return only JSON, no other text.'
+        ].join('\n');
+        callOpenRouter({
+          model:'google/gemini-2.5-flash', max_tokens:2500,
+          messages:[
+            { role:'system', content:'You are correcting an eBay listing based on quality control findings. Make only the specific corrections identified. Do not change anything that was not flagged.' },
+            { role:'user', content: stage3User }
+          ]
+        }, function(e3, fixText){
+          if(e3 || !fixText){
+            result.could_not_fix = fixable.map(function(x){ return x.description || ''; });
+            console.log('[CHECKER] SKU ' + sku + ' ' + pipeline + ' fix call failed — returning findings only');
+            callback(result); return;
+          }
+          var fix = parseGeminiJson(fixText);
+          if(fix && (fix.title || fix.condition_box || fix.description_html || fix.item_specifics)){
+            if(fix.title != null) listing.title = String(fix.title);
+            if(fix.condition_box != null) listing.condition_box = String(fix.condition_box);
+            if(fix.description_html != null) listing.description_html = String(fix.description_html);
+            if(fix.item_specifics && typeof fix.item_specifics === 'object' && !Array.isArray(fix.item_specifics)) listing.item_specifics = fix.item_specifics;
+            result.corrections_made = Array.isArray(fix.corrections_made) ? fix.corrections_made : [];
+            result.could_not_fix = Array.isArray(fix.could_not_fix) ? fix.could_not_fix : [];
+            result.listing_updated = true;
+            console.log('[CHECKER] SKU ' + sku + ' fixed ' + result.corrections_made.length + ' issues');
+            if(result.could_not_fix.length) console.log('[CHECKER] SKU ' + sku + ' could not fix: ' + result.could_not_fix.join('; '));
+          } else {
+            result.could_not_fix = fixable.map(function(x){ return x.description || ''; });
+            console.log('[CHECKER] SKU ' + sku + ' ' + pipeline + ' fix parse failed — returning findings only');
+          }
+          callback(result);
+        });
+      });
+    });
+  } catch(e){ fail(e.message); }
+}
+
+// ── COMPONENT 3: per-pipeline view stored on the listing record ──
+function dualPipelineView(listing, pipeline, status){
+  listing = listing || {};
+  return {
+    title: listing.title != null ? String(listing.title) : '',
+    condition_box: listing.condition_box != null ? String(listing.condition_box) : '',
+    description_html: listing.description_html != null ? String(listing.description_html) : '',
+    avg_sold_price: listing.avg_sold_price,
+    price_low: listing.price_low,
+    price_high: listing.price_high,
+    suggested_price: listing.suggested_price,
+    accept_price: listing.accept_price,
+    decline_price: listing.decline_price,
+    item_specifics: (listing.item_specifics && typeof listing.item_specifics === 'object' && !Array.isArray(listing.item_specifics)) ? listing.item_specifics : {},
+    shipping: listing.shipping || listing.shipping_policy || '',
+    is_lot: !!listing.is_lot,
+    lot_quantity: listing.lot_quantity || 1,
+    pipeline: pipeline,
+    status: status || 'complete',
+    checker: null
+  };
+}
+
+// Re-read listing.json fresh, apply a mutation, write it back. Re-reading right before the
+// write minimizes clobbering any concurrent user edits made while the pipeline was running.
+function saveDualRecord(sku, mutate){
+  var lp = path.join(DATA_DIR, 'items', String(sku), 'listing.json');
+  var rec = null;
+  try { if(fs.existsSync(lp)) rec = JSON.parse(fs.readFileSync(lp, 'utf8')); } catch(e){}
+  if(!rec) return null;
+  try { mutate(rec); } catch(e){}
+  try { fs.writeFileSync(lp, JSON.stringify(rec, null, 2)); } catch(e){ console.log('[QUEUE] SKU ' + sku + ' dual save error: ' + e.message); }
+  return rec;
+}
+
+// ── COMPONENT 4: dual pipeline orchestration ──
+// The existing Sonnet generation has ALREADY run (processItem wrote record.listing). This
+// builds the sonnet view, runs Gemini generation, then runs the Checker on both results
+// (in parallel), applying any fixable corrections. Saves both onto the record. Never throws.
+function runDualPipeline(sku, callback){
+  callback = typeof callback === 'function' ? callback : function(){};
+  var itemDir = path.join(DATA_DIR, 'items', String(sku));
+  var lp = path.join(itemDir, 'listing.json');
+  var record;
+  try { record = JSON.parse(fs.readFileSync(lp, 'utf8')); }
+  catch(e){ console.log('[QUEUE] SKU ' + sku + ' dual pipeline skipped (no listing.json)'); callback(); return; }
+  if(!record || !record.listing){ callback(); return; }
+  console.log('[QUEUE] SKU ' + sku + ' running dual pipeline generation');
+
+  var sonnetView = dualPipelineView(record.listing, 'sonnet', 'complete');
+  record._regenNotes = '';
+
+  buildDualPhotoBlocksForRecord(record, itemDir, function(orBlocks){
+    generateListingGemini(sku, record, orBlocks, function(geminiListing){
+      var geminiView = geminiListing ? dualPipelineView(geminiListing, 'gemini', 'complete') : dualPipelineView({}, 'gemini', 'failed');
+
+      var pending = 2, sonnetChecker = null, geminiChecker = null;
+      function finish(){
+        pending--;
+        if(pending > 0) return;
+        sonnetView.checker = sonnetChecker;
+        geminiView.checker = geminiChecker;
+        saveDualRecord(sku, function(rec){
+          rec.sonnet = sonnetView;
+          rec.gemini = geminiView;
+          rec.dual_pipeline = true;
+        });
+        try { loadListings(); } catch(e){}
+        var sv = sonnetChecker ? sonnetChecker.verdict : 'UNKNOWN';
+        var gv = geminiChecker ? geminiChecker.verdict : (geminiListing ? 'UNKNOWN' : 'FAILED');
+        console.log('[QUEUE] SKU ' + sku + ' dual pipeline complete — Sonnet: ' + sv + ' | Gemini: ' + gv);
+        callback();
+      }
+      checkListing(sku, sonnetView, orBlocks, 'sonnet', function(r){ sonnetChecker = r; finish(); });
+      if(geminiListing){ checkListing(sku, geminiView, orBlocks, 'gemini', function(r){ geminiChecker = r; finish(); }); }
+      else { geminiChecker = { verdict:'UNKNOWN', error:'generation failed' }; finish(); }
+    });
+  });
+}
+
+// ── COMPONENT 6 helper: regenerate a single pipeline's listing, then re-run its Checker ──
+function regenerateListingPipeline(sku, pipeline, notes, callback){
+  callback = typeof callback === 'function' ? callback : function(){};
+  pipeline = (pipeline === 'gemini') ? 'gemini' : 'sonnet';
+  var itemDir = path.join(DATA_DIR, 'items', String(sku));
+  var lp = path.join(itemDir, 'listing.json');
+  if(!fs.existsSync(lp)){ callback({success:false, error:'Listing not found for SKU ' + sku}); return; }
+
+  if(pipeline === 'sonnet'){
+    // Reuse the existing (UNCHANGED) Sonnet regenerator, then refresh the sonnet view + checker.
+    regenerateListing(sku, notes, function(result){
+      if(!result || !result.success){ callback(result || {success:false, error:'Regeneration failed'}); return; }
+      var rec; try { rec = JSON.parse(fs.readFileSync(lp, 'utf8')); } catch(e){ result.pipeline = 'sonnet'; callback(result); return; }
+      var view = dualPipelineView(rec.listing, 'sonnet', 'complete');
+      buildDualPhotoBlocksForRecord(rec, itemDir, function(orBlocks){
+        checkListing(sku, view, orBlocks, 'sonnet', function(chk){
+          view.checker = chk;
+          saveDualRecord(sku, function(r){ r.sonnet = view; if(r.gemini) r.dual_pipeline = true; });
+          try { loadListings(); } catch(e){}
+          result.pipeline = 'sonnet';
+          result.verdict = chk ? chk.verdict : 'UNKNOWN';
+          result.checker = chk;
+          callback(result);
+        });
+      });
+    });
+    return;
+  }
+
+  // Gemini regenerate.
+  var record; try { record = JSON.parse(fs.readFileSync(lp, 'utf8')); } catch(e){ callback({success:false, error:'Bad listing.json'}); return; }
+  record._regenNotes = notes || '';
+  buildDualPhotoBlocksForRecord(record, itemDir, function(orBlocks){
+    generateListingGemini(sku, record, orBlocks, function(geminiListing){
+      if(!geminiListing){
+        saveDualRecord(sku, function(r){ r.gemini = dualPipelineView({}, 'gemini', 'failed'); });
+        callback({success:false, error:'Gemini generation failed', pipeline:'gemini'});
+        return;
+      }
+      var view = dualPipelineView(geminiListing, 'gemini', 'complete');
+      checkListing(sku, view, orBlocks, 'gemini', function(chk){
+        view.checker = chk;
+        saveDualRecord(sku, function(r){ r.gemini = view; if(r.sonnet) r.dual_pipeline = true; });
+        try { loadListings(); } catch(e){}
+        callback({ success:true, pipeline:'gemini', title:view.title, condition_box:view.condition_box, description_html:view.description_html, suggested_price:view.suggested_price, accept_price:view.accept_price, decline_price:view.decline_price, verdict: chk ? chk.verdict : 'UNKNOWN', checker: chk });
+      });
+    });
+  });
+}
+
 function processItem(item, callback) {
   var meta = item.meta;
   var itemDir = item.dir;
@@ -4492,10 +4943,210 @@ function sanitizeForFilename(s){
   return String(s||'').replace(/[^a-z0-9]+/gi,'-').replace(/^-+|-+$/g,'').slice(0,40) || 'item';
 }
 
+// ── DUAL PIPELINE (ADDITIVE): render a shared header + two pipeline cards for one SKU ──
+// Gemini card (teal/blue accent) and Sonnet card (purple accent) side by side, each with a
+// checker badge/report, per-pipeline title/price editing, Regenerate, and List on eBay. The
+// shared header carries item-level fields (photos, weight, category, dimensions, specifics)
+// that both pipelines share. Uses the SAME client-side edit functions as the single card.
+function buildDualCardHtml(r, i, colors, ebayStat){
+  colors = colors || ['#1565c0'];
+  var sku = r.sku;
+  var skuStr = String(sku);
+  var meta = r.meta || {};
+  var listing = r.listing || {};
+  var grade = r.gradeConflict ? r.gradeConflict.claude : (meta.grade || 'B');
+  var headerColor = colors[i % colors.length];
+  var quantity = (r.quantity && r.quantity > 1) ? r.quantity : ((meta.quantity && meta.quantity > 1) ? meta.quantity : 1);
+  var itemName = (listing.title) || (r.visionData && r.visionData.item_name) || ('SKU ' + sku);
+  function attr(s){ return String(s == null ? '' : s).replace(/"/g, '&quot;'); }
+  function esc(s){ return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+
+  // ── shared photo stems (same selection as the single card) ──
+  var stems = (r.outputPhotos && r.outputPhotos.length) ? r.outputPhotos.slice() : [];
+  if(stems.length === 0){ var pc = r.photoCount || meta.photoCount || 0; for(var sp = 1; sp <= pc; sp++) stems.push('photo_' + sp); }
+  var _tp = (r.testingPhotos || (meta && meta.testingPhotos) || []).map(function(f){ return String(f).replace(/\.jpg$/i, ''); });
+  if(_tp.length){ var _have = {}; stems.forEach(function(s){ _have[String(s).replace(/\.jpg$/i, '')] = true; }); var _miss = _tp.filter(function(s){ return !_have[s]; }); if(_miss.length){ stems = stems.slice(0, 1).concat(_miss, stems.slice(1)); } }
+  var photoCount = stems.length;
+  var photoStrip = '';
+  if(photoCount > 0){
+    var thumbs = '';
+    for(var p = 0; p < Math.min(photoCount, 24); p++){
+      var st = stems[p];
+      thumbs += '<div class="lp-thumb" data-sku="' + skuStr + '" data-stem="' + st + '" style="position:relative;flex:0 0 auto;cursor:grab;">'
+        + '<div class="lp-grip" title="Drag to reorder" style="position:absolute;top:0;left:0;bottom:0;width:28px;display:flex;align-items:center;justify-content:center;z-index:2;background:rgba(0,0,0,0.45);color:#fff;border-radius:6px 0 0 6px;font-size:15px;cursor:grab;touch-action:none;">&#9776;</div>'
+        + '<img class="lp-lightboxable" src="/api/photo/' + skuStr + '/' + st + '" onclick="openLightbox(this)" style="width:82px;height:82px;object-fit:cover;border-radius:6px;border:2px solid ' + (st.indexOf('test_photo') === 0 ? '#2e7d32' : '#e0e0e0') + ';cursor:pointer;">'
+        + '<button class="thumb-del-btn" onclick="deletePhoto(\'' + skuStr + '\',\'' + st + '\',this)" title="Delete photo" style="position:absolute;top:-7px;right:-7px;width:22px;height:22px;border-radius:50%;border:none;background:#c62828;color:#fff;font-size:14px;font-weight:bold;line-height:1;cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,0.4);">&times;</button>'
+        + '</div>';
+    }
+    photoStrip = '<div style="font-size:11px;font-weight:bold;color:#888;letter-spacing:0.08em;text-transform:uppercase;margin:6px 0;">Photos (' + photoCount + ') &middot; weight photo excluded &middot; drag &#9776; to reorder <span class="lp-order-msg" style="font-weight:bold;margin-left:8px;"></span></div>'
+      + '<div class="lp-photostrip" style="display:flex;gap:8px;overflow-x:auto;padding:6px 2px 10px;">' + thumbs + '</div>';
+  }
+
+  // ── shared info row (weight / category / dimensions / shipping) — item-level edit fns ──
+  var wtier = r.shipping_tier || meta.shipping_tier || null;
+  var hasWeight = !!(wtier && ((wtier.rawLbs || 0) > 0 || (wtier.rawOz || 0) > 0));
+  var infoRow = '<div style="background:#f5f5f5;border-bottom:1px solid #ddd;padding:8px 16px;font-size:12.5px;color:#444;display:flex;flex-wrap:wrap;gap:6px 18px;">'
+    + '<span><b>Shelf:</b> ' + (meta.shelf || '&mdash;') + '</span>'
+    + (wtier ? ('<span><b>Weight:</b> <span id="wt_' + skuStr + '" data-sku="' + skuStr + '" data-lbs="' + wtier.rawLbs + '" data-oz="' + wtier.rawOz + '" onclick="editWeight(this)" title="Click to edit weight" style="cursor:pointer;color:#1565c0;border-bottom:1px dashed #1565c0;">' + wtier.rawLbs + ' lbs ' + wtier.rawOz + ' oz &rarr; Tier ' + (wtier.tier != null ? wtier.tier : '?') + ' | ' + (wtier.boxSize || '') + '</span> <span id="wtmsg2_' + skuStr + '" style="font-weight:bold;"></span></span>') : ((r.weight || meta.weight) ? '<span><b>Weight:</b> ' + (r.weight || meta.weight) + '</span>' : ''))
+    + '<span><b>Custom SKU:</b> ' + (listing.custom_sku || (skuStr + (meta.shelf ? '-' + meta.shelf : ''))) + '</span>'
+    + '<span><b>eBay Category:</b> <span id="cat_' + skuStr + '" data-sku="' + skuStr + '" data-catid="' + (r.ebay_category_id || listing.category_id || '') + '" onclick="editCategory(this)" title="Click to edit category ID" style="cursor:pointer;color:#1565c0;border-bottom:1px dashed #1565c0;">' + ((r.ebay_category_id || listing.category_id) ? ((r.ebay_category_name ? r.ebay_category_name + ' ' : '') + '(' + (r.ebay_category_id || listing.category_id) + ')') : '(set)') + '</span> <span id="catmsg_' + skuStr + '" style="font-weight:bold;"></span></span>'
+    + (listing.shipping_policy ? '<span><b>Ship:</b> ' + listing.shipping_policy + '</span>' : '')
+    + '<span><b>Box:</b> <span id="dim_' + skuStr + '" data-sku="' + skuStr + '" onclick="editDims(this)" title="Click to edit dimensions (LxWxH inches)" style="cursor:pointer;color:#1565c0;border-bottom:1px dashed #1565c0;">' + (((wtier && wtier.boxSize) ? wtier.boxSize : (listing.box_dimensions || '')) || '(set)') + '</span> <span id="dimmsg_' + skuStr + '" style="font-weight:bold;"></span></span>'
+    + '<span style="display:inline-flex;align-items:center;gap:6px;"><label for="qty_' + skuStr + '"><b>Qty:</b></label><input id="qty_' + skuStr + '" type="number" min="1" max="99" value="' + quantity + '" style="width:56px;padding:4px 6px;border:1px solid #bbb;border-radius:4px;font-size:12.5px;"><button onclick="saveQty(\'' + skuStr + '\')" style="padding:4px 10px;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;background:#455a64;color:#fff;">Save</button><span id="qtymsg_' + skuStr + '" style="font-size:12px;"></span></span>'
+    + '</div>';
+  var weightEntry = !hasWeight ?
+    '<div style="background:#fff8e1;border-bottom:1px solid #f9a825;padding:8px 16px;font-size:12.5px;color:#8d6e00;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">'
+    + '<div style="width:100%;font-weight:bold;">&#9888; Scale reading (raw — packing added automatically):</div>'
+    + '<input id="wtlb_' + skuStr + '" type="number" min="0" step="1" placeholder="lb" style="width:64px;padding:4px 6px;border:1px solid #f9a825;border-radius:4px;font-size:13px;"><span>lb</span>'
+    + '<input id="wtoz_' + skuStr + '" type="number" min="0" step="0.1" placeholder="oz" style="width:64px;padding:4px 6px;border:1px solid #f9a825;border-radius:4px;font-size:13px;"><span>oz</span>'
+    + '<button onclick="saveWeight(\'' + skuStr + '\')" style="padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;background:#f9a825;color:#fff;">Save Weight</button>'
+    + '<span id="wtmsg_' + skuStr + '" style="font-weight:bold;"></span>'
+    + '</div>' : '';
+
+  // ── shared item specifics (record-level; editSpec / addSpec) ──
+  var spec = (listing.item_specifics && typeof listing.item_specifics === 'object') ? listing.item_specifics : {};
+  var specKeys = Object.keys(spec).filter(function(k){ var t = String(k).trim(); return !(/^serial(\s|_)?(number|no\.?|#)?$/i.test(t) || /^s\/?n$/i.test(t)); });
+  var catId = r.ebay_category_id || listing.category_id || '';
+  var detailRows = '';
+  if(catId){ detailRows += '<tr><td style="border:1px solid #e0e0e0;padding:5px 8px;font-weight:bold;width:35%;background:#eef5ff;">eBay Category</td><td style="border:1px solid #e0e0e0;padding:5px 8px;background:#eef5ff;">' + (r.ebay_category_name ? r.ebay_category_name + ' ' : '') + '(' + catId + ')</td></tr>'; }
+  specKeys.forEach(function(k){
+    var v = spec[k]; v = Array.isArray(v) ? v.join(', ') : (v == null ? '' : v);
+    var fAttr = String(k).replace(/"/g, '&quot;');
+    var valCell = String(v).trim() ? esc(String(v)) : '<span style="color:#bbb;">(tap to add)</span>';
+    detailRows += '<tr><td style="border:1px solid #e0e0e0;padding:5px 8px;font-weight:bold;width:35%;background:#fafafa;">' + esc(k) + '</td>'
+      + '<td class="spec-val" data-sku="' + skuStr + '" data-field="' + fAttr + '" onclick="editSpec(this)" title="Click to edit" style="border:1px solid #e0e0e0;padding:5px 8px;cursor:pointer;">' + valCell + '</td></tr>';
+  });
+  var specHtml = '';
+  if(detailRows){
+    specHtml = '<details style="margin:10px 16px;"><summary style="cursor:pointer;font-size:12px;font-weight:bold;color:#1565c0;">eBay Details &mdash; Category &amp; Item Specifics (' + specKeys.length + ')</summary>'
+      + '<table style="border-collapse:collapse;width:100%;font-size:12.5px;color:#444;margin-top:8px;">' + detailRows + '</table>'
+      + '<div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap;align-items:center;">'
+      + '<input id="nf_name_' + skuStr + '" type="text" placeholder="Field name" style="flex:1;min-width:110px;padding:5px 7px;border:1px solid #bbb;border-radius:4px;font-size:12.5px;">'
+      + '<input id="nf_val_' + skuStr + '" type="text" placeholder="Value" style="flex:1;min-width:110px;padding:5px 7px;border:1px solid #bbb;border-radius:4px;font-size:12.5px;">'
+      + '<button onclick="addSpec(\'' + skuStr + '\')" style="padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12.5px;font-weight:bold;background:#455a64;color:#fff;">Add field</button>'
+      + '<span id="specmsg_' + skuStr + '" style="font-weight:bold;font-size:12px;"></span></div></details>';
+  }
+
+  // ── checker badge + report panel ──
+  function checkerBadge(pl, chk){
+    var v = (chk && chk.verdict) ? String(chk.verdict).toUpperCase() : 'UNKNOWN';
+    var m = { PASS:['#2e7d32', '&#9989; PASS'], WARN:['#f9a825', '&#9888; WARN'], FLAG:['#c62828', '&#128680; FLAG'], UNKNOWN:['#757575', '&#10067; UNKNOWN'] };
+    var mm = m[v] || m.UNKNOWN;
+    return '<span id="cbadge_' + pl + '_' + skuStr + '" onclick="toggleChecker(\'' + pl + '\',\'' + skuStr + '\')" title="Click to view the Checker report" style="display:inline-block;cursor:pointer;background:' + mm[0] + ';color:#fff;padding:2px 10px;border-radius:11px;font-size:12px;font-weight:bold;">' + mm[1] + '</span>';
+  }
+  function checkerPanel(pl, chk){
+    var issues = (chk && Array.isArray(chk.issues)) ? chk.issues : [];
+    var corr = (chk && Array.isArray(chk.corrections_made)) ? chk.corrections_made : [];
+    var cnf = (chk && Array.isArray(chk.could_not_fix)) ? chk.could_not_fix : [];
+    var summary = (chk && chk.summary) ? esc(chk.summary) : (chk && chk.error ? 'Checker unavailable: ' + esc(chk.error) : 'No checker report available.');
+    var h = '<div id="cpanel_' + pl + '_' + skuStr + '" style="display:none;margin-top:8px;background:#fafafa;border:1px solid #e0e0e0;border-radius:6px;padding:10px 12px;font-size:12.5px;color:#444;">';
+    h += '<div style="font-weight:bold;margin-bottom:4px;">' + summary + '</div>';
+    if(issues.length){ h += '<div style="font-weight:bold;color:#8d6e00;margin-top:6px;">Issues found:</div><ul style="margin:4px 0 4px 18px;">'; issues.forEach(function(x){ h += '<li>[' + esc(x.type || 'issue') + '] ' + esc(x.description || '') + (x.fixable ? '' : ' <span style="color:#c62828;">(not auto-fixable)</span>') + '</li>'; }); h += '</ul>'; }
+    if(corr.length){ h += '<div style="font-weight:bold;color:#2e7d32;margin-top:6px;">Corrections made automatically:</div><ul style="margin:4px 0 4px 18px;">'; corr.forEach(function(c){ h += '<li>' + esc(c) + '</li>'; }); h += '</ul>'; }
+    if(cnf.length){ h += '<div style="font-weight:bold;color:#c62828;margin-top:6px;">Could not fix (needs your attention):</div><ul style="margin:4px 0 4px 18px;">'; cnf.forEach(function(c){ h += '<li>' + esc(c) + '</li>'; }); h += '</ul>'; }
+    if(!issues.length && !corr.length && !cnf.length){ h += '<div style="color:#2e7d32;">No issues found.</div>'; }
+    h += '</div>';
+    return h;
+  }
+
+  // ── one pipeline card ──
+  function pcard(pl, view){
+    view = view || {};
+    var accent = pl === 'gemini' ? '#00838f' : '#6a1b9a';
+    var label = pl === 'gemini' ? '&#9889; Gemini Flash' : '&#129302; Anthropic Sonnet';
+    var otherName = pl === 'gemini' ? 'Anthropic Sonnet' : 'Gemini Flash';
+    var status = view.status || 'complete';
+    var listedThis = (r.listed_pipeline === pl) && r.ebay_item_id;
+    var isSuperseded = (status === 'superseded') || (r.listed_pipeline && r.listed_pipeline !== pl);
+
+    var checkbox = (!r.ebay_item_id && !isSuperseded && status === 'complete') ?
+      '<label style="display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:normal;cursor:pointer;"><input type="checkbox" class="bulkSel" value="' + skuStr + '" data-pipeline="' + pl + '" onchange="bulkPick(this)" style="width:16px;height:16px;cursor:pointer;">Select</label>' : '';
+    var head = '<div style="background:' + accent + ';color:#fff;padding:8px 12px;font-size:13px;font-weight:bold;display:flex;align-items:center;justify-content:space-between;gap:8px;">'
+      + '<span>' + label + '</span>' + checkbox + '</div>';
+
+    var overlay = '<div id="superseded_' + pl + '_' + skuStr + '" style="' + (isSuperseded ? 'display:flex;' : 'display:none;') + 'position:absolute;inset:0;background:rgba(110,110,110,0.55);color:#fff;align-items:center;justify-content:center;flex-direction:column;border-radius:6px;z-index:5;font-weight:bold;text-align:center;padding:12px;">'
+      + '<div style="font-size:17px;">Superseded</div>'
+      + '<div style="font-size:12px;margin-top:5px;">Listed using ' + otherName + ' version</div>'
+      + '</div>';
+
+    var body;
+    if(status === 'failed'){
+      body = '<div style="padding:18px 12px;text-align:center;color:#c62828;font-weight:bold;">Generation failed'
+        + '<div style="margin-top:10px;"><button id="regbtn_' + pl + '_' + skuStr + '" onclick="doRegenPipe(\'' + skuStr + '\',\'' + pl + '\')" style="padding:8px 16px;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:bold;background:#37474f;color:#fff;">&#8634; Regenerate</button>'
+        + ' <span id="regmsg_' + pl + '_' + skuStr + '" style="font-weight:bold;font-size:12px;"></span></div></div>';
+    } else if(status === 'pending'){
+      body = '<div style="padding:22px 12px;text-align:center;color:#666;font-weight:bold;">Generating&hellip;</div>';
+    } else {
+      var title = view.title || itemName;
+      var cond = view.condition_box || 'See photos.';
+      var desc = view.description_html || ('<p>' + esc(title) + '</p>');
+      var suggest = view.suggested_price || 0;
+      var accept = view.accept_price || 0;
+      var decline = view.decline_price || 0;
+      var listBtn;
+      if(listedThis){
+        listBtn = '<a href="' + (r.ebay_listing_url || ('https://www.ebay.com/itm/' + r.ebay_item_id)) + '" target="_blank" style="padding:8px 16px;border-radius:4px;font-size:13px;font-weight:bold;background:#2e7d32;color:#fff;text-decoration:none;">Listed &#10003;</a>';
+      } else if(isSuperseded){
+        listBtn = '<button id="ebtn_' + pl + '_' + skuStr + '" disabled style="padding:8px 16px;border:none;border-radius:4px;font-size:13px;font-weight:bold;background:#9e9e9e;color:#fff;opacity:0.6;cursor:not-allowed;">Superseded</button>';
+      } else {
+        listBtn = '<button id="ebtn_' + pl + '_' + skuStr + '" onclick="listEbayPipe(\'' + skuStr + '\',\'' + pl + '\')" style="padding:8px 16px;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:bold;background:#0064d2;color:#fff;">List on eBay</button>';
+      }
+      body = '<div style="padding:12px;">'
+        + '<div id="title_' + pl + '_' + skuStr + '" data-sku="' + skuStr + '" data-pipeline="' + pl + '" data-raw="' + attr(title) + '" onclick="editTitlePipe(this)" title="Click to edit title (eBay limit 80 chars)" style="font-size:14px;font-weight:bold;cursor:pointer;border-bottom:1px dashed #bbb;margin-bottom:6px;">' + esc((quantity > 1 ? 'LOT OF ' + quantity + ': ' : '') + title) + '</div>'
+        + '<div style="margin-bottom:6px;">' + checkerBadge(pl, view.checker) + '</div>'
+        + checkerPanel(pl, view.checker)
+        + '<div style="background:#f5f5f5;border-radius:4px;padding:6px 8px;font-size:12.5px;color:#444;display:flex;flex-wrap:wrap;gap:4px 14px;margin:8px 0;">'
+        + '<span><b>Suggest:</b> $<span id="sug_' + pl + '_' + skuStr + '" data-sku="' + skuStr + '" data-pipeline="' + pl + '" onclick="editSuggestPipe(this)" title="Click to edit listing price" style="cursor:pointer;border-bottom:1px dashed #1565c0;color:#1565c0;">' + suggest + '</span> <span id="sugmsg_' + pl + '_' + skuStr + '" style="font-weight:bold;"></span></span>'
+        + '<span><b>Accept:</b> $' + accept + '</span><span><b>Decline:</b> $' + decline + '</span>'
+        + '</div>'
+        + '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;">'
+        + '<button id="btn_t_' + pl + '_' + skuStr + '" onclick="cp(this.id.slice(4))" style="padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;background:#1565c0;color:#fff;">Copy Title</button>'
+        + '<button id="btn_c_' + pl + '_' + skuStr + '" onclick="cp(this.id.slice(4))" style="padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;background:#37474f;color:#fff;">Copy Condition Box</button>'
+        + '<button id="btn_h_' + pl + '_' + skuStr + '" onclick="cp(this.id.slice(4))" style="padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;background:#2e7d32;color:#fff;">Copy HTML Description</button>'
+        + '<button id="regbtn_' + pl + '_' + skuStr + '" onclick="toggleRegenPipe(\'' + skuStr + '\',\'' + pl + '\')" style="padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;background:#37474f;color:#fff;">&#8634; Regenerate</button>'
+        + listBtn
+        + '</div>'
+        + '<div id="regpanel_' + pl + '_' + skuStr + '" style="display:none;margin-bottom:8px;background:#f5f5f5;border:1px solid #ddd;border-radius:6px;padding:8px 10px;">'
+        + '<textarea id="regnotes_' + pl + '_' + skuStr + '" placeholder="Anything to fix or add? (optional)" style="width:100%;box-sizing:border-box;min-height:44px;padding:6px 8px;border:1px solid #bbb;border-radius:4px;font-size:13px;resize:vertical;"></textarea>'
+        + '<div style="display:flex;align-items:center;gap:12px;margin-top:6px;">'
+        + '<button onclick="doRegenPipe(\'' + skuStr + '\',\'' + pl + '\')" style="padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:bold;background:#2e7d32;color:#fff;">Regenerate Now</button>'
+        + '<span onclick="cancelRegenPipe(\'' + skuStr + '\',\'' + pl + '\')" style="color:#1565c0;font-size:13px;cursor:pointer;text-decoration:underline;">Cancel</span>'
+        + '<span id="regmsg_' + pl + '_' + skuStr + '" style="font-weight:bold;font-size:12.5px;"></span>'
+        + '</div></div>'
+        + '<div style="font-size:12px;color:#555;"><b>Condition:</b> ' + esc(cond) + '</div>'
+        + '<textarea id="t_' + pl + '_' + skuStr + '" style="display:none;">' + esc(title) + '</textarea>'
+        + '<textarea id="c_' + pl + '_' + skuStr + '" style="display:none;">' + esc(cond) + '</textarea>'
+        + '<textarea id="h_' + pl + '_' + skuStr + '" style="display:none;">' + esc(desc) + '</textarea>'
+        + '</div>';
+    }
+    return '<div id="pcard_' + pl + '_' + skuStr + '" style="position:relative;flex:1 1 330px;min-width:290px;background:#fff;border:1px solid #e0e0e0;border-radius:6px;overflow:hidden;">' + overlay + head + body + '</div>';
+  }
+
+  var header = '<div style="background:' + headerColor + ';color:#fff;padding:12px 16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;">'
+    + '<span style="background:rgba(255,255,255,0.25);border-radius:4px;padding:2px 8px;font-size:13px;font-weight:bold;">SKU ' + skuStr + '</span>'
+    + '<span style="font-size:15px;font-weight:bold;flex:1;">' + esc((quantity > 1 ? 'LOT OF ' + quantity + ': ' : '') + itemName) + '</span>'
+    + '<span style="background:rgba(255,255,255,0.28);padding:2px 8px;border-radius:4px;font-size:11px;font-weight:bold;">Dual Pipeline</span>'
+    + (quantity > 1 ? '<span style="background:#2e7d32;color:#fff;padding:2px 8px;border-radius:4px;font-size:12px;font-weight:bold;">QTY: ' + quantity + '</span>' : '')
+    + '<span style="background:rgba(255,255,255,0.2);padding:2px 8px;border-radius:4px;font-size:12px;">Grade ' + grade + '</span>'
+    + '<button onclick="deleteListing(\'' + skuStr + '\')" style="padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;background:rgba(0,0,0,0.25);color:#fff;">Remove</button>'
+    + '</div>';
+
+  return '<div id="card_' + skuStr + '" style="background:#fff;border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,0.15);margin-bottom:28px;overflow:hidden;">'
+    + header + infoRow + weightEntry
+    + '<div style="padding:10px 16px 0;">' + photoStrip + '</div>'
+    + specHtml
+    + '<div style="display:flex;flex-wrap:wrap;gap:14px;padding:8px 16px 16px;">' + pcard('gemini', r.gemini) + pcard('sonnet', r.sonnet) + '</div>'
+    + '</div>';
+}
+
 function generateListingsPage(listings, ebayStat){
   ebayStat = ebayStat || {connected:false};
   var colors=['#1565c0','#2e7d32','#e65100','#6a1b9a','#00838f','#c62828','#37474f','#558b2f'];
   var cards = listings.map(function(r, i) {
+    // ADDITIVE: dual-pipeline records render TWO comparable cards (Gemini + Sonnet) under a
+    // shared header. Legacy single-pipeline records fall through to the original card below,
+    // completely unchanged (full backward compatibility).
+    if(r && r.gemini && r.sonnet){ return buildDualCardHtml(r, i, colors, ebayStat); }
     var sku = r.sku;
     var meta = r.meta||{};
     var listing = r.listing||{};
@@ -4745,7 +5396,7 @@ function generateListingsPage(listings, ebayStat){
     +'function updateBulkCount(){var all=Array.prototype.slice.call(document.querySelectorAll(".bulkSel"));var sel=all.filter(function(b){return b.checked;});var btn=document.getElementById("listSelectedBtn");if(btn){btn.textContent="List Selected ("+sel.length+")";btn.disabled=sel.length===0;btn.style.opacity=sel.length===0?"0.5":"1";btn.style.cursor=sel.length===0?"not-allowed":"pointer";}var sa=document.getElementById("selectAll");if(sa){sa.checked=all.length>0&&sel.length===all.length;}}'
     +'function toggleSelectAll(cb){var all=Array.prototype.slice.call(document.querySelectorAll(".bulkSel"));all.forEach(function(b){b.checked=cb.checked;});updateBulkCount();}'
     +'function markListed(sku,url){var cb=document.querySelector(".bulkSel[value=\\""+sku+"\\"]");if(cb&&cb.parentNode){cb.parentNode.removeChild(cb);}var b=document.getElementById("ebaybtn_"+sku);if(b){var a=document.createElement("a");a.id="ebaybtn_"+sku;a.href=url||"#";a.target="_blank";a.textContent="Listed \\u2713";a.style.cssText="padding:8px 16px;border-radius:4px;font-size:13px;font-weight:bold;background:#2e7d32;color:#fff;text-decoration:none;";if(b.parentNode)b.parentNode.replaceChild(a,b);}}'
-    +'function listSelected(){var skus=Array.prototype.slice.call(document.querySelectorAll(".bulkSel:checked")).map(function(b){return b.value;});if(!skus.length)return;if(!confirm("List "+skus.length+" items on eBay?"))return;var prog=document.getElementById("bulkProgress");var btn=document.getElementById("listSelectedBtn");if(btn){btn.disabled=true;btn.style.opacity="0.5";btn.style.cursor="not-allowed";}var ok=0,fails=[],idx=0;function postNext(){if(idx>=skus.length){if(prog){prog.textContent="Listed "+ok+" items successfully, "+fails.length+" failed"+(fails.length?(" ("+fails.map(function(f){return f.sku+": "+f.error;}).join("; ")+")"):"");}updateBulkCount();return;}var sku=skus[idx];idx++;if(prog){prog.textContent="Listing item "+idx+" of "+skus.length+"...";}fetch("/api/send-to-ebay",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sku:parseInt(sku,10)})}).then(function(r){return r.json();}).then(function(d){if(d.success){ok++;markListed(sku,d.listing_url);}else{fails.push({sku:sku,error:(d.error||"failed")});}}).catch(function(){fails.push({sku:sku,error:"network error"});}).then(function(){setTimeout(postNext,2000);});}postNext();}'
+    +'function listSelected(){var boxes=Array.prototype.slice.call(document.querySelectorAll(".bulkSel:checked")).map(function(b){return {sku:b.value,pipeline:b.getAttribute("data-pipeline")||""};});if(!boxes.length)return;if(!confirm("List "+boxes.length+" items on eBay?"))return;var prog=document.getElementById("bulkProgress");var btn=document.getElementById("listSelectedBtn");if(btn){btn.disabled=true;btn.style.opacity="0.5";btn.style.cursor="not-allowed";}var ok=0,fails=[],idx=0;function sendOne(item,done){var post=function(){fetch("/api/send-to-ebay",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sku:parseInt(item.sku,10)})}).then(function(r){return r.json();}).then(function(d){if(d&&d.success){ok++;if(item.pipeline){markListedPipe(item.sku,item.pipeline,d.listing_url);}else{markListed(item.sku,d.listing_url);}}else{fails.push({sku:item.sku,error:((d&&d.error)||"failed")});}}).catch(function(){fails.push({sku:item.sku,error:"network error"});}).then(done);};if(item.pipeline){fetch("/api/listings/supersede/"+item.sku+"/"+item.pipeline,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({listed_pipeline:item.pipeline})}).then(function(r){return r.json();}).then(function(){post();}).catch(function(){post();});}else{post();}}function postNext(){if(idx>=boxes.length){if(prog){prog.textContent="Listed "+ok+" items successfully, "+fails.length+" failed"+(fails.length?(" ("+fails.map(function(f){return f.sku+": "+f.error;}).join("; ")+")"):"");}updateBulkCount();return;}var item=boxes[idx];idx++;if(prog){prog.textContent="Listing item "+idx+" of "+boxes.length+"...";}sendOne(item,function(){setTimeout(postNext,2000);});}postNext();}'
     +'function savePhotoOrder(sku,order,strip){var msg=strip.parentNode.querySelector(".lp-order-msg");fetch("/api/listings/"+sku,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({photo_order:order})}).then(function(r){return r.json();}).then(function(d){if(d.success){if(msg){msg.style.color="#2e7d32";msg.textContent="Order saved";setTimeout(function(){msg.textContent="";},1500);}}else{if(msg){msg.style.color="#c62828";msg.textContent=d.error||"Save failed";}}}).catch(function(){if(msg){msg.style.color="#c62828";msg.textContent="Network error";}});}'
     +'function flashTick(cell,ok){var s=document.createElement("span");s.textContent=ok?" \\u2713":" \\u2717";s.style.color=ok?"#2e7d32":"#c62828";s.style.fontWeight="bold";cell.appendChild(s);setTimeout(function(){if(s.parentNode)s.parentNode.removeChild(s);},1500);}'
     +'function editSpec(cell){if(cell.dataset.editing)return;cell.dataset.editing="1";var sku=cell.getAttribute("data-sku");var field=cell.getAttribute("data-field");var cur=cell.textContent.replace(/\\s*[\\u2713\\u2717]\\s*$/,"").trim();if(cur==="Required \\u2014 tap to add"||cur==="(tap to add)"||cur==="(empty)")cur="";var inp=document.createElement("input");inp.type="text";inp.value=cur;inp.style.cssText="width:100%;box-sizing:border-box;padding:3px 5px;border:1px solid #1565c0;border-radius:3px;font-size:12.5px;";cell.textContent="";cell.appendChild(inp);inp.focus();inp.select();var done=false;function save(){if(done)return;done=true;var nv=inp.value;var body={item_specifics:{}};body.item_specifics[field]=nv;fetch("/api/listings/"+sku,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(function(r){return r.json();}).then(function(d){cell.removeAttribute("data-editing");if(d&&d.success){cell.textContent=(nv.trim()?nv:"(empty)");cell.style.borderLeft="1px solid #e0e0e0";var row=cell.parentNode;if(row){var nm=row.querySelector("td");if(nm){nm.style.color="";nm.style.borderLeft="1px solid #e0e0e0";}}cell.style.background="#e8f5e9";setTimeout(function(){cell.style.background="";},1200);flashTick(cell,true);}else{cell.textContent=(cur||"(empty)");flashTick(cell,false);}}).catch(function(){cell.removeAttribute("data-editing");cell.textContent=(cur||"(empty)");flashTick(cell,false);});}inp.addEventListener("blur",save);inp.addEventListener("keydown",function(e){if(e.key==="Enter"){e.preventDefault();inp.blur();}else if(e.key==="Escape"){done=true;cell.removeAttribute("data-editing");cell.textContent=(cur||"(empty)");}});}'
@@ -4768,6 +5419,16 @@ function generateListingsPage(listings, ebayStat){
     +'document.addEventListener("touchstart",function(e){var box=document.getElementById("lpLightbox");if(box&&box.style.display==="flex")lpTouchX=e.changedTouches[0].clientX;},{passive:true});'
     +'document.addEventListener("touchend",function(e){var box=document.getElementById("lpLightbox");if(box&&box.style.display==="flex"){var dx=e.changedTouches[0].clientX-lpTouchX;if(Math.abs(dx)>40)lbNav(dx<0?1:-1);}},{passive:true});'
     +'function initPhotoReorder(){Array.prototype.slice.call(document.querySelectorAll(".lp-photostrip")).forEach(function(s){setupStrip(s);});}'
+    +'function bulkPick(cb){if(cb.checked){var same=document.querySelectorAll(".bulkSel[value=\\""+cb.value+"\\"]");Array.prototype.forEach.call(same,function(o){if(o!==cb)o.checked=false;});}updateBulkCount();}'
+    +'function toggleChecker(pl,sku){var p=document.getElementById("cpanel_"+pl+"_"+sku);if(!p)return;p.style.display=(p.style.display==="none"||!p.style.display)?"block":"none";}'
+    +'function editTitlePipe(span){if(span.dataset.editing)return;span.dataset.editing="1";var sku=span.getAttribute("data-sku");var pl=span.getAttribute("data-pipeline");var cur=span.getAttribute("data-raw")||span.textContent.replace(/^LOT OF \\d+:\\s*/,"");var inp=document.createElement("input");inp.type="text";inp.value=cur;inp.style.cssText="width:100%;box-sizing:border-box;padding:3px 5px;border:1px solid #1565c0;border-radius:3px;font-size:14px;color:#222;";span.textContent="";span.appendChild(inp);inp.focus();inp.select();var done=false;function save(){if(done)return;done=true;var nv=inp.value;fetch("/api/listings/"+sku,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({title:nv,pipeline:pl})}).then(function(r){return r.json();}).then(function(d){span.removeAttribute("data-editing");if(d&&d.success){span.setAttribute("data-raw",nv);span.textContent=(nv);var ta=document.getElementById("t_"+pl+"_"+sku);if(ta)ta.value=nv;flashTick(span,true);}else{span.textContent=cur;flashTick(span,false);}}).catch(function(){span.removeAttribute("data-editing");span.textContent=cur;flashTick(span,false);});}inp.addEventListener("blur",save);inp.addEventListener("keydown",function(e){if(e.key==="Enter"){e.preventDefault();inp.blur();}else if(e.key==="Escape"){done=true;span.removeAttribute("data-editing");span.textContent=cur;}});}'
+    +'function editSuggestPipe(span){if(!span||span.dataset.editing)return;span.dataset.editing="1";var sku=span.getAttribute("data-sku");var pl=span.getAttribute("data-pipeline");var cur=parseFloat(span.textContent)||0;var inp=document.createElement("input");inp.type="number";inp.min="0";inp.step="0.01";inp.value=cur;inp.style.cssText="width:80px;padding:2px 4px;border:1px solid #1565c0;border-radius:3px;font-size:12.5px;";span.textContent="";span.appendChild(inp);inp.focus();inp.select();var done=false;function save(){if(done)return;done=true;var nv=parseFloat(inp.value);var msg=document.getElementById("sugmsg_"+pl+"_"+sku);if(isNaN(nv)||nv<=0){span.textContent=cur;span.removeAttribute("data-editing");if(msg){msg.style.color="#c62828";msg.textContent="invalid";}return;}fetch("/api/listings/"+sku,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({suggest_price:nv,pipeline:pl})}).then(function(r){return r.json();}).then(function(d){if(d&&d.success){span.textContent=nv;if(msg){msg.style.color="#2e7d32";msg.textContent="\\u2713";setTimeout(function(){msg.textContent="";},1500);}}else{span.textContent=cur;if(msg){msg.style.color="#c62828";msg.textContent=(d&&d.error)||"failed";}}span.removeAttribute("data-editing");}).catch(function(){span.textContent=cur;span.removeAttribute("data-editing");if(msg){msg.style.color="#c62828";msg.textContent="error";}});}inp.addEventListener("blur",save);inp.addEventListener("keydown",function(e){if(e.key==="Enter"){e.preventDefault();inp.blur();}else if(e.key==="Escape"){done=true;span.textContent=cur;span.removeAttribute("data-editing");}});}'
+    +'function toggleRegenPipe(sku,pl){var pa=document.getElementById("regpanel_"+pl+"_"+sku);if(!pa)return;var show=(pa.style.display==="none"||!pa.style.display);pa.style.display=show?"block":"none";if(show){var t=document.getElementById("regnotes_"+pl+"_"+sku);if(t)t.focus();}}'
+    +'function cancelRegenPipe(sku,pl){var pa=document.getElementById("regpanel_"+pl+"_"+sku);if(pa)pa.style.display="none";var m=document.getElementById("regmsg_"+pl+"_"+sku);if(m)m.textContent="";}'
+    +'function applyRegenPipe(sku,pl,d){var tt=document.getElementById("t_"+pl+"_"+sku);if(tt&&d.title!=null)tt.value=d.title;var cc=document.getElementById("c_"+pl+"_"+sku);if(cc&&d.condition_box!=null)cc.value=d.condition_box;var hh=document.getElementById("h_"+pl+"_"+sku);if(hh&&d.description_html!=null)hh.value=d.description_html;var ts=document.getElementById("title_"+pl+"_"+sku);if(ts&&d.title!=null){ts.setAttribute("data-raw",d.title);ts.textContent=d.title;}var sg=document.getElementById("sug_"+pl+"_"+sku);if(sg&&d.suggested_price!=null)sg.textContent=d.suggested_price;}'
+    +'function doRegenPipe(sku,pl){var inp=document.getElementById("regnotes_"+pl+"_"+sku);var notes=inp?inp.value:"";var st=document.getElementById("regmsg_"+pl+"_"+sku);var btn=document.getElementById("regbtn_"+pl+"_"+sku);if(st){st.style.color="#8d6e00";st.textContent="Regenerating...";}if(btn){btn.disabled=true;btn.innerHTML="Regenerating...";}fetch("/api/regenerate-listing/"+sku,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({notes:notes,pipeline:pl})}).then(function(r){return r.json();}).then(function(d){if(btn){btn.disabled=false;btn.innerHTML="&#8634; Regenerate";}if(d&&d.success){applyRegenPipe(sku,pl,d);if(st){st.style.color="#2e7d32";st.textContent="Updated \\u2713 (reloading)";}setTimeout(function(){location.reload();},1200);}else{if(st){st.style.color="#c62828";st.textContent=(d&&d.error)||"Failed";}}}).catch(function(){if(btn){btn.disabled=false;btn.innerHTML="&#8634; Regenerate";}if(st){st.style.color="#c62828";st.textContent="Network error";}});}'
+    +'function listEbayPipe(sku,pl){var b=document.getElementById("ebtn_"+pl+"_"+sku);if(b){b.textContent="Listing...";b.disabled=true;}fetch("/api/listings/supersede/"+sku+"/"+pl,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({listed_pipeline:pl})}).then(function(r){return r.json();}).then(function(sd){if(!sd||!sd.success){if(b){b.textContent="Retry";b.disabled=false;}alert("Could not set listing: "+((sd&&sd.error)||"unknown"));return;}return fetch("/api/send-to-ebay",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sku:parseInt(sku,10)})}).then(function(r){return r.json();}).then(function(d){if(d&&d.success){markListedPipe(sku,pl,d.listing_url);}else{if(b){b.textContent="Retry";b.disabled=false;}alert("eBay: "+((d&&d.error)||"failed"));}});}).catch(function(){if(b){b.textContent="Retry";b.disabled=false;}alert("Network error contacting server.");});}'
+    +'function markListedPipe(sku,pl,url){var other=pl==="gemini"?"sonnet":"gemini";var b=document.getElementById("ebtn_"+pl+"_"+sku);if(b){var a=document.createElement("a");a.href=url||"#";a.target="_blank";a.textContent="Listed \\u2713";a.style.cssText="padding:8px 16px;border-radius:4px;font-size:13px;font-weight:bold;background:#2e7d32;color:#fff;text-decoration:none;";if(b.parentNode)b.parentNode.replaceChild(a,b);}var ov=document.getElementById("superseded_"+other+"_"+sku);if(ov)ov.style.display="flex";var ob=document.getElementById("ebtn_"+other+"_"+sku);if(ob){ob.disabled=true;ob.textContent="Superseded";ob.style.background="#9e9e9e";ob.style.opacity="0.6";ob.style.cursor="not-allowed";ob.onclick=null;}var cbs=document.querySelectorAll(".bulkSel[value=\\""+sku+"\\"]");Array.prototype.forEach.call(cbs,function(cb){if(cb.parentNode)cb.parentNode.removeChild(cb);});updateBulkCount();}'
     +'setInterval(loadQueue,10000);loadQueue();updateBulkCount();initPhotoReorder();'
     +'<\/script>'
     +'</head><body>'
