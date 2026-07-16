@@ -430,6 +430,93 @@ test('send-to-ebay leaf-validates known', has('validateLeafCategory(knownCat'));
 test('Non-leaf structured error',         has('needs_category_review: true') && has('is not a leaf category and cannot be listed in'));
 test('Route returns needs_category_review', has('info.blocked') && has('needs_category_review:true'));
 
+section('HUMAN GROUND TRUTH — presence');
+test('human_facts captured on record',      has('human_facts: buildHumanFacts(meta, visionData)'));
+test('buildHumanFacts single source',       has('function buildHumanFacts('));
+test('shared human-facts prompt block',     has('function humanFactsPromptBlock('));
+test('spec allowlist helper',               has('function isAllowlistedSpecField('));
+test('protected-fact helper',               has('function isProtectedFactField('));
+test('human-note conflict helper',          has('function claimStatedByHuman('));
+test('description-rewrite blocker',         has('function isDescriptionRewrite('));
+test('surgical patch enforcer',             has('function applySurgicalCorrections('));
+test('deterministic quantity guard',        has('function enforceQuantityGuard('));
+test('guard revert log line',               has('[GUARD] SKU'));
+test('verifier takes humanFacts',           has('function verifySpecs(sku, listing, pipeline, humanFacts, callback)'));
+test('checker takes humanFacts',            has('function checkListing(sku, listing, photos, pipeline, humanFacts, callback)'));
+test('checker conflict array',              has('"conflicts": [') && has('human-fact conflict'));
+test('verifier surgical contract',          has('NEVER return a rewritten description'));
+test('web search stays openrouter:web_search', has("'openrouter:web_search'"));
+test('scale is_scale_photo OCR field',      has('is_scale_photo'));
+test('resolveScalePhoto helper',            has('function resolveScalePhoto('));
+test('no_scale_detected flag',              has('no_scale_detected'));
+test('scale manual toggle route',           has('/scale-toggle') && has('function toggleScalePhoto('));
+test('no-scale warning on page',            has('No scale photo detected'));
+test('conflict flag on badge',              has('Conflict') && has('&#128681;'));
+test('discrete lot qty field (processor)',  has('identLotQty'));
+
+section('HUMAN GROUND TRUTH — enforcement (functional)');
+(function(){
+  function extractFn(name){
+    var s = content.indexOf('function ' + name + '(');
+    if(s < 0) return '';
+    var d = 0, seen = false, e = -1;
+    for(var i = s; i < content.length; i++){ var c = content[i]; if(c === '{'){ d++; seen = true; } else if(c === '}'){ d--; if(seen && d === 0){ e = i + 1; break; } } }
+    return content.slice(s, e);
+  }
+  function withLogs(fn){ var logs = []; var o = console.log; console.log = function(){ logs.push(Array.prototype.slice.call(arguments).join(' ')); }; try { fn(); } finally { console.log = o; } return logs; }
+  try {
+    var code = '';
+    ['isAllowlistedSpecField','isProtectedFactField','claimStatedByHuman','isDescriptionRewrite','applySurgicalCorrections','enforceQuantityGuard','resolveScalePhoto','buildHumanFacts'].forEach(function(n){ code += extractFn(n) + '\n'; });
+    var fns = {};
+    eval(code + '\nfns.apply=applySurgicalCorrections;fns.guard=enforceQuantityGuard;fns.scale=resolveScalePhoto;fns.hf=buildHumanFacts;');
+
+    // single source: brand/model/qty/notes all land on ONE object
+    var hf = fns.hf({ quantity:5, notes:'no power cord included', test_notes:'powers on', identified_item:{ brand:'Cisco', model:'SG300-28' } }, {});
+    test('buildHumanFacts captures qty+notes+identity', hf.lot_quantity === 5 && /no power cord/.test(hf.additional_notes) && hf.brand === 'Cisco');
+
+    // GUARD — wrong quantity reverted in field + title + item specifics, with a proof log line
+    var lst1 = { title:'Lot of 1 Cisco SG300-28 Switch', lot_quantity:1, item_specifics:{ 'Number of Items':'1' } };
+    var glogs = withLogs(function(){ fns.guard('9001', lst1, { lot_quantity:5 }); });
+    test('GUARD reverts qty in field+title+specifics', lst1.lot_quantity === 5 && /Lot of 5/.test(lst1.title) && lst1.item_specifics['Number of Items'] === '5');
+    test('GUARD emits [GUARD] revert log', glogs.some(function(l){ return /\[GUARD\] SKU 9001 reverted quantity 1 /.test(l); }));
+    console.log('    ↳ GUARD logs: ' + glogs.filter(function(l){ return /\[GUARD\]/.test(l); }).join('  |  '));
+
+    // ALLOWLIST — a full description rewrite is rejected in code (not applied), with proof log
+    var lst2 = { title:'Printer', description_html:'<p>orig</p>', item_specifics:{} };
+    var rlogs = withLogs(function(){ fns.apply('9002', lst2, [{ field:'description_html', old:'<p>orig</p>', new:'<p>a brand new description that also claims a power cord is included plus lots of extra prose text</p>' }], {}, 'SPEC'); });
+    test('ALLOWLIST rejects full description rewrite (no mutation)', lst2.description_html === '<p>orig</p>' && rlogs.some(function(l){ return /REJECTED.*description/i.test(l); }));
+    console.log('    ↳ REJECT logs: ' + rlogs.filter(function(l){ return /REJECTED/.test(l); }).join('  |  '));
+
+    // PROTECTED — quantity + includes patches refused, listing untouched
+    var lst3 = { title:'Lot of 5 Widgets', item_specifics:{ 'Lot Quantity':'5', 'Includes':'unit only' } };
+    var plogs = withLogs(function(){ fns.apply('9003', lst3, [{ field:'Lot Quantity', old:'5', new:'3' }, { field:'Includes', old:'unit only', new:'unit + power cord' }], {}, 'CHECKER'); });
+    test('PROTECTED fields (quantity, includes) not patched', lst3.item_specifics['Lot Quantity'] === '5' && lst3.item_specifics['Includes'] === 'unit only');
+    test('PROTECTED patches both logged as rejected', plogs.filter(function(l){ return /REJECTED/.test(l); }).length === 2);
+    console.log('    ↳ PROTECTED logs: ' + plogs.filter(function(l){ return /REJECTED/.test(l); }).join('  |  '));
+
+    // HUMAN NOTE — "no power cord included" note blocks a contradicting cord claim (conflict path)
+    var lst4 = { title:'Widget', description_html:'no power cord included', item_specifics:{} };
+    var hlogs = withLogs(function(){ fns.apply('9004', lst4, [{ field:'Connectivity', old:'no power cord included', new:'includes power cord' }], { additional_notes:'no power cord included' }, 'CHECKER'); });
+    test('Human-stated note blocks contradicting patch', /no power cord included/.test(lst4.description_html) && hlogs.some(function(l){ return /REJECTED.*human-stated/i.test(l); }));
+
+    // ALLOWLISTED spec DOES get corrected surgically (positive control)
+    var lst5 = { title:'Laptop 4GB RAM', item_specifics:{ 'RAM':'4GB' } };
+    fns.apply('9005', lst5, [{ field:'RAM', old:'4GB', new:'8GB' }], {}, 'SPEC');
+    test('Allowlisted spec (RAM) corrected surgically', lst5.item_specifics['RAM'] === '8GB' && /8GB/.test(lst5.title));
+
+    // SCALE — is_scale_photo false keeps the photo; default/undefined keeps rule 21 behavior
+    var sT = fns.scale(6, true), sF = fns.scale(6, false), sU = fns.scale(6, undefined);
+    test('scale detected -> last photo excluded', sT.weightPhotoIndex === 6 && sT.no_scale_detected === false);
+    test('is_scale_photo=false -> photo KEPT + flagged', sF.weightPhotoIndex === null && sF.no_scale_detected === true);
+    test('is_scale_photo undefined -> rule 21 default', sU.weightPhotoIndex === 6 && sU.no_scale_detected === false);
+
+    // GRACEFUL — malformed input never throws, listing survives (both layers never block)
+    var lst6 = { title:'X', item_specifics:{} }, survived = true;
+    try { fns.apply('9006', lst6, null, {}, 'SPEC'); fns.apply('9006', lst6, [null, {}, { field:'RAM' }], {}, 'SPEC'); fns.guard('9006', lst6, {}); } catch(e){ survived = false; }
+    test('Enforcement never throws on malformed input', survived && lst6.title === 'X');
+  } catch(e){ test('human-facts enforcement functional eval', false); console.log('    ERROR:', e.message); }
+})();
+
 section('SYNTAX CHECK');
 try {
   require('child_process').execSync('node --check ' + serverFile, {stdio:'pipe'});
