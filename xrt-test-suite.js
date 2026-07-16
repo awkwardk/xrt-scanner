@@ -517,6 +517,74 @@ section('HUMAN GROUND TRUTH — enforcement (functional)');
   } catch(e){ test('human-facts enforcement functional eval', false); console.log('    ERROR:', e.message); }
 })();
 
+section('OMISSION DEFENSE — presence');
+test('omission guard (restore missing notes)', has('function enforceNoteOmissionGuard('));
+test('note-text conflict detector',            has('function detectNoteTextConflicts('));
+test('negated-object extractor',               has('function extractNegatedObjects('));
+test('negation clause detector',               has('function isNegationClause('));
+test('shared deterministic guard entry',       has('function applyHumanFactGuards('));
+test('omission restore log line',              has('restored omitted human note'));
+test('guards run in pipeline',                 has('chk = applyHumanFactGuards(sku, record.listing, hf, chk)'));
+test('lot qty field empty default (dirty/null)', has("placeholder='1'") && !has("step='1' value='1'"));
+
+section('OMISSION DEFENSE — presence check (functional)');
+(function(){
+  function extractFn(name){
+    var s = content.indexOf('function ' + name + '(');
+    if(s < 0) return '';
+    var d = 0, seen = false, e = -1;
+    for(var i = s; i < content.length; i++){ var c = content[i]; if(c === '{'){ d++; seen = true; } else if(c === '}'){ d--; if(seen && d === 0){ e = i + 1; break; } } }
+    return content.slice(s, e);
+  }
+  function withLogs(fn){ var logs = []; var o = console.log; console.log = function(){ logs.push(Array.prototype.slice.call(arguments).join(' ')); }; try { fn(); } finally { console.log = o; } return logs; }
+  try {
+    var code = '';
+    ['isAllowlistedSpecField','isProtectedFactField','claimStatedByHuman','isDescriptionRewrite','applySurgicalCorrections','enforceQuantityGuard','_normText','splitNoteClauses','isNegationClause','clauseRepresented','enforceNoteOmissionGuard','extractNegatedObjects','detectNoteTextConflicts','applyHumanFactGuards'].forEach(function(n){ code += extractFn(n) + '\n'; });
+    var fns = {};
+    eval(code + '\nfns.apply=applySurgicalCorrections;fns.omit=enforceNoteOmissionGuard;fns.textConf=detectNoteTextConflicts;fns.guards=applyHumanFactGuards;fns.guard=enforceQuantityGuard;');
+    var HF = { testing_notes:'', additional_notes:'no power cord included' };
+
+    // (i) a layer patch that DELETES the human note is rejected (all three shapes)
+    var d1 = { title:'X', description_html:'Unit powers on. No power cord included.', item_specifics:{} };
+    var r1a = withLogs(function(){ fns.apply('i1', d1, [{ field:'description_html', old:'No power cord included.', new:'Unit powers on.' }], HF, 'CHECKER'); });
+    var r1b = withLogs(function(){ fns.apply('i1', d1, [{ field:'Notes', old:'No power cord included.', new:'' }], HF, 'CHECKER'); });
+    var r1c = withLogs(function(){ fns.apply('i1', d1, [{ field:'Connectivity', old:'no power cord included', new:'includes power cord' }], HF, 'CHECKER'); });
+    test('(i) deletion via description-rewrite rejected', /No power cord included\./.test(d1.description_html) && r1a.some(function(l){ return /REJECTED/.test(l); }));
+    test('(i) deletion via empty value rejected', r1b.some(function(l){ return /REJECTED.*empty/.test(l); }));
+    test('(i) note inversion via allowlisted field rejected', r1c.some(function(l){ return /REJECTED.*human-stated/.test(l); }) && /No power cord included\./.test(d1.description_html));
+    console.log('    ↳ DELETION-attempt logs: ' + [].concat(r1a, r1b, r1c).filter(function(l){ return /REJECTED/.test(l); }).join('  |  '));
+
+    // (ii) if a stripped note somehow lands, the omission guard restores it + logs
+    var d2 = { description_html:'<p>Cisco switch, powers on and boots.</p>', item_specifics:{} };
+    var r2 = withLogs(function(){ fns.omit('i2', d2, HF); });
+    test('(ii) omission guard restores stripped note', /no power cord included/i.test(d2.description_html));
+    test('(ii) omission guard logs the restore', r2.some(function(l){ return /\[GUARD\] SKU i2 restored omitted human note: "no power cord included"/.test(l); }));
+    console.log('    ↳ OMISSION log: ' + r2.filter(function(l){ return /restored omitted/.test(l); }).join('  |  '));
+    var d2b = { description_html:'<p>Powers on. No power cord included.</p>', item_specifics:{} };
+    var r2b = withLogs(function(){ fns.omit('i2b', d2b, HF); });
+    test('(ii) already-present negation not re-restored', r2b.filter(function(l){ return /restored/.test(l); }).length === 0);
+
+    // (iii) negation survives the full pipeline: checker tries to invert (rejected), guards keep it
+    var d3 = { title:'Cisco switch', description_html:'<p>Powers on. No power cord included.</p>', item_specifics:{}, lot_quantity:1 };
+    withLogs(function(){ fns.apply('i3', d3, [{ field:'Connectivity', old:'no power cord included', new:'power cord included' }], HF, 'CHECKER'); });
+    fns.guards('i3', d3, HF, { verdict:'PASS' });
+    test('(iii) negation survives pipeline (present + not inverted)', /no power cord included/i.test(d3.description_html) && fns.textConf(d3, HF).length === 0);
+
+    // (2c) generator hallucination: text asserts the cord, note says none, NO photo conflict -> flagged
+    var d4 = { title:'Cisco switch with power cord', description_html:'<p>Includes power cord and rack ears.</p>', item_specifics:{ 'Connectivity':'RJ45' } };
+    var conf = fns.textConf(d4, HF);
+    test('(2c) listing-text conflict detected without any photo', conf.length >= 1 && /power cord/.test(conf[0].human_fact));
+    console.log('    ↳ TEXT-CONFLICT: ' + (conf[0] ? conf[0].note : '(none)'));
+    var d5 = { title:'Cisco switch', description_html:'<p>No power cord included.</p>', item_specifics:{} };
+    test('(2c) honored negation not falsely flagged', fns.textConf(d5, HF).length === 0);
+
+    // (follow-up 1) explicit lot quantity of 1 is enforced against a layer that set 5
+    var d6 = { title:'Lot of 5 Widgets', lot_quantity:5, item_specifics:{ 'Number of Items':'5' } };
+    var r6 = withLogs(function(){ fns.guard('i6', d6, { lot_quantity:1 }); });
+    test('(1) explicit qty 1 survives a layer changing it to 5', d6.lot_quantity === 1 && /Lot of 1/.test(d6.title) && d6.item_specifics['Number of Items'] === '1' && r6.some(function(l){ return /reverted quantity 5 /.test(l); }));
+  } catch(e){ test('omission defense functional eval', false); console.log('    ERROR:', e.message); }
+})();
+
 section('SYNTAX CHECK');
 try {
   require('child_process').execSync('node --check ' + serverFile, {stdio:'pipe'});
