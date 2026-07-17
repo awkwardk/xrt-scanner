@@ -3669,25 +3669,39 @@ function isAllowlistedSpecField(field){
 function isProtectedFactField(field){
   var f = String(field == null ? '' : field).toLowerCase().replace(/[_\s]+/g, ' ').trim();
   if(!f) return true; // no field name -> refuse (fail closed)
+  // CATEGORICAL field-name protection only (quantity, inclusions, condition, test-status, identity).
+  // No item-specific accessory vocabulary — specific accessory claims are protected note-derived via
+  // claimStatedByHuman, and any non-spec field is already rejected by the allowlist backstop.
   var protect = ['lot quantity','lot qty','quantity','qty','lot','number of items','number of units','units','unit count','pieces','count',
     'includes','included','included items','accessory','accessories','bundle','what is included','in the box','box contents',
     'condition','grade','item condition','cosmetic condition','condition notes',
     'test','tested','test result','test results','power test','powers on','working','functional','functionality','working status',
-    'power cord','power cable','power adapter','power supply','ac adapter','charger','cord','cable included',
     'brand','model','mpn','manufacturer'];
   return protect.some(function(p){ return f === p || f.indexOf(p) >= 0 || p.indexOf(f) >= 0; });
 }
 
-// True if a value the layer wants to change overlaps a claim the human physically wrote in a note.
+// True if a value the layer wants to change/insert overlaps a claim the human physically wrote.
+// The NOTE TEXT ITSELF defines what is protected — there is NO fixed vocabulary (rule 38, item-type
+// agnostic). Whatever the human wrote defines the protected claim, so it works the same for consumer
+// electronics, printers, scanners, lab analyzers, or networking gear — the words come from the note,
+// not from a hardcoded list that silently rots as the inventory mix changes.
 function claimStatedByHuman(value, humanFacts){
-  var v = String(value == null ? '' : value).toLowerCase().replace(/[^a-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim();
+  var v = _normText(value);
   if(!v || v.length < 3) return false;
   humanFacts = humanFacts || {};
-  var notes = [humanFacts.testing_notes, humanFacts.additional_notes].filter(Boolean).join(' ').toLowerCase();
+  var notes = [humanFacts.testing_notes, humanFacts.additional_notes].filter(Boolean).join(' | ');
   if(!notes) return false;
-  var keyPhrases = ['power cord','power cable','power adapter','power supply','ac adapter','charger','cord','cable',
-    'remote','battery','batteries','stylus','manual','box','accessory','accessories','included','not included','missing','no '];
-  for(var i = 0; i < keyPhrases.length; i++){ var kp = keyPhrases[i].trim(); if(kp && v.indexOf(kp) >= 0 && notes.indexOf(kp) >= 0) return true; }
+  var stop = { the:1, and:1, with:1, for:1, are:1, has:1, have:1, this:1, that:1, its:1, but:1, all:1, new:1, used:1,
+    not:1, any:1, was:1, were:1, them:1, they:1, you:1, your:1, from:1, into:1, only:1, some:1 };
+  var clauses = splitNoteClauses(notes);
+  for(var i = 0; i < clauses.length; i++){
+    var cTokens = _normText(clauses[i]).split(' ').filter(function(t){ return t.length > 2 && !stop[t]; });
+    if(!cTokens.length) continue;
+    var overlap = cTokens.filter(function(t){ return v.indexOf(t) >= 0; });
+    // The layer is touching a human-stated claim if it shares the clause's distinctive content:
+    // >= 2 shared content tokens, or every content token of a short clause.
+    if(overlap.length >= 2 || overlap.length === cTokens.length) return true;
+  }
   return false;
 }
 
@@ -3795,26 +3809,37 @@ function clauseRepresented(clause, descText, isNeg){
   if(!toks.length) return true;
   return toks.every(function(t){ return d.indexOf(t) >= 0; });
 }
-// Deterministic OMISSION GUARD: restore any human note clause missing from the final description.
+// Deterministic OMISSION GUARD, split by severity:
+//  - NEGATIONS (defect class): a stripped/inverted negation is an item-not-as-described case, so it
+//    is RESTORED hard (exact-phrase) and appended as a "Seller notes" list at the end.
+//  - POSITIVES (judgment class): a missing positive note is only FLAGGED (🚩 conflict), never
+//    appended — that kills the noise while still surfacing a genuinely stripped positive to judge.
+// Returns { restored:[...], conflicts:[...] }. Mutates `listing.description_html` only for negations.
 function enforceNoteOmissionGuard(sku, listing, humanFacts){
-  if(!listing || !humanFacts) return listing;
+  var out = { restored: [], conflicts: [] };
+  if(!listing || !humanFacts) return out;
   var notes = [humanFacts.testing_notes, humanFacts.additional_notes].filter(Boolean);
-  if(!notes.length) return listing;
+  if(!notes.length) return out;
   var descText = String(listing.description_html || '').replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g, ' ');
-  var restored = [];
   notes.forEach(function(note){
     splitNoteClauses(note).forEach(function(clause){
-      if(!clauseRepresented(clause, descText, isNegationClause(clause))){
-        restored.push(clause);
+      var neg = isNegationClause(clause);
+      if(clauseRepresented(clause, descText, neg)) return;
+      if(neg){
+        out.restored.push(clause);
         console.log('[GUARD] SKU ' + sku + ' restored omitted human note: "' + clause + '"');
+      } else {
+        out.conflicts.push({ human_fact: clause, photo_shows: 'not represented in the listing description',
+          note: 'Human note "' + clause + '" is not represented in the description — verify before listing.' });
+        console.log('[GUARD] SKU ' + sku + ' flagged omitted positive note: "' + clause + '"');
       }
     });
   });
-  if(restored.length){
-    var items = restored.map(function(c){ return '<li>' + String(c).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</li>'; }).join('');
+  if(out.restored.length){
+    var items = out.restored.map(function(c){ return '<li>' + String(c).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</li>'; }).join('');
     listing.description_html = String(listing.description_html || '') + '<p><strong>Seller notes:</strong></p><ul>' + items + '</ul>';
   }
-  return listing;
+  return out;
 }
 // Strip negation words to get the negated OBJECT phrase ("no power cord included" -> "power cord").
 function extractNegatedObjects(text){
@@ -3858,14 +3883,17 @@ function detectNoteTextConflicts(listing, humanFacts){
 //   1) quantity guard  2) listing-text conflict flag (before restore)  3) omission/restore guard.
 function applyHumanFactGuards(sku, listing, humanFacts, chk){
   enforceQuantityGuard(sku, listing, humanFacts);
+  // Flag listing-text hallucinations BEFORE restoring negations (restoration would mask them).
   var tc = detectNoteTextConflicts(listing, humanFacts);
-  if(tc.length){
+  // Restore omitted negations (hard) and collect omitted-positive flags (judgment).
+  var om = enforceNoteOmissionGuard(sku, listing, humanFacts);
+  var allConf = tc.concat((om && om.conflicts) || []);
+  if(allConf.length){
     chk = chk || { verdict:'WARN' };
-    chk.conflicts = (Array.isArray(chk.conflicts) ? chk.conflicts : []).concat(tc);
+    chk.conflicts = (Array.isArray(chk.conflicts) ? chk.conflicts : []).concat(allConf);
     if(!chk.verdict || chk.verdict === 'PASS' || chk.verdict === 'UNKNOWN') chk.verdict = 'WARN';
-    console.log('[GUARD] SKU ' + sku + ' ' + tc.length + ' listing-text conflict(s) with human notes');
+    console.log('[GUARD] SKU ' + sku + ' ' + allConf.length + ' listing conflict(s) with human notes');
   }
-  enforceNoteOmissionGuard(sku, listing, humanFacts);
   return chk;
 }
 

@@ -466,7 +466,7 @@ section('HUMAN GROUND TRUTH — enforcement (functional)');
   function withLogs(fn){ var logs = []; var o = console.log; console.log = function(){ logs.push(Array.prototype.slice.call(arguments).join(' ')); }; try { fn(); } finally { console.log = o; } return logs; }
   try {
     var code = '';
-    ['isAllowlistedSpecField','isProtectedFactField','claimStatedByHuman','isDescriptionRewrite','applySurgicalCorrections','enforceQuantityGuard','resolveScalePhoto','buildHumanFacts'].forEach(function(n){ code += extractFn(n) + '\n'; });
+    ['_normText','splitNoteClauses','isNegationClause','isAllowlistedSpecField','isProtectedFactField','claimStatedByHuman','isDescriptionRewrite','applySurgicalCorrections','enforceQuantityGuard','resolveScalePhoto','buildHumanFacts'].forEach(function(n){ code += extractFn(n) + '\n'; });
     var fns = {};
     eval(code + '\nfns.apply=applySurgicalCorrections;fns.guard=enforceQuantityGuard;fns.scale=resolveScalePhoto;fns.hf=buildHumanFacts;');
 
@@ -499,6 +499,14 @@ section('HUMAN GROUND TRUTH — enforcement (functional)');
     var hlogs = withLogs(function(){ fns.apply('9004', lst4, [{ field:'Connectivity', old:'no power cord included', new:'includes power cord' }], { additional_notes:'no power cord included' }, 'CHECKER'); });
     test('Human-stated note blocks contradicting patch', /no power cord included/.test(lst4.description_html) && hlogs.some(function(l){ return /REJECTED.*human-stated/i.test(l); }));
 
+    // NOTE-DERIVED protection (rule 38): a NON-electronics note protects its OWN claim with no
+    // vocabulary — the words come from the note, not from a hardcoded list. "roller"/"worn" appear
+    // nowhere in server.js yet a patch touching that claim is still rejected.
+    var lstR = { title:'Zebra ZM400 label printer', description_html:'<p>Thermal transfer printer.</p>', item_specifics:{ 'Print Technology':'thermal' } };
+    var rlogsR = withLogs(function(){ fns.apply('9007', lstR, [{ field:'Print Technology', old:'roller worn', new:'roller replaced' }], { additional_notes:'roller worn, needs replacement' }, 'CHECKER'); });
+    test('Note-derived protection blocks a non-electronics note (roller worn)', rlogsR.some(function(l){ return /REJECTED.*human-stated/i.test(l); }) && lstR.item_specifics['Print Technology'] === 'thermal');
+    console.log('    ↳ ROLLER-note reject: ' + rlogsR.filter(function(l){ return /REJECTED/.test(l); }).join('  |  ') + '  [\"roller\" in server.js? ' + (content.indexOf('roller') >= 0) + ']');
+
     // ALLOWLISTED spec DOES get corrected surgically (positive control)
     var lst5 = { title:'Laptop 4GB RAM', item_specifics:{ 'RAM':'4GB' } };
     fns.apply('9005', lst5, [{ field:'RAM', old:'4GB', new:'8GB' }], {}, 'SPEC');
@@ -523,6 +531,8 @@ test('note-text conflict detector',            has('function detectNoteTextConfl
 test('negated-object extractor',               has('function extractNegatedObjects('));
 test('negation clause detector',               has('function isNegationClause('));
 test('shared deterministic guard entry',       has('function applyHumanFactGuards('));
+test('claimStatedByHuman is note-derived (no vocab)', !has('keyPhrases') && !has('roller worn'));
+test('positive omission flagged not appended', has('flagged omitted positive note'));
 test('omission restore log line',              has('restored omitted human note'));
 test('guards run in pipeline',                 has('chk = applyHumanFactGuards(sku, record.listing, hf, chk)'));
 test('lot qty field empty default (dirty/null)', has("placeholder='1'") && !has("step='1' value='1'"));
@@ -563,6 +573,16 @@ section('OMISSION DEFENSE — presence check (functional)');
     var d2b = { description_html:'<p>Powers on. No power cord included.</p>', item_specifics:{} };
     var r2b = withLogs(function(){ fns.omit('i2b', d2b, HF); });
     test('(ii) already-present negation not re-restored', r2b.filter(function(l){ return /restored/.test(l); }).length === 0);
+
+    // (2 split) POSITIVE omission -> FLAGGED (conflict), NOT appended (kills the noise)
+    var d7 = { description_html:'<p>Cisco switch, clean cosmetics.</p>', item_specifics:{} };
+    var om7, r7 = withLogs(function(){ om7 = fns.omit('i7', d7, { testing_notes:'powers on and passes self test', additional_notes:'' }); });
+    test('(2) positive omission flagged, not appended', om7.conflicts.length >= 1 && om7.restored.length === 0 && !/Seller notes/.test(d7.description_html) && r7.some(function(l){ return /flagged omitted positive note/.test(l); }));
+    console.log('    ↳ POSITIVE-FLAG: ' + (om7.conflicts[0] ? om7.conflicts[0].note : '(none)'));
+    // (2 split) NEGATION still hard-restored + appended, in the same guard
+    var d8 = { description_html:'<p>Powers fine.</p>', item_specifics:{} };
+    var om8 = fns.omit('i8', d8, { testing_notes:'', additional_notes:'no rack ears included' });
+    test('(2) negation still hard-restored (appended)', om8.restored.length === 1 && /no rack ears included/i.test(d8.description_html) && om8.conflicts.length === 0 && /Seller notes/.test(d8.description_html));
 
     // (iii) negation survives the full pipeline: checker tries to invert (rejected), guards keep it
     var d3 = { title:'Cisco switch', description_html:'<p>Powers on. No power cord included.</p>', item_specifics:{}, lot_quantity:1 };
