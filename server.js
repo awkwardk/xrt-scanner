@@ -4799,8 +4799,13 @@ function processItem(item, callback) {
 
   // Step 0: detect weight + dimensions from the last photo, then identify + write listing
   detectWeightAndDims(scalePhotoB64, function(winfo){
+    // MIGRATION GATE: a reading the misread detector flagged (lbs=0 with oz>32, or oz>15 with lbs>0)
+    // is NOT allowed to set a shipping tier on its own. It is surfaced for manual confirmation on the
+    // listings page instead — the raw numbers are still shown, but the tier/policy stay unset so a bad
+    // OCR can never silently pick a shipping tier. Cleared as soon as the weight is confirmed/edited.
+    var _suspectRead = !!(winfo && winfo.scale_warning);
     // store weight natively as lbs/oz and run calculateShippingTier (never total oz)
-    if(winfo && winfo.lbs !== null && winfo.lbs !== undefined && (winfo.lbs > 0 || winfo.oz > 0)){
+    if(winfo && winfo.lbs !== null && winfo.lbs !== undefined && (winfo.lbs > 0 || winfo.oz > 0) && !_suspectRead){
       meta.dimensions = winfo.dimensions || null;
       var tier = calculateShippingTier(winfo.lbs, winfo.oz, sku);
       meta.weightLbs = tier.rawLbs;
@@ -4810,6 +4815,15 @@ function processItem(item, callback) {
       meta.shipping_tier = tier;
       meta.noWeightFlag = false;
       console.log('[WEIGHT] SKU ' + sku + ' scale reading: ' + tier.rawLbs + 'lb ' + tier.rawOz + 'oz (confidence: ' + (winfo.confidence || '?') + ')');
+    } else if(_suspectRead){
+      // Keep the raw numbers visible for the human check, but do not derive a tier from them.
+      meta.dimensions = (winfo && winfo.dimensions) ? winfo.dimensions : null;
+      meta.weightLbs = (winfo.lbs === null || winfo.lbs === undefined) ? null : winfo.lbs;
+      meta.weightOzPart = (winfo.oz === null || winfo.oz === undefined) ? null : winfo.oz;
+      meta.weight = null;
+      meta.shipping_tier = null;
+      meta.noWeightFlag = true;
+      console.log('[WEIGHT] SKU ' + sku + ' scale read looks wrong (' + winfo.lbs + 'lb ' + winfo.oz + 'oz) — tier NOT set, flagged for manual confirmation');
     } else {
       meta.dimensions = (winfo && winfo.dimensions) ? winfo.dimensions : null;
       meta.shipping_tier = null;
