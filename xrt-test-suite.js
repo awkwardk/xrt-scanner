@@ -672,6 +672,22 @@ test('unverifiable claims not flagged',        has('Silence is the correct respo
 test('confirmed identification stated',        has('CONFIRMED BY THE OPERATOR before generation'));
 test('old awareness-flag rule removed',        !has('verified by research, not visible in photos'));
 
+section('UNCONFIRMED SLOTS / BAYS / MODULES');
+// Generator: never guess at what is inside a slot or bay it cannot see into.
+test('generator rule present',                 has('EXPANSION SLOTS, BAYS, PORTS AND MODULAR AREAS — NEVER GUESS AT THE CONTENTS'));
+test('no negative characterisation',           has('"empty", "missing", "unpopulated", "vacant", "not included"'));
+test('no positive characterisation either',    has('Do NOT call it populated either'));
+test('no inferring counts from slot count',    has('Do NOT infer how many modules, interfaces or supplies are present'));
+test('seller notes are the only override',     has('The ONLY thing that overrides this is the seller notes'));
+test('neutral default wording specified',      has('See photos for full details of included components/modules.'));
+test('covers slots/bays/ports generally',      has('drive bays, power-supply bays, and any comparable modular area'));
+// Checker: ambiguous bay/slot presence is not a discrepancy.
+test('bay/slot population out of Checker scope', has('other modular area is POPULATED or EMPTY'));
+test('ambiguous bay is not evidence',            has('evidence of absence and not evidence of presence'));
+test('neutral wording marked correct',           has('is the CORRECT treatment, not a defect to fix'));
+test('human note is the only exception',         has('a human note above that directly states what is or is not installed'));
+test('guessing framed as the failure mode',      has('whether the guess is worded as a spec, as a missing part, or as a completeness/condition problem'));
+
 section('DESCRIPTION TEMPLATE LOCK');
 test('template block present',                 has('REQUIRED DESCRIPTION TEMPLATE — MANDATORY, EVERY ITEM, EVERY TIME'));
 test('Overview section required',              has('<h3>Overview</h3>'));
