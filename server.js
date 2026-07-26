@@ -1680,6 +1680,24 @@ const server = http.createServer(function(req, res) {
     parseBody(req, function(err, parsed){
       if(err || !parsed || !parsed.sku){ sendJSON(res,400,{success:false, error:'Bad request'}); return; }
       if(!ebayStatus().connected){ sendJSON(res,200,{success:false, error:'Connect eBay first'}); return; }
+      // ── PRE-PUBLISH GATE (server-side enforcement) ──
+      // The disabled button is a courtesy; THIS is the gate. Refuse to publish while the Checker has
+      // unresolved findings and the operator has not acknowledged them. Any read failure falls
+      // through to the normal path so the gate can never wedge publishing on a malformed record.
+      try {
+        var gRec = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'items', String(parsed.sku), 'listing.json'), 'utf8'));
+        var gState = checkerGateState(gRec && gRec.listing);
+        if(gState.blocked){
+          var gN = gState.issues.length, gC = gState.conflicts.length;
+          var gBits = [];
+          if(gN) gBits.push(gN + ' unresolved issue' + (gN === 1 ? '' : 's'));
+          if(gC) gBits.push(gC + ' human-fact conflict' + (gC === 1 ? '' : 's'));
+          console.log('[GATE] SKU ' + parsed.sku + ' publish BLOCKED — ' + (gBits.join(', ') || 'checker FLAG'));
+          sendJSON(res,200,{success:false, checker_blocked:true,
+            error:'Blocked by Checker: ' + (gBits.join(' and ') || 'flagged findings') + '. Apply a suggested fix or dismiss the findings before listing.'});
+          return;
+        }
+      } catch(e){}
       createEbayListing(parsed.sku, function(lErr, info){
         if(lErr){ sendJSON(res,200,{success:false, error:lErr.message}); return; }
         if(info && info.blocked){ sendJSON(res,200,{success:false, error:info.error, needs_category_review:true, category_id:info.category_id}); return; }
@@ -1822,6 +1840,84 @@ const server = http.createServer(function(req, res) {
       if(err || !parsed || !parsed.sku){ sendJSON(res,400,{success:false, error:'Bad request'}); return; }
       enqueueListing(parsed.sku); // clears the failed flag and re-queues
       sendJSON(res,200,{success:true, sku: Number(parsed.sku)});
+    });
+    return;
+  }
+
+  // ── PRE-PUBLISH GATE: acknowledge (dismiss) the Checker findings for a SKU ──
+  // Records WHO cleared the gate and HOW on listing.checker.acknowledged. Never deletes findings —
+  // the report stays on the record for audit; it only stops blocking publication.
+  if(req.method==='POST' && /^\/api\/listings\/checker-ack\/\d+$/.test(req.url.split('?')[0])){
+    var ackSku = req.url.split('?')[0].split('/').pop();
+    parseBody(req, function(aErr, aBody){
+      var action = (aBody && aBody.action === 'edited') ? 'edited' : 'dismissed';
+      var okRec = saveDualRecord(ackSku, function(rec){
+        rec.listing = rec.listing || {};
+        rec.listing.checker = rec.listing.checker || { verdict:'UNKNOWN' };
+        rec.listing.checker.acknowledged = { action: action, at: new Date().toISOString() };
+      });
+      if(!okRec){ sendJSON(res,404,{success:false, error:'Listing not found for SKU ' + ackSku}); return; }
+      try { loadListings(); } catch(e){}
+      console.log('[GATE] SKU ' + ackSku + ' checker findings ' + action + ' — listing unlocked');
+      sendJSON(res,200,{success:true, sku:Number(ackSku), action:action});
+    });
+    return;
+  }
+
+  // ── PRE-PUBLISH GATE: apply one Checker-suggested fix ──
+  // Surgical: replaces the issue's exact `old_text` wherever it appears (condition_box first, then
+  // description_html), or replaces condition_box wholesale for a condition-type issue with no
+  // old_text. Refuses anything that would overwrite a fact the operator physically wrote in their
+  // notes (same human-ground-truth contract the automated layers obey). Clears the gate once every
+  // issue is resolved and no human-fact conflicts remain.
+  if(req.method==='POST' && /^\/api\/listings\/apply-checker-fix\/\d+$/.test(req.url.split('?')[0])){
+    var fixSku = req.url.split('?')[0].split('/').pop();
+    parseBody(req, function(fErr, fBody){
+      var idx = parseInt(fBody && fBody.index, 10);
+      if(isNaN(idx) || idx < 0){ sendJSON(res,400,{success:false, error:'Bad issue index'}); return; }
+      var fixPath = path.join(DATA_DIR, 'items', String(fixSku), 'listing.json');
+      var fixRec = null;
+      try { fixRec = JSON.parse(fs.readFileSync(fixPath, 'utf8')); } catch(e){}
+      if(!fixRec || !fixRec.listing){ sendJSON(res,404,{success:false, error:'Listing not found for SKU ' + fixSku}); return; }
+      var fchk = fixRec.listing.checker || {};
+      var fissues = Array.isArray(fchk.issues) ? fchk.issues : [];
+      var issue = fissues[idx];
+      if(!issue){ sendJSON(res,404,{success:false, error:'Issue not found'}); return; }
+      if(issue.resolved){ sendJSON(res,200,{success:true, already:true, remaining:0}); return; }
+      var newText = String(issue.suggested_fix == null ? '' : issue.suggested_fix).trim();
+      if(!newText){ sendJSON(res,400,{success:false, error:'No suggested wording for this issue — edit the listing manually'}); return; }
+      var fhf = fixRec.human_facts || buildHumanFacts(fixRec.meta, fixRec.visionData);
+      if(claimStatedByHuman(newText, fhf)){
+        sendJSON(res,400,{success:false, error:'Refused — the suggested wording overlaps a fact you recorded by hand. Edit manually.'});
+        return;
+      }
+      var oldText = String(issue.old_text == null ? '' : issue.old_text).trim();
+      var applied = false, where = '';
+      var cbox = String(fixRec.listing.condition_box || '');
+      var dhtml = String(fixRec.listing.description_html || '');
+      if(oldText && cbox.indexOf(oldText) >= 0){ fixRec.listing.condition_box = cbox.split(oldText).join(newText); applied = true; where = 'condition_box'; }
+      if(oldText && dhtml.indexOf(oldText) >= 0){ fixRec.listing.description_html = dhtml.split(oldText).join(newText); applied = true; where = where ? (where + ' + description') : 'description'; }
+      if(!applied && String(issue.type || '') === 'condition'){ fixRec.listing.condition_box = newText; applied = true; where = 'condition_box (replaced)'; }
+      if(!applied){
+        sendJSON(res,400,{success:false, error:'Could not locate the original wording to replace — edit the listing manually'});
+        return;
+      }
+      fissues[idx].resolved = true;
+      fissues[idx].applied_at = new Date().toISOString();
+      var remaining = fissues.filter(function(x){ return x && !x.resolved; }).length
+        + ((Array.isArray(fchk.conflicts) ? fchk.conflicts : []).length);
+      var clear = (remaining === 0);
+      saveDualRecord(fixSku, function(rec){
+        rec.listing = rec.listing || {};
+        rec.listing.condition_box = fixRec.listing.condition_box;
+        rec.listing.description_html = fixRec.listing.description_html;
+        rec.listing.checker = rec.listing.checker || {};
+        rec.listing.checker.issues = fissues;
+        if(clear) rec.listing.checker.acknowledged = { action:'fixed', at: new Date().toISOString() };
+      });
+      try { loadListings(); } catch(e){}
+      console.log('[GATE] SKU ' + fixSku + ' applied checker fix #' + idx + ' to ' + where + ' | ' + remaining + ' finding(s) remaining');
+      sendJSON(res,200,{success:true, applied_to:where, remaining:remaining, gate_cleared:clear});
     });
     return;
   }
@@ -3251,6 +3347,40 @@ function buildListingSystemPrompt(){
     '- Do NOT use emoji anywhere',
     '- Do NOT use: "like new", "mint", "vintage", "copy", "reproduction", "insurance", "money order", "check"',
     '',
+    'REQUIRED DESCRIPTION TEMPLATE — MANDATORY, EVERY ITEM, EVERY TIME:',
+    '',
+    'description_html MUST contain these five sections, in this exact order, with these exact headings,',
+    'and NOTHING before the first heading or after the last section:',
+    '',
+    '  <h3>Overview</h3>',
+    '  <h3>What\'s Included</h3>',
+    '  <h3>Condition</h3>',
+    '  <h3>Testing Notes</h3>',
+    '  <h3>Specifications</h3>',
+    '',
+    'Section rules:',
+    '- Overview: 1-3 sentences. What the item IS and who it is for. No condition detail, no',
+    '  accessory list, no test results, no specs — those belong to their own sections.',
+    '- What\'s Included: a <ul> listing ONLY what is physically visible in the photos. One line per item.',
+    '- Condition: cosmetic state only — wear, scuffs, scratches, dents, discoloration, and their',
+    '  locations. Also note what is clean or undamaged. No functionality claims here.',
+    '- Testing Notes: what was and was NOT tested, and the result. Every negative or limiting fact from',
+    '  the seller notes goes HERE (e.g. "powers on, no further testing done", "no power cord included").',
+    '  If nothing was tested, say so plainly.',
+    '- Specifications: a <ul> or <table> of manufacturer specs. Facts only, no prose.',
+    '',
+    'NO-REPETITION RULE — THIS IS STRICT:',
+    'State each fact EXACTLY ONCE, in its designated section only. Do not restate a fact in the',
+    'Overview and again in its own section, and do not add a closing/summary paragraph that repeats',
+    'facts already stated above. Specifically:',
+    '- Do NOT mention condition or wear in Overview or Testing Notes — Condition only.',
+    '- Do NOT mention what is included in Overview or Condition — What\'s Included only.',
+    '- Do NOT mention test results or "sold as-is" in Overview or Condition — Testing Notes only.',
+    '- Do NOT repeat specs in Overview — Specifications only.',
+    '- Do NOT append a closing paragraph, a sales pitch, a shipping paragraph, or an "Important',
+    '  Notice" block after Specifications. The Specifications section is the end of the description.',
+    'If you find yourself writing a fact a second time, delete it — the first placement stands.',
+    '',
     'Return ONLY this JSON with no markdown:',
     '{"title":"eBay title under 80 chars","condition_box":"2-3 honest sentences for eBay condition field","description_html":"complete HTML description","avg_sold_price":0,"price_low":0,"price_high":0,"suggested_price":0,"accept_price":0,"decline_price":0,"shipping":"GA Ground","item_specifics":{"Brand":"value","Model":"value","Type":"value"},"is_lot":false,"lot_quantity":1}'
   ].join('\n');
@@ -3383,6 +3513,21 @@ function parseGeminiJson(text){
 function stripHtmlExcerpt(html, n){
   return String(html == null ? '' : html).replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim().slice(0, n || 500);
 }
+// FIX (truncation false-positive): the review layers (Checker, Spec Verifier) used to receive a
+// stripHtmlExcerpt(...,500/800) SNIPPET of the description. Real descriptions run 1000-1400 chars,
+// so the snippet always ended mid-sentence — and the Checker correctly reported the text it was
+// given as "cut off / incomplete", producing a false positive on a description that was complete.
+// Root cause = truncated INPUT, not a truncated listing. This returns the description in FULL for
+// review. Only a pathological description (> REVIEW_TEXT_MAX) is cut, and when that happens the cut
+// is labelled explicitly so the model never mistakes the boundary for the end of the listing.
+var REVIEW_TEXT_MAX = 12000;
+function descriptionTextForReview(html){
+  var full = String(html == null ? '' : html).replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim();
+  if(full.length <= REVIEW_TEXT_MAX) return full;
+  return full.slice(0, REVIEW_TEXT_MAX) +
+    ' [... TRUNCATED HERE FOR REVIEW LENGTH ONLY — the actual listing description continues past this' +
+    ' point and is complete. Do NOT report the description as cut off, unfinished, or incomplete.]';
+}
 
 // The SAME user-message shape the Sonnet pipeline uses (item name, grade, category,
 // includes, condition notes, seller notes, photo-analysis instructions), assembled
@@ -3467,33 +3612,39 @@ function checkListing(sku, listing, photos, pipeline, humanFacts, callback){
     var photoBlocks = Array.isArray(photos) ? photos : [];
     var title = String(listing.title || '');
     var condition = String(listing.condition_box || '');
-    var descExcerpt = stripHtmlExcerpt(listing.description_html, 500);
+    // FIX: full description text (was a 500-char excerpt that always cut mid-sentence).
+    var descFull = descriptionTextForReview(listing.description_html);
     var specStr = '{}'; try { specStr = JSON.stringify(listing.item_specifics || {}); } catch(e){ specStr = '{}'; }
 
     // ── Stage 1: analysis (with vision, no JSON requirement) ──
     var stage1User = [
       humanFactsPromptBlock(humanFacts),
       '',
+      checkerScopeBlock(humanFacts),
+      '',
       'Review this listing against the photos provided.',
+      '',
+      'The Title, Condition and Description below are reproduced IN FULL and are exactly what will be',
+      'published. They are complete. Never report them as truncated, cut off, unfinished, or missing an',
+      'ending — that is not a defect class you are checking for, and any apparent sentence boundary is',
+      'the real end of the text.',
       '',
       'LISTING TO CHECK:',
       'Title: ' + title,
-      'Condition: ' + condition,
-      'Description excerpt: ' + descExcerpt,
+      'Condition (complete): ' + condition,
+      'Description (complete plain text): ' + descFull,
       'Item Specifics: ' + specStr,
       '',
       'Check for these specific issues:',
       '1. INCLUDES — Does the listing claim accessories or items that are NOT visible in the first photo? Does it miss accessories that ARE clearly visible?',
       '2. CONDITION — Does the condition description match the visible wear, damage, or cosmetic issues in the photos? Is it more optimistic or more pessimistic than reality?',
-      '3. TITLE — Does the title match what the item actually appears to be based on labels, branding, and appearance visible in the photos?',
-      '4. SPECS — If a specs screen (BIOS, device info, settings) is visible in any photo, do the specs in the listing match what the screen shows?',
-      '5. WEIGHT PLAUSIBILITY — Given the item\'s apparent size and type in the photos, does the shipping tier seem plausible? Flag if something appears obviously wrong.',
-      '6. TITLE ACCURACY — Review the title against what you can observe in the photos:',
-      '   - Does the brand name in the title match visible branding on the item in the photos?',
-      '   - Does the model number in the title match any visible labels or nameplates in the photos?',
-      '   - Are there any specs in the title that directly CONTRADICT what is visible in photos? (e.g. title says "Black" but item is clearly gray)',
-      '   - Note any title specs that CANNOT be verified from the photos alone — these may have come from research and should be flagged for awareness.',
-      '   Do not flag unverifiable specs as errors — just note them as "verified by research, not visible in photos" so the seller is aware.',
+      '3. COUNTS — Does the number of units/accessories the listing describes match what is actually visible in the photos?',
+      '4. MISSING PARTS — Does the listing describe a part, panel, cover, tray, cable or module as present that is visibly absent in the photos (or vice versa)?',
+      '5. CONTRADICTED-BY-PHOTO CLAIMS ONLY — Flag a spec or descriptive claim ONLY when a photo DIRECTLY',
+      '   CONTRADICTS it (e.g. the listing says "Black" but the item is plainly gray, or the listing says',
+      '   "24 ports" and the photo plainly shows 8). A claim you simply cannot verify from the photos is',
+      '   NOT an issue — say nothing about it. Do not list unverifiable specs "for awareness".',
+      '6. WEIGHT PLAUSIBILITY — Given the item\'s apparent size and type in the photos, does the shipping tier seem plausible? Flag only if something appears obviously wrong.',
       '7. HUMAN-FACT CONFLICTS — If a photo appears to CONTRADICT a human ground-truth fact above',
       '   (e.g. a photo shows a powered-on unit but the notes say "no power cord included", or the',
       '   photo seems to show a different count than the authoritative lot quantity), do NOT treat it',
@@ -3501,6 +3652,9 @@ function checkListing(sku, listing, photos, pipeline, humanFacts, callback){
       '   seller can judge — state which human fact and what the photo appears to show.',
       '',
       'Describe each issue found in plain language.',
+      'For every issue, quote the EXACT wording from the listing that is wrong, and give the exact',
+      'corrected wording that should replace it — the operator can apply your correction with one click,',
+      'so the replacement text must be complete, self-contained, and ready to publish as written.',
       'If no issues found, say PASS.',
       'Be specific — cite which photo showed what.'
     ].join('\n');
@@ -3508,7 +3662,7 @@ function checkListing(sku, listing, photos, pipeline, humanFacts, callback){
     callOpenRouter({
       model:'google/gemini-2.5-flash', max_tokens:1200,
       messages:[
-        { role:'system', content:'You are a quality control expert reviewing an eBay listing against the actual photos of the item. Your job is to find any discrepancies between what the listing says and what is actually visible in the photos.' },
+        { role:'system', content:'You are a quality control expert reviewing an eBay listing against the actual photos of the item. Your ONLY job is to catch claims the listing writer inferred from the photos and got wrong — condition, cosmetic wear, what is included, counts, and missing parts. The item\'s identity (brand, model, MPN) and its manufacturer specifications are established from the operator\'s confirmed identification and separate research; they are NOT yours to verify or question. Report a problem only when a photo DIRECTLY CONTRADICTS the listing. If you cannot verify something from the photos, say nothing about it — an unverifiable claim is not a finding. The listing text you are given is always complete; never report it as truncated or cut off.' },
         { role:'user', content: stage1Content }
       ]
     }, function(e1, analysis){
@@ -3519,7 +3673,7 @@ function checkListing(sku, listing, photos, pipeline, humanFacts, callback){
         '{',
         '  "verdict": "PASS" | "WARN" | "FLAG",',
         '  "issues": [',
-        '    { "type": "includes" | "condition" | "title" | "title_claim" | "specs" | "weight", "description": "specific issue description", "fixable": true | false }',
+        '    { "type": "includes" | "condition" | "counts" | "missing_parts" | "contradicted_claim" | "weight", "description": "specific issue description", "old_text": "the exact wording currently in the listing that is wrong, copied verbatim, or empty string", "suggested_fix": "the corrected wording that should replace old_text, or empty string if no wording change applies", "fixable": true | false }',
         '  ],',
         '  "conflicts": [',
         '    { "human_fact": "which human ground-truth fact is contradicted", "photo_shows": "what the photo appears to show", "note": "one sentence for the seller" }',
@@ -3809,6 +3963,24 @@ function clauseRepresented(clause, descText, isNeg){
   if(!toks.length) return true;
   return toks.every(function(t){ return d.indexOf(t) >= 0; });
 }
+// ── Shared note-clause collector (FIX: cross-field duplication) ──
+// testing_notes ("What Did You Find?") and additional_notes ("Additional Notes") are independent
+// operator inputs, and operators routinely type the same sentence into both. Pool every clause from
+// both fields and dedupe on normalized text so downstream guards see each distinct fact ONCE. The
+// first spelling wins so the restored/flagged wording stays verbatim-human. Order is preserved.
+function collectNoteClauses(humanFacts){
+  humanFacts = humanFacts || {};
+  var seen = {}, out = [];
+  [humanFacts.testing_notes, humanFacts.additional_notes].filter(Boolean).forEach(function(note){
+    splitNoteClauses(note).forEach(function(clause){
+      var key = _normText(clause);
+      if(!key || seen[key]) return;
+      seen[key] = true;
+      out.push(clause);
+    });
+  });
+  return out;
+}
 // Deterministic OMISSION GUARD, split by severity:
 //  - NEGATIONS (defect class): a stripped/inverted negation is an item-not-as-described case, so it
 //    is RESTORED hard (exact-phrase) and appended as a "Seller notes" list at the end.
@@ -3818,22 +3990,24 @@ function clauseRepresented(clause, descText, isNeg){
 function enforceNoteOmissionGuard(sku, listing, humanFacts){
   var out = { restored: [], conflicts: [] };
   if(!listing || !humanFacts) return out;
-  var notes = [humanFacts.testing_notes, humanFacts.additional_notes].filter(Boolean);
-  if(!notes.length) return out;
+  // FIX (note duplication): testing_notes and additional_notes are two separate operator fields, but
+  // an operator who types the same phrase in both used to get that clause restored/flagged TWICE —
+  // once per source field. Clauses are now pooled and deduped on normalized text before iterating,
+  // so an identical fact entered in both fields is handled exactly once.
+  var clauses = collectNoteClauses(humanFacts);
+  if(!clauses.length) return out;
   var descText = String(listing.description_html || '').replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g, ' ');
-  notes.forEach(function(note){
-    splitNoteClauses(note).forEach(function(clause){
-      var neg = isNegationClause(clause);
-      if(clauseRepresented(clause, descText, neg)) return;
-      if(neg){
-        out.restored.push(clause);
-        console.log('[GUARD] SKU ' + sku + ' restored omitted human note: "' + clause + '"');
-      } else {
-        out.conflicts.push({ human_fact: clause, photo_shows: 'not represented in the listing description',
-          note: 'Human note "' + clause + '" is not represented in the description — verify before listing.' });
-        console.log('[GUARD] SKU ' + sku + ' flagged omitted positive note: "' + clause + '"');
-      }
-    });
+  clauses.forEach(function(clause){
+    var neg = isNegationClause(clause);
+    if(clauseRepresented(clause, descText, neg)) return;
+    if(neg){
+      out.restored.push(clause);
+      console.log('[GUARD] SKU ' + sku + ' restored omitted human note: "' + clause + '"');
+    } else {
+      out.conflicts.push({ human_fact: clause, photo_shows: 'not represented in the listing description',
+        note: 'Human note "' + clause + '" is not represented in the description — verify before listing.' });
+      console.log('[GUARD] SKU ' + sku + ' flagged omitted positive note: "' + clause + '"');
+    }
   });
   if(out.restored.length){
     var items = out.restored.map(function(c){ return '<li>' + String(c).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</li>'; }).join('');
@@ -3859,12 +4033,19 @@ function extractNegatedObjects(text){
 function detectNoteTextConflicts(listing, humanFacts){
   var out = [];
   if(!listing || !humanFacts) return out;
-  var notes = [humanFacts.testing_notes, humanFacts.additional_notes].filter(Boolean).join(' | ');
+  // FIX (note duplication): build the negation list from the DEDUPED clause pool rather than from a
+  // raw join of both note fields, so a phrase typed into testing_notes AND additional_notes raises
+  // one conflict instead of two identical ones.
+  var notes = collectNoteClauses(humanFacts).join('. ');
   if(!notes) return out;
   var hay = [listing.title, String(listing.description_html || '').replace(/<[^>]*>/g, ' ')];
   try { var isp = listing.item_specifics || {}; Object.keys(isp).forEach(function(k){ var v = isp[k]; hay.push(k + ' ' + (Array.isArray(v) ? v.join(' ') : v)); }); } catch(e){}
   var text = _normText(hay.join(' '));
+  var seenNeg = {};
   extractNegatedObjects(notes).forEach(function(neg){
+    var negKey = _normText(neg.clause);
+    if(seenNeg[negKey]) return;
+    seenNeg[negKey] = true;
     var objTokens = neg.object.split(' ').filter(function(t){ return t.length > 2; });
     if(!objTokens.length) return;
     var objPresent = objTokens.every(function(t){ return text.indexOf(t) >= 0; });
@@ -3892,7 +4073,19 @@ function applyHumanFactGuards(sku, listing, humanFacts, chk){
     chk = chk || { verdict:'WARN' };
     chk.conflicts = (Array.isArray(chk.conflicts) ? chk.conflicts : []).concat(allConf);
     if(!chk.verdict || chk.verdict === 'PASS' || chk.verdict === 'UNKNOWN') chk.verdict = 'WARN';
-    console.log('[GUARD] SKU ' + sku + ' ' + allConf.length + ' listing conflict(s) with human notes');
+  }
+  // FIX (note duplication), final backstop: dedupe the merged conflict list on normalized content so
+  // the same finding can never surface twice — whether it came from two note fields, from both the
+  // text-conflict and omission guards, or from the AI Checker echoing a guard finding.
+  if(chk && Array.isArray(chk.conflicts) && chk.conflicts.length){
+    var seenC = {};
+    chk.conflicts = chk.conflicts.filter(function(cf){
+      var key = _normText([(cf && cf.human_fact) || '', (cf && cf.photo_shows) || '', (cf && cf.note) || ''].join(' '));
+      if(!key || seenC[key]) return false;
+      seenC[key] = true;
+      return true;
+    });
+    console.log('[GUARD] SKU ' + sku + ' ' + chk.conflicts.length + ' distinct listing conflict(s) with human notes');
   }
   return chk;
 }
@@ -3905,6 +4098,11 @@ function buildHumanFacts(meta, visionData){
   return {
     brand: String(idi.brand || visionData.brand || '').trim(),
     model: String(idi.model || visionData.model || '').trim(),
+    // Identity as CONFIRMED BY THE OPERATOR on the Processor identify screen (or typed manually via
+    // /api/identify-manual). When present, brand/model/spec claims derived from it are NOT the
+    // Checker's business — it only reviews what Gemini inferred from the photos.
+    item_name: String(idi.item_name || '').trim(),
+    identity_confirmed: !!(idi && idi.item_name && String(idi.item_name).trim()),
     lot_quantity: lotQ,
     testing_notes: String(meta.test_notes || '').trim(),
     additional_notes: String(meta.notes || '').trim()
@@ -3927,6 +4125,44 @@ function humanFactsPromptBlock(hf){
   ].join('\n');
 }
 
+// ── CHECKER SCOPE (recalibration) ──
+// The Checker exists to catch what the GENERATOR INVENTED FROM PHOTOS — not to re-litigate the
+// item's identity. Brand, model, MPN and the manufacturer specs that follow from them come from the
+// operator's confirmed identification (or their typed brand/model), and from web research keyed to
+// that model. Those are out of scope here: the Spec Verifier already fact-checks specs against
+// manufacturer sources, and a second opinion from a vision model that cannot read a datasheet only
+// produces noise ("serial not fully visible", "cannot verify port count from photos").
+function checkerScopeBlock(hf){
+  hf = hf || {};
+  var lines = [
+    'SCOPE — WHAT YOU MAY AND MAY NOT FLAG:',
+    '',
+    'IN SCOPE (claims the listing generator inferred from the photos — review these):',
+    '- Condition and cosmetic wear: scuffs, scratches, dents, discoloration, cracks, their severity and location',
+    '- What is included: accessories, cables, adapters, trays, brackets, modules actually visible',
+    '- Counts and quantities visible in the photos',
+    '- Missing or absent parts, panels, covers',
+    '- Functionality claims that rest on visual evidence (a lit indicator, a screen showing output)',
+    '',
+    'OUT OF SCOPE (do NOT flag, do NOT mention, do NOT list "for awareness"):',
+    '- The brand, model number, MPN, or item identity',
+    '- Manufacturer specifications that follow from the model (port counts, capacity, resolution,',
+    '  speed, interface, layer, form factor, protocol support, print technology, etc.)',
+    '- A serial number being unreadable, partially visible, or absent from the photos',
+    '- Any claim you merely CANNOT CONFIRM from the photos. Silence is the correct response to an',
+    '  unverifiable claim. Only a DIRECT visual CONTRADICTION is reportable.'
+  ];
+  if(hf.identity_confirmed){
+    lines.push('');
+    lines.push('This item\'s identity was CONFIRMED BY THE OPERATOR before generation:');
+    lines.push('  Identified as: ' + (hf.item_name || '(name not recorded)'));
+    lines.push('  Brand: ' + (hf.brand || '(not recorded)') + ' | Model: ' + (hf.model || '(not recorded)'));
+    lines.push('Treat that identification as settled fact. Do not question it, do not ask for');
+    lines.push('verification of it, and do not raise issues about specs that derive from it.');
+  }
+  return lines.join('\n');
+}
+
 // ── CHANGE 2: SPEC VERIFIER — web-search fact-check of the listing's claims ──
 // Runs AFTER Gemini generation and BEFORE the Checker. Two calls (search, then JSON extraction),
 // the same grounding/JSON split the buyer finder uses. Applies SURGICAL corrections to the wrong
@@ -3945,7 +4181,9 @@ function verifySpecs(sku, listing, pipeline, humanFacts, callback){
       if(/^brand$/i.test(k)) brand = Array.isArray(spec[k]) ? spec[k].join(', ') : String(spec[k]);
       if(/^(model|mpn)$/i.test(k) && !model) model = Array.isArray(spec[k]) ? spec[k].join(', ') : String(spec[k]);
     });
-    var descExcerpt = stripHtmlExcerpt(listing.description_html, 800);
+    // FIX: full description text (was an 800-char excerpt that cut mid-sentence and made the
+    // verifier reason about a partial listing).
+    var descExcerpt = descriptionTextForReview(listing.description_html);
     var specStr = '{}'; try { specStr = JSON.stringify(spec); } catch(e){ specStr = '{}'; }
 
     var sys1 = [
@@ -3979,7 +4217,7 @@ function verifySpecs(sku, listing, pipeline, humanFacts, callback){
       'TITLE TO VERIFY:',
       (listing.title || ''),
       '',
-      'DESCRIPTION CLAIMS TO VERIFY:',
+      'DESCRIPTION CLAIMS TO VERIFY (complete text — this is the entire description, not an extract):',
       descExcerpt,
       '',
       'ITEM SPECIFICS TO VERIFY:',
@@ -5425,6 +5663,28 @@ function sanitizeForFilename(s){
   return String(s||'').replace(/[^a-z0-9]+/gi,'-').replace(/^-+|-+$/g,'').slice(0,40) || 'item';
 }
 
+// ── PRE-PUBLISH GATE ──
+// The Checker moved from informational to blocking: while it reports open findings (a WARN/FLAG
+// verdict, unresolved issues, or human-fact conflicts) the item cannot be sent to eBay. The gate
+// clears when the operator applies a suggested fix that resolves every issue, or explicitly
+// dismisses the findings. `listing.checker.acknowledged` records who cleared it and how.
+// Enforced BOTH in the UI (button disabled) and server-side in /api/send-to-ebay — a disabled
+// button alone is decoration, the server is the actual gate.
+function checkerGateState(listing){
+  listing = listing || {};
+  var chk = listing.checker || null;
+  var out = { blocked:false, issues:[], conflicts:[], acked:null, verdict:'UNKNOWN' };
+  if(!chk) return out;                                  // never run -> do not block (backward compat)
+  out.verdict = String(chk.verdict || 'UNKNOWN').toUpperCase();
+  out.issues = (Array.isArray(chk.issues) ? chk.issues : []).filter(function(x){ return x && !x.resolved; });
+  out.conflicts = Array.isArray(chk.conflicts) ? chk.conflicts : [];
+  out.acked = chk.acknowledged || null;
+  if(out.acked) return out;                             // operator already cleared it
+  if(out.issues.length || out.conflicts.length) out.blocked = true;
+  else if(out.verdict === 'FLAG') out.blocked = true;   // FLAG with no itemised issue still blocks
+  return out;
+}
+
 // ── CHANGE 4: Checker + Spec Verifier badges (and click-to-open report panels) for a card ──
 // Reads listing.checker (photo vs listing) and listing.spec_verifier (research accuracy). Both
 // badges show on every card; records without these fields simply show "Not run" (backward compat).
@@ -5467,7 +5727,24 @@ function renderListingBadges(sku, listing){
     var cnf = Array.isArray(chk.could_not_fix) ? chk.could_not_fix : [];
     function fmtCorr(c){ return (c && typeof c === 'object') ? ((c.field ? esc(c.field) + ': ' : '') + esc(c.old == null || c.old === '' ? '(new)' : c.old) + ' &rarr; ' + esc(c.new)) : esc(c); }
     if(chkConflicts.length){ cpan += '<div style="font-weight:bold;color:#c62828;margin-top:6px;">&#128681; Human-fact conflicts — photo vs your notes (you decide, nothing was changed):</div><ul style="margin:4px 0 4px 18px;">'; chkConflicts.forEach(function(cf){ cpan += '<li>' + esc(cf.note || ((cf.human_fact ? cf.human_fact + ': ' : '') + (cf.photo_shows || ''))) + '</li>'; }); cpan += '</ul>'; }
-    if(issues.length){ cpan += '<div style="font-weight:bold;color:#8d6e00;margin-top:6px;">Issues found:</div><ul style="margin:4px 0 4px 18px;">'; issues.forEach(function(x){ cpan += '<li>[' + esc(x.type || 'issue') + '] ' + esc(x.description || '') + (x.fixable ? '' : ' <span style="color:#c62828;">(not auto-fixable)</span>') + '</li>'; }); cpan += '</ul>'; }
+    if(issues.length){
+      cpan += '<div style="font-weight:bold;color:#8d6e00;margin-top:6px;">Issues found:</div><ul style="margin:4px 0 4px 18px;">';
+      issues.forEach(function(x, ix){
+        var canApply = !!(x && x.suggested_fix && String(x.suggested_fix).trim() && !x.resolved);
+        cpan += '<li id="chkissue_' + skuStr + '_' + ix + '"' + (x && x.resolved ? ' style="opacity:0.55;text-decoration:line-through;"' : '') + '>'
+          + '[' + esc(x.type || 'issue') + '] ' + esc(x.description || '')
+          + (x.fixable ? '' : ' <span style="color:#c62828;">(not auto-fixable)</span>');
+        if(canApply){
+          cpan += '<div style="margin:4px 0 2px;padding:6px 8px;background:#fff;border:1px solid #cfd8dc;border-radius:4px;">'
+            + '<span style="color:#555;">Suggested: </span>' + esc(x.suggested_fix)
+            + ' <button onclick="applyCheckerFix(\'' + skuStr + '\',' + ix + ')" style="margin-left:6px;padding:4px 10px;border:none;border-radius:4px;cursor:pointer;font-size:11.5px;font-weight:bold;background:#2e7d32;color:#fff;">Apply suggested fix</button>'
+            + ' <span id="chkfixmsg_' + skuStr + '_' + ix + '" style="font-weight:bold;font-size:11.5px;"></span>'
+            + '</div>';
+        }
+        cpan += '</li>';
+      });
+      cpan += '</ul>';
+    }
     if(corr.length){ cpan += '<div style="font-weight:bold;color:#2e7d32;margin-top:6px;">Corrections made automatically:</div><ul style="margin:4px 0 4px 18px;">'; corr.forEach(function(c){ cpan += '<li>' + fmtCorr(c) + '</li>'; }); cpan += '</ul>'; }
     if(cnf.length){ cpan += '<div style="font-weight:bold;color:#8d6e00;margin-top:6px;">Blocked (protected — not changed):</div><ul style="margin:4px 0 4px 18px;">'; cnf.forEach(function(c){ cpan += '<li>' + esc(c) + '</li>'; }); cpan += '</ul>'; }
     if(!issues.length && !corr.length && !cnf.length && !chkConflicts.length){ cpan += '<div style="color:#2e7d32;">No issues found.</div>'; }
@@ -5489,7 +5766,28 @@ function renderListingBadges(sku, listing){
   } else { span += '<div style="color:#757575;">Spec Verifier has not run for this listing yet.</div>'; }
   span += '</div>';
 
-  return '<div style="padding:8px 16px;background:#fff;border-bottom:1px solid #eee;display:flex;flex-wrap:wrap;gap:8px;align-items:center;">' + checkerBadge + conflictBadge + specBadge + '</div>' + cpan + span;
+  // ── Pre-publish gate bar ──
+  var gate = checkerGateState(listing);
+  var gateBar = '';
+  if(gate.blocked){
+    var nI = gate.issues.length, nC = gate.conflicts.length;
+    var parts = [];
+    if(nI) parts.push(nI + ' issue' + (nI === 1 ? '' : 's'));
+    if(nC) parts.push(nC + ' conflict' + (nC === 1 ? '' : 's'));
+    gateBar = '<div id="gatebar_' + skuStr + '" style="margin:0;padding:9px 16px;background:#fff3e0;border-bottom:1px solid #ffb74d;font-size:12.5px;color:#7a4a00;display:flex;flex-wrap:wrap;gap:8px;align-items:center;">'
+      + '<span style="font-weight:bold;">&#128274; Listing blocked &mdash; Checker found ' + (parts.join(' and ') || 'open findings') + '.</span>'
+      + '<span>Apply a fix or dismiss to unlock.</span>'
+      + '<button onclick="toggleCardChecker(\'' + skuStr + '\')" style="padding:5px 12px;border:1px solid #f57c00;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;background:#fff;color:#e65100;">Review findings</button>'
+      + '<button onclick="dismissChecker(\'' + skuStr + '\')" style="padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;background:#f57c00;color:#fff;">Dismiss &amp; allow listing</button>'
+      + '<span id="gatemsg_' + skuStr + '" style="font-weight:bold;"></span>'
+      + '</div>';
+  } else if(gate.acked){
+    gateBar = '<div id="gatebar_' + skuStr + '" style="margin:0;padding:7px 16px;background:#f1f8e9;border-bottom:1px solid #c5e1a5;font-size:12px;color:#33691e;">'
+      + '&#9989; Checker findings ' + (gate.acked.action === 'fixed' ? 'resolved' : 'reviewed and dismissed') + ' &mdash; listing unlocked.'
+      + '</div>';
+  }
+
+  return '<div style="padding:8px 16px;background:#fff;border-bottom:1px solid #eee;display:flex;flex-wrap:wrap;gap:8px;align-items:center;">' + checkerBadge + conflictBadge + specBadge + '</div>' + gateBar + cpan + span;
 }
 
 // ── DUAL PIPELINE (ADDITIVE): render a shared header + two pipeline cards for one SKU ──
@@ -5863,16 +6161,23 @@ function generateListingsPage(listings, ebayStat){
     // eBay publish button — always visible on every card (FIX 1). When already listed,
     // show the live-listing link; otherwise show "List on eBay" (posting logic unchanged —
     // /api/send-to-ebay reports "Connect eBay first" if not connected).
+    // PRE-PUBLISH GATE: while the Checker has open findings the publish button is disabled and the
+    // item is excluded from bulk listing. Unlocked by applyCheckerFix / dismissChecker (which also
+    // enable the button client-side without a page reload).
+    var cardGate = checkerGateState(listing);
     var ebayBtn = '';
     if(r.ebay_item_id){
       ebayBtn = '<a href="'+(r.ebay_listing_url||('https://www.ebay.com/itm/'+r.ebay_item_id))+'" target="_blank" id="ebaybtn_'+skuStr+'" style="padding:8px 16px;border-radius:4px;font-size:13px;font-weight:bold;background:#2e7d32;color:#fff;text-decoration:none;">Listed &#10003;</a>';
+    } else if(cardGate.blocked){
+      ebayBtn = '<button id="ebaybtn_'+skuStr+'" disabled data-gated="1" onclick="listEbay(\''+skuStr+'\')" title="Checker found open findings — apply a fix or dismiss to unlock." style="padding:8px 16px;border:none;border-radius:4px;cursor:not-allowed;font-size:13px;font-weight:bold;background:#9e9e9e;color:#fff;opacity:0.7;">&#128274; List on eBay</button>';
     } else {
       ebayBtn = '<button id="ebaybtn_'+skuStr+'" onclick="listEbay(\''+skuStr+'\')" style="padding:8px 16px;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:bold;background:#0064d2;color:#fff;">List on eBay</button>';
     }
 
-    // FIX 3: bulk-select checkbox — only on listings not yet posted to eBay
-    var selectBox = !r.ebay_item_id ?
-      '<input type="checkbox" class="bulkSel" value="'+skuStr+'" onchange="updateBulkCount()" style="width:18px;height:18px;cursor:pointer;flex:0 0 auto;" title="Select for bulk listing">' : '';
+    // FIX 3: bulk-select checkbox — only on listings not yet posted to eBay AND not gated
+    var selectBox = (!r.ebay_item_id && !cardGate.blocked) ?
+      '<input type="checkbox" class="bulkSel" value="'+skuStr+'" onchange="updateBulkCount()" style="width:18px;height:18px;cursor:pointer;flex:0 0 auto;" title="Select for bulk listing">' :
+      (!r.ebay_item_id ? '<span class="gatelock" title="Blocked by Checker — resolve findings to enable bulk listing" style="font-size:15px;flex:0 0 auto;opacity:0.85;">&#128274;</span>' : '');
 
     return '<div id="card_'+skuStr+'" style="background:#fff;border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,0.15);margin-bottom:28px;overflow:hidden;">'
       +'<div style="background:'+headerColor+';color:#fff;padding:12px 16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;">'
@@ -5946,7 +6251,7 @@ function generateListingsPage(listings, ebayStat){
     +'function cp(id){var el=document.getElementById(id);if(!el)return;var btn=document.querySelector("[id=btn_"+id+"]");navigator.clipboard.writeText(el.value.trim()).then(function(){if(btn){var o=btn.textContent;btn.textContent="Copied!";setTimeout(function(){btn.textContent=o;},1500);}});}'
     +'function clearAll(){if(!confirm("Clear all listings? This cannot be undone."))return;fetch("/api/clear-listings",{method:"POST"}).then(function(){location.reload();});}'
     +'function dlAll(sku,stems,safe){for(var i=0;i<stems.length;i++){(function(n){setTimeout(function(){var a=document.createElement("a");a.href="/api/photo/"+sku+"/"+stems[n];a.download=sku+"-"+safe+"-photo"+(n+1)+".jpg";document.body.appendChild(a);a.click();document.body.removeChild(a);},n*500);})(i);}}'
-    +'function listEbay(sku){var b=document.getElementById("ebaybtn_"+sku);if(b){b.textContent="Listing...";b.disabled=true;}fetch("/api/send-to-ebay",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sku:parseInt(sku,10)})}).then(function(r){return r.json();}).then(function(d){if(d.success){if(b){var a=document.createElement("a");a.id="ebaybtn_"+sku;a.href=d.listing_url||"#";a.target="_blank";a.textContent="Listed \\u2713";a.style.cssText="padding:8px 16px;border-radius:4px;font-size:13px;font-weight:bold;background:#2e7d32;color:#fff;text-decoration:none;";if(b.parentNode)b.parentNode.replaceChild(a,b);}}else{if(b){b.textContent="Retry";b.disabled=false;}alert("eBay: "+(d.error||"failed"));}}).catch(function(){if(b){b.textContent="Retry";b.disabled=false;}alert("Network error contacting server.");});}'
+    +'function listEbay(sku){var b=document.getElementById("ebaybtn_"+sku);if(b&&b.getAttribute("data-gated")==="1"){alert("Checker findings are unresolved for SKU "+sku+".\\n\\nApply a suggested fix or dismiss the findings to unlock listing.");return;}if(b){b.textContent="Listing...";b.disabled=true;}fetch("/api/send-to-ebay",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sku:parseInt(sku,10)})}).then(function(r){return r.json();}).then(function(d){if(d.success){if(b){var a=document.createElement("a");a.id="ebaybtn_"+sku;a.href=d.listing_url||"#";a.target="_blank";a.textContent="Listed \\u2713";a.style.cssText="padding:8px 16px;border-radius:4px;font-size:13px;font-weight:bold;background:#2e7d32;color:#fff;text-decoration:none;";if(b.parentNode)b.parentNode.replaceChild(a,b);}}else{if(b){b.textContent="Retry";b.disabled=false;}alert("eBay: "+(d.error||"failed"));}}).catch(function(){if(b){b.textContent="Retry";b.disabled=false;}alert("Network error contacting server.");});}'
     +'function loadQueue(){fetch("/api/queue-status").then(function(r){return r.json();}).then(function(d){var banner=document.getElementById("queueBanner");if(d.pending>0||d.processing){banner.style.display="block";banner.textContent=d.pending+" listing"+(d.pending===1?"":"s")+" generating...";}else{banner.style.display="none";}var fc=document.getElementById("failedItems");fc.innerHTML="";(d.failed||[]).forEach(function(f){var row=document.createElement("div");row.style.cssText="background:#ffebee;border:1px solid #c62828;color:#b71c1c;padding:8px 14px;border-radius:6px;margin-bottom:8px;font-size:13px;display:flex;align-items:center;gap:12px;";var span=document.createElement("span");span.style.flex="1";span.textContent="SKU "+f.sku+" failed: "+(f.error||"error")+" (after "+f.attempts+" attempts)";var btn=document.createElement("button");btn.textContent="Retry";btn.style.cssText="padding:6px 14px;border:none;border-radius:4px;background:#c62828;color:#fff;font-weight:bold;cursor:pointer;";btn.onclick=function(){retryListing(f.sku);};row.appendChild(span);row.appendChild(btn);fc.appendChild(row);});}).catch(function(){});}'
     +'function retryListing(sku){fetch("/api/retry-listing",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sku:sku})}).then(function(){loadQueue();});}'
     +'function saveWeight(sku){var lb=document.getElementById("wtlb_"+sku);var oz=document.getElementById("wtoz_"+sku);var msg=document.getElementById("wtmsg_"+sku);var L=lb?parseInt(lb.value,10):0;if(isNaN(L))L=0;var O=oz?parseFloat(oz.value):0;if(isNaN(O))O=0;if(L<0||O<0||(L===0&&O===0)){if(msg){msg.style.color="#c62828";msg.textContent="Enter lb and/or oz";}return;}if(msg){msg.style.color="#8d6e00";msg.textContent="Saving...";}fetch("/api/set-weight",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sku:parseInt(sku,10),lbs:L,oz:O})}).then(function(r){return r.json();}).then(function(d){if(d.success){if(msg){msg.style.color="#2e7d32";msg.textContent="Saved \\u2713 Packed: "+d.final_lbs+"lb "+d.final_oz+"oz | Box: "+d.box_size;}setTimeout(function(){location.reload();},1200);}else{if(msg){msg.style.color="#c62828";msg.textContent=d.error||"Save failed";}}}).catch(function(){if(msg){msg.style.color="#c62828";msg.textContent="Network error";}});}'
@@ -5983,6 +6288,10 @@ function generateListingsPage(listings, ebayStat){
     +'function bulkPick(cb){if(cb.checked){var same=document.querySelectorAll(".bulkSel[value=\\""+cb.value+"\\"]");Array.prototype.forEach.call(same,function(o){if(o!==cb)o.checked=false;});}updateBulkCount();}'
     +'function toggleChecker(pl,sku){var p=document.getElementById("cpanel_"+pl+"_"+sku);if(!p)return;p.style.display=(p.style.display==="none"||!p.style.display)?"block":"none";}'
     +'function toggleCardChecker(sku){var p=document.getElementById("chkpanel_"+sku);if(!p)return;p.style.display=(p.style.display==="none"||!p.style.display)?"block":"none";}'
+    // ── PRE-PUBLISH GATE (client) ── unlock the publish button + bulk checkbox without a reload.
+    +'function unlockGate(sku,action){var b=document.getElementById("ebaybtn_"+sku);if(b&&b.tagName==="BUTTON"){b.disabled=false;b.removeAttribute("data-gated");b.style.background="#0064d2";b.style.cursor="pointer";b.style.opacity="1";b.innerHTML="List on eBay";b.title="";}var g=document.getElementById("gatebar_"+sku);if(g){g.style.background="#f1f8e9";g.style.borderBottom="1px solid #c5e1a5";g.style.color="#33691e";g.innerHTML="\\u2705 Checker findings "+(action==="fixed"?"resolved":"reviewed and dismissed")+" \\u2014 listing unlocked.";}var card=document.getElementById("card_"+sku);var lk=card?card.querySelector(".gatelock"):null;if(lk&&lk.parentNode){var cb=document.createElement("input");cb.type="checkbox";cb.className="bulkSel";cb.value=sku;cb.title="Select for bulk listing";cb.style.cssText="width:18px;height:18px;cursor:pointer;flex:0 0 auto;";cb.onchange=function(){updateBulkCount();};lk.parentNode.replaceChild(cb,lk);updateBulkCount();}}'
+    +'function dismissChecker(sku){if(!confirm("Dismiss the Checker findings for SKU "+sku+" and allow this item to be listed?"))return;var m=document.getElementById("gatemsg_"+sku);if(m){m.style.color="#7a4a00";m.textContent="Saving...";}fetch("/api/listings/checker-ack/"+sku,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"dismissed"})}).then(function(r){return r.json();}).then(function(d){if(d&&d.success){unlockGate(sku,"dismissed");}else{if(m){m.style.color="#c62828";m.textContent=(d&&d.error)||"Failed";}}}).catch(function(){if(m){m.style.color="#c62828";m.textContent="Network error";}});}'
+    +'function applyCheckerFix(sku,ix){var m=document.getElementById("chkfixmsg_"+sku+"_"+ix);if(m){m.style.color="#7a4a00";m.textContent="Applying...";}fetch("/api/listings/apply-checker-fix/"+sku,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({index:ix})}).then(function(r){return r.json();}).then(function(d){if(d&&d.success){if(m){m.style.color="#2e7d32";m.textContent="Applied \\u2713";}var li=document.getElementById("chkissue_"+sku+"_"+ix);if(li){li.style.opacity="0.55";li.style.textDecoration="line-through";}if(d.gate_cleared){unlockGate(sku,"fixed");}else{var g=document.getElementById("gatemsg_"+sku);if(g){g.style.color="#7a4a00";g.textContent=(d.remaining||0)+" finding(s) still open";}}}else{if(m){m.style.color="#c62828";m.textContent=(d&&d.error)||"Failed";}}}).catch(function(){if(m){m.style.color="#c62828";m.textContent="Network error";}});}'
     +'function toggleCardSpec(sku){var p=document.getElementById("specpanel_"+sku);if(!p)return;p.style.display=(p.style.display==="none"||!p.style.display)?"block":"none";}'
     +'function toggleScalePhoto(sku,include){fetch("/api/listings/"+sku+"/scale-toggle",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({include:include})}).then(function(r){return r.json();}).then(function(d){if(d&&d.success){location.reload();}else{alert("Toggle failed: "+((d&&d.error)||"unknown"));}}).catch(function(){alert("Network error.");});}'
     +'function editTitlePipe(span){if(span.dataset.editing)return;span.dataset.editing="1";var sku=span.getAttribute("data-sku");var pl=span.getAttribute("data-pipeline");var cur=span.getAttribute("data-raw")||span.textContent.replace(/^LOT OF \\d+:\\s*/,"");var inp=document.createElement("input");inp.type="text";inp.value=cur;inp.style.cssText="width:100%;box-sizing:border-box;padding:3px 5px;border:1px solid #1565c0;border-radius:3px;font-size:14px;color:#222;";span.textContent="";span.appendChild(inp);inp.focus();inp.select();var done=false;function save(){if(done)return;done=true;var nv=inp.value;fetch("/api/listings/"+sku,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({title:nv,pipeline:pl})}).then(function(r){return r.json();}).then(function(d){span.removeAttribute("data-editing");if(d&&d.success){span.setAttribute("data-raw",nv);span.textContent=(nv);var ta=document.getElementById("t_"+pl+"_"+sku);if(ta)ta.value=nv;flashTick(span,true);}else{span.textContent=cur;flashTick(span,false);}}).catch(function(){span.removeAttribute("data-editing");span.textContent=cur;flashTick(span,false);});}inp.addEventListener("blur",save);inp.addEventListener("keydown",function(e){if(e.key==="Enter"){e.preventDefault();inp.blur();}else if(e.key==="Escape"){done=true;span.removeAttribute("data-editing");span.textContent=cur;}});}'

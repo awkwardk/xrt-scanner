@@ -549,9 +549,9 @@ section('OMISSION DEFENSE — presence check (functional)');
   function withLogs(fn){ var logs = []; var o = console.log; console.log = function(){ logs.push(Array.prototype.slice.call(arguments).join(' ')); }; try { fn(); } finally { console.log = o; } return logs; }
   try {
     var code = '';
-    ['isAllowlistedSpecField','isProtectedFactField','claimStatedByHuman','isDescriptionRewrite','applySurgicalCorrections','enforceQuantityGuard','_normText','splitNoteClauses','isNegationClause','clauseRepresented','enforceNoteOmissionGuard','extractNegatedObjects','detectNoteTextConflicts','applyHumanFactGuards'].forEach(function(n){ code += extractFn(n) + '\n'; });
+    ['isAllowlistedSpecField','isProtectedFactField','claimStatedByHuman','isDescriptionRewrite','applySurgicalCorrections','enforceQuantityGuard','_normText','splitNoteClauses','isNegationClause','clauseRepresented','collectNoteClauses','enforceNoteOmissionGuard','extractNegatedObjects','detectNoteTextConflicts','applyHumanFactGuards'].forEach(function(n){ code += extractFn(n) + '\n'; });
     var fns = {};
-    eval(code + '\nfns.apply=applySurgicalCorrections;fns.omit=enforceNoteOmissionGuard;fns.textConf=detectNoteTextConflicts;fns.guards=applyHumanFactGuards;fns.guard=enforceQuantityGuard;');
+    eval(code + '\nfns.apply=applySurgicalCorrections;fns.omit=enforceNoteOmissionGuard;fns.textConf=detectNoteTextConflicts;fns.guards=applyHumanFactGuards;fns.guard=enforceQuantityGuard;fns.collect=collectNoteClauses;');
     var HF = { testing_notes:'', additional_notes:'no power cord included' };
 
     // (i) a layer patch that DELETES the human note is rejected (all three shapes)
@@ -602,7 +602,119 @@ section('OMISSION DEFENSE — presence check (functional)');
     var d6 = { title:'Lot of 5 Widgets', lot_quantity:5, item_specifics:{ 'Number of Items':'5' } };
     var r6 = withLogs(function(){ fns.guard('i6', d6, { lot_quantity:1 }); });
     test('(1) explicit qty 1 survives a layer changing it to 5', d6.lot_quantity === 1 && /Lot of 1/.test(d6.title) && d6.item_specifics['Number of Items'] === '1' && r6.some(function(l){ return /reverted quantity 5 /.test(l); }));
+
+    // ── NOTE DUPLICATION REGRESSION (production bug, SKUs 2363-2367) ──
+    // The operator typed the same sentence into BOTH testing_notes and additional_notes, and every
+    // clause was restored/flagged once per source field. These lock the deduped behaviour in.
+    var DUP = { testing_notes:'Powers on. No further testing done.', additional_notes:'Powers on. No further testing done.' };
+    test('(dup) collectNoteClauses dedupes across both note fields',
+      fns.collect(DUP).filter(function(c){ return /no further testing done/i.test(c); }).length === 1);
+    var d9 = { description_html:'<p>Adtran Atlas 830 rackmount unit.</p>', item_specifics:{} };
+    var om9 = fns.omit('dup1', d9, DUP);
+    test('(dup) identical negation in both fields restored ONCE',
+      om9.restored.filter(function(c){ return /no further testing done/i.test(c); }).length === 1);
+    test('(dup) restored note appears once in the description',
+      (String(d9.description_html).match(/no further testing done/gi) || []).length === 1);
+    // SKU 2367's real failure: "Works great" typed twice -> two identical conflicts.
+    var d10 = { description_html:'<p>Xbox controller, light wear.</p>', item_specifics:{} };
+    var om10 = fns.omit('dup2', d10, { testing_notes:'Works great', additional_notes:'Works great' });
+    test('(dup) identical positive note in both fields flagged ONCE', om10.conflicts.length === 1);
+    var chkDup = fns.guards('dup3', { title:'X', description_html:'<p>Xbox controller.</p>', item_specifics:{}, lot_quantity:1 },
+      { testing_notes:'Works great', additional_notes:'Works great', lot_quantity:1 }, { verdict:'PASS' });
+    test('(dup) merged conflict list carries no duplicates',
+      chkDup.conflicts.length === 1 && /works great/i.test(chkDup.conflicts[0].note));
+    // Over-dedup regression: genuinely DIFFERENT clauses in the two fields must both survive.
+    var d11 = { description_html:'<p>Switch.</p>', item_specifics:{} };
+    var om11 = fns.omit('dup4', d11, { testing_notes:'no power cord included', additional_notes:'no rack ears included' });
+    test('(dup) distinct notes in both fields are both still restored', om11.restored.length === 2);
+    // Text-conflict detector deduped too (same negation typed twice -> one conflict).
+    var d12 = { title:'Cisco switch with power cord', description_html:'<p>Includes power cord.</p>', item_specifics:{} };
+    test('(dup) text-conflict detector reports one conflict per distinct note',
+      fns.textConf(d12, { testing_notes:'no power cord included', additional_notes:'no power cord included' }).length === 1);
   } catch(e){ test('omission defense functional eval', false); console.log('    ERROR:', e.message); }
+})();
+
+section('CHECKER INPUT — no truncated review text');
+test('descriptionTextForReview exists',        has('function descriptionTextForReview('));
+test('Checker gets full description',          has('var descFull = descriptionTextForReview(listing.description_html)'));
+test('Checker no longer excerpts to 500',      !has('stripHtmlExcerpt(listing.description_html, 500)'));
+test('Spec Verifier no longer excerpts to 800', !has('stripHtmlExcerpt(listing.description_html, 800)'));
+test('Checker labels text as complete',        has('Description (complete plain text): '));
+test('Checker told not to report truncation',  has('never report it as truncated or cut off'));
+(function(){
+  // Functional: the real SKU 2364 failure shape — a ~1100 char description must reach the Checker
+  // whole. The old 500-char excerpt cut mid-sentence and the Checker reported the cut as a defect.
+  var s = content.indexOf('function descriptionTextForReview(');
+  if(s < 0){ test('descriptionTextForReview returns full text for a real-length description', false); return; }
+  var d = 0, seen = false, e = -1;
+  for(var i = s; i < content.length; i++){ var c = content[i]; if(c === '{'){ d++; seen = true; } else if(c === '}'){ d--; if(seen && d === 0){ e = i + 1; break; } } }
+  var box = {};
+  try {
+    // NB: this file is strict mode, so eval'd declarations do not leak — hand the fn out via `box`.
+    eval('var REVIEW_TEXT_MAX = 12000;\n' + content.slice(s, e) + '\nbox.f = descriptionTextForReview;');
+    var body = '<h3>Adtran Atlas 830</h3><p>' + new Array(60).join('cosmetic wear consistent with its age and use in an industrial or data center environment. ') + '</p>';
+    var outFull = box.f(body);
+    var plain = body.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+    test('descriptionTextForReview returns full text for a real-length description',
+      outFull.length === plain.length && /environment\.$/.test(outFull.trim()));
+    test('descriptionTextForReview labels a genuine overflow cut',
+      /TRUNCATED HERE FOR REVIEW LENGTH ONLY/.test(box.f('<p>' + new Array(4000).join('long words here ') + '</p>')));
+  } catch(err){ test('descriptionTextForReview returns full text for a real-length description', false); console.log('    ERROR:', err.message); }
+})();
+
+section('CHECKER SCOPE — photo-inferred claims only');
+test('checkerScopeBlock exists',               has('function checkerScopeBlock('));
+test('scope block wired into Checker prompt',  has('checkerScopeBlock(humanFacts)'));
+test('identity recorded in human facts',       has('identity_confirmed:'));
+test('brand/model/MPN out of scope',           has('The brand, model number, MPN, or item identity'));
+test('unreadable serial not flagged',          has('A serial number being unreadable'));
+test('unverifiable claims not flagged',        has('Silence is the correct response to an'));
+test('confirmed identification stated',        has('CONFIRMED BY THE OPERATOR before generation'));
+test('old awareness-flag rule removed',        !has('verified by research, not visible in photos'));
+
+section('DESCRIPTION TEMPLATE LOCK');
+test('template block present',                 has('REQUIRED DESCRIPTION TEMPLATE — MANDATORY, EVERY ITEM, EVERY TIME'));
+test('Overview section required',              has('<h3>Overview</h3>'));
+test('What\'s Included section required',      has('<h3>What\\\'s Included</h3>'));
+test('Condition section required',             has('<h3>Condition</h3>'));
+test('Testing Notes section required',         has('<h3>Testing Notes</h3>'));
+test('Specifications section required',        has('<h3>Specifications</h3>'));
+test('no-repetition rule present',             has('NO-REPETITION RULE'));
+test('single-placement rule stated',           has('State each fact EXACTLY ONCE, in its designated section only'));
+test('closing paragraph banned',               has('Do NOT append a closing paragraph'));
+
+section('PRE-PUBLISH GATE');
+test('checkerGateState exists',                has('function checkerGateState('));
+test('gate bar rendered',                      has('Listing blocked &mdash; Checker found '));
+test('publish button gated',                   has('data-gated="1"'));
+test('bulk checkbox withheld when gated',      has('!r.ebay_item_id && !cardGate.blocked'));
+test('dismiss endpoint',                       has('/api/listings/checker-ack/'));
+test('apply-fix endpoint',                     has('/api/listings/apply-checker-fix/'));
+test('server-side publish enforcement',        has('checker_blocked:true'));
+test('apply-fix respects human facts',         has('the suggested wording overlaps a fact you recorded by hand'));
+test('Checker asked for old_text',             has('"old_text": "the exact wording currently in the listing'));
+test('Checker asked for suggested_fix',        has('"suggested_fix": "the corrected wording'));
+test('Apply suggested fix button',             has('Apply suggested fix'));
+test('client dismiss fn',                      has('function dismissChecker(sku)'));
+test('client apply fn',                        has('function applyCheckerFix(sku,ix)'));
+test('client unlock fn',                       has('function unlockGate(sku,action)'));
+(function(){
+  var s = content.indexOf('function checkerGateState(');
+  if(s < 0){ test('checkerGateState blocks/clears correctly', false); return; }
+  var d = 0, seen = false, e = -1;
+  for(var i = s; i < content.length; i++){ var c = content[i]; if(c === '{'){ d++; seen = true; } else if(c === '}'){ d--; if(seen && d === 0){ e = i + 1; break; } } }
+  var gbox = {};
+  try {
+    eval(content.slice(s, e) + '\ngbox.g = checkerGateState;');
+    var G = gbox.g;
+    test('gate: no checker -> not blocked (backward compat)', G({}).blocked === false);
+    test('gate: PASS with no findings -> not blocked', G({ checker:{ verdict:'PASS', issues:[], conflicts:[] } }).blocked === false);
+    test('gate: WARN with an issue -> blocked', G({ checker:{ verdict:'WARN', issues:[{description:'x'}] } }).blocked === true);
+    test('gate: conflicts alone -> blocked', G({ checker:{ verdict:'PASS', conflicts:[{note:'x'}] } }).blocked === true);
+    test('gate: FLAG with no itemised issue -> blocked', G({ checker:{ verdict:'FLAG' } }).blocked === true);
+    test('gate: acknowledged -> unblocked', G({ checker:{ verdict:'FLAG', issues:[{description:'x'}], acknowledged:{action:'dismissed'} } }).blocked === false);
+    test('gate: resolved issues do not block', G({ checker:{ verdict:'WARN', issues:[{description:'x', resolved:true}] } }).blocked === false);
+  } catch(err){ test('checkerGateState blocks/clears correctly', false); console.log('    ERROR:', err.message); }
 })();
 
 section('SYNTAX CHECK');
