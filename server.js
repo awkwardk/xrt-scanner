@@ -5,10 +5,7 @@ const fs = require('fs');
 const path = require('path');
 
 const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.ANTHROPIC_API_KEY || process.env.anthropic_api_key || '';
 const DATA_DIR = process.env.DATA_DIR || '/data/xrt-data'; // Render persistent disk mounts at /data
-
-console.log('[STARTUP] API key found:', API_KEY.length > 0);
 
 if(!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, {recursive:true});
 if(!fs.existsSync(path.join(DATA_DIR, 'items'))) fs.mkdirSync(path.join(DATA_DIR, 'items'), {recursive:true});
@@ -570,63 +567,42 @@ function callOpenRouter(payload, callback) {
   req.end();
 }
 
-function callClaude(payload, callback) {
-  var body = JSON.stringify(payload);
-  var options = {
-    hostname: 'api.anthropic.com',
-    path: '/v1/messages',
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': API_KEY,
-      'anthropic-version': '2023-06-01',
-      'Content-Length': Buffer.byteLength(body)
-    }
-  };
-  var req = https.request(options, function(res) {
-    var data = '';
-    res.on('data', function(c) { data += c; });
-    res.on('end', function() {
-      console.log('[API] Status:', res.statusCode);
-      if(res.statusCode !== 200) console.log('[API] Error:', data.slice(0,300));
-      try { var parsed = JSON.parse(data); parsed._httpStatus = res.statusCode; callback(null, parsed); }
-      catch(e) { callback(null, {content:[], type:'error', error:{message:'parse_failed'}, _httpStatus: res.statusCode}); }
-    });
+// ── Gemini Flash vision (via OpenRouter) — the single vision path for XRT.
+// Accepts ordered parts: {text:'...'} and/or {b64:'<base64 jpeg>'} and/or {url:'https://...'}.
+// Sends them as OpenRouter text / image_url blocks and hands back an Anthropic-SHAPED response
+// ({content:[{type:'text',text}]}) so every existing extractText()/extractFirstJson() call site is
+// unchanged. Matches the model + transport already used by the main listing pipeline.
+function callGeminiVisionParts(parts, maxTokens, callback){
+  var content = (Array.isArray(parts) ? parts : []).map(function(p){
+    if(p && p.b64) return { type:'image_url', image_url:{ url:'data:image/jpeg;base64,' + p.b64 } };
+    if(p && p.url) return { type:'image_url', image_url:{ url: String(p.url) } };
+    return { type:'text', text: String((p && p.text) || '') };
   });
-  req.on('error', function(e) { console.log('[API] Network error:', e.message); callback(e); });
-  req.write(body);
-  req.end();
+  callOpenRouter({
+    model: 'google/gemini-2.5-flash',
+    max_tokens: maxTokens || 1024,
+    messages: [{ role:'user', content: content }]
+  }, function(err, text){
+    if(err){ callback(err, null); return; }
+    callback(null, { content: [ { type:'text', text: (text || '') } ] });
+  });
 }
-// Build Anthropic image content blocks from a listing's photo list. Only eBay CDN (i.ebayimg.com)
-// URLs are used — those are already uploaded and publicly reachable; local/temp URLs are skipped so
-// the API never fails on an inaccessible URL. Capped at 6 images; when there are more than 6 CDN
-// photos, the first 5 plus the last photo are sent.
-function buildClaudePhotoBlocks(photos){
-  var urls = (Array.isArray(photos) ? photos : []).map(function(p){
-    if(p && typeof p === 'object') return String(p.url || p.src || p.href || '');
-    return String(p == null ? '' : p);
-  }).filter(function(u){ return u.indexOf('i.ebayimg.com') >= 0; });
-  if(!urls.length) return [];
-  var pick;
-  if(urls.length <= 6){ pick = urls.slice(); }
-  else { pick = urls.slice(0, 5); pick.push(urls[urls.length - 1]); }
-  return pick.slice(0, 6).map(function(u){ return { type:'image', source:{ type:'url', url: u } }; });
-}
-// FIX 1: optional `sharp` used ONLY to compress the COPY of each photo sent to Sonnet. The original
+
+// FIX 1: optional `sharp` used ONLY to compress the COPY of each photo sent to the model. The original
 // file on disk is never modified and the eBay upload pipeline (createImageFromUrl/getImage) always uses
 // the full-resolution original. If sharp is not installed the original bytes are sent unchanged.
 var _sharp = null;
-try { _sharp = require('sharp'); console.log('[PHOTO] sharp available — compressing photos for Sonnet'); }
-catch(e){ _sharp = null; console.log('[PHOTO] sharp not installed — sending original photos to Sonnet (add sharp to package.json to enable compression)'); }
-// Compress an image buffer for Sonnet: longest side <= 1024px (aspect kept), JPEG quality 85. Async.
+try { _sharp = require('sharp'); console.log('[PHOTO] sharp available — compressing photos for the model'); }
+catch(e){ _sharp = null; console.log('[PHOTO] sharp not installed — sending original photos to the model (add sharp to package.json to enable compression)'); }
+// Compress an image buffer for the model: longest side <= 1024px (aspect kept), JPEG quality 85. Async.
 // Falls back to the original buffer on any failure — never throws, never blocks listing generation.
-function compressForSonnet(buf, label, cb){
+function compressForModel(buf, label, cb){
   if(!_sharp){ cb(buf); return; }
   try {
     _sharp(buf).rotate().resize({ width:1024, height:1024, fit:'inside', withoutEnlargement:true }).jpeg({ quality:85 }).toBuffer()
       .then(function(out){
         if(out && out.length){
-          console.log('[PHOTO] compressed ' + Math.round(buf.length/1024) + 'KB → ' + Math.round(out.length/1024) + 'KB for Sonnet analysis (original file untouched)');
+          console.log('[PHOTO] compressed ' + Math.round(buf.length/1024) + 'KB → ' + Math.round(out.length/1024) + 'KB for model analysis (original file untouched)');
           cb(out);
         } else { cb(buf); }
       })
@@ -636,7 +612,7 @@ function compressForSonnet(buf, label, cb){
 // Build base64 image content blocks from a listing's LOCAL photo files (Render persistent disk). The
 // scale/weight photo (last) is never included — it is for weight OCR only. Selection: 1-7 photos -> all
 // except the scale photo; 8+ photos -> first 6 plus any testing/screen photos; scale photo always skipped.
-// Each photo is COMPRESSED for Sonnet (original file untouched). Async — calls back with the blocks array.
+// Each photo is COMPRESSED for the model (original file untouched). Async — calls back with the blocks array.
 function buildLocalPhotoBase64Blocks(itemDir, photoCount, weightIdx, testingPhotos, sku, callback){
   var blocks = [];
   function done(){ if(typeof callback === 'function') callback(blocks); }
@@ -662,7 +638,7 @@ function buildLocalPhotoBase64Blocks(itemDir, photoCount, weightIdx, testingPhot
       var buf;
       try { buf = fs.readFileSync(p); }
       catch(e){ console.log('[LISTING] skipping unreadable photo ' + p + ' for SKU ' + sku); nextFile(); return; }
-      compressForSonnet(buf, 'SKU ' + sku + ' ' + name, function(outBuf){
+      compressForModel(buf, 'SKU ' + sku + ' ' + name, function(outBuf){
         try { blocks.push({ type:'image', source:{ type:'base64', media_type:'image/jpeg', data: (outBuf || buf).toString('base64') } }); } catch(e2){}
         nextFile();
       });
@@ -674,43 +650,6 @@ function buildLocalPhotoBase64Blocks(itemDir, photoCount, weightIdx, testingPhot
 // from what it observes. With no blocks it sends the text-only prompt. If the image-included call fails
 // (e.g. an unreadable/inaccessible image), it falls back to a text-only call once so generation never
 // breaks because of a photo. Rate-limit/overload responses pass straight through. basePayload omits `messages`.
-function callClaudeWithImageBlocks(basePayload, textPrompt, imageBlocks, sku, callback){
-  function clonePayload(){ var p = {}; for(var k in basePayload){ if(Object.prototype.hasOwnProperty.call(basePayload, k)) p[k] = basePayload[k]; } return p; }
-  function textOnly(){ var p = clonePayload(); p.messages = [{ role:'user', content: textPrompt }]; callClaude(p, callback); }
-  if(!imageBlocks || !imageBlocks.length){ textOnly(); return; }
-  var content = imageBlocks.concat([{ type:'text', text: textPrompt }]);
-  var p2 = clonePayload(); p2.messages = [{ role:'user', content: content }];
-  var fellBack = false;
-  try {
-    callClaude(p2, function(err, resp){
-      if(isClaudeRateLimited(resp)){ callback(err, resp); return; }
-      if((err || (resp && resp.error)) && !fellBack){
-        fellBack = true;
-        console.log('[LISTING] image-assisted generation failed for SKU ' + sku + ', falling back to text-only: ' + (err ? err.message : (resp && resp.error ? resp.error.message : 'unknown')));
-        textOnly();
-        return;
-      }
-      callback(err, resp);
-    });
-  } catch(e){
-    console.log('[LISTING] image-assisted generation failed for SKU ' + sku + ', falling back to text-only: ' + e.message);
-    textOnly();
-  }
-}
-// CDN-URL variant (refresh pipeline): photos already live on eBay's CDN, so pass them as URL image blocks.
-function callClaudeWithPhotos(basePayload, textPrompt, photos, sku, callback){
-  var blocks = [];
-  try { blocks = buildClaudePhotoBlocks(photos); } catch(e){ blocks = []; }
-  callClaudeWithImageBlocks(basePayload, textPrompt, blocks, sku, callback);
-}
-// True when Anthropic signals a rate limit / overload (429 or rate_limit_error)
-function isClaudeRateLimited(resp){
-  if(!resp) return false;
-  if(resp._httpStatus === 429) return true;
-  if(resp.error && (resp.error.type === 'rate_limit_error' || resp.error.type === 'overloaded_error')) return true;
-  return false;
-}
-
 function extractText(content) {
   return (content||[]).filter(function(b){return b.type==='text';}).map(function(b){return b.text;}).join('');
 }
@@ -1039,7 +978,7 @@ const server = http.createServer(function(req, res) {
     return;
   }
 
-  // ── PROCESSOR IDENTIFIER (FEATURE 1) — Anthropic Sonnet vision ──
+  // ── PROCESSOR IDENTIFIER (FEATURE 1) — Gemini 2.5 Flash vision via OpenRouter ──
   if(req.method==='POST' && req.url==='/api/identify-item'){
     parseBody(req, function(err, parsed){
       if(err){ sendJSON(res,400,{error:'Bad request'}); return; }
@@ -1067,14 +1006,10 @@ const server = http.createServer(function(req, res) {
         '  "parts_repair_price": estimated AS-IS parts/repair sold price as integer (0 if no parts demand)',
         '}'
       ].join('\n');
-      callClaude({
-        model: 'claude-sonnet-4-5',
-        max_tokens: 1024,
-        messages: [{role:'user', content:[
-          {type:'image', source:{type:'base64', media_type:'image/jpeg', data:image}},
-          {type:'text', text: idPrompt}
-        ]}]
-      }, function(err2, resp){
+      callGeminiVisionParts([
+        { b64: image },
+        { text: idPrompt }
+      ], 1024, function(err2, resp){
         if(err2 || !resp){ sendJSON(res,200,{error:'vision_error'}); return; }
         var text = extractText(resp.content);
         var data = extractFirstJson(text) || {};
@@ -2597,8 +2532,22 @@ function generateRefreshItem(item, userNotes, callback){
     ].join('\n');
     var prevImp = item.improved || {};
     var refreshPhotoUrls = (prevImp.photos && prevImp.photos.length) ? prevImp.photos : (orig.photos || []);
-    callClaudeWithPhotos({ model:'claude-sonnet-4-5', max_tokens:2500, system: sys, tools:[{type:'web_search_20250305', name:'web_search', max_uses:5}] }, userMsg, refreshPhotoUrls, (orig.item_id || item.id || ''), function(err, resp){
-      if(err || !resp){ callback({ success:false, error:'AI request failed' }); return; }
+    // MIGRATION: refresh generation runs on Gemini 2.5 Flash via OpenRouter. Photos are already on
+    // eBay's CDN, so they are passed straight through as remote image_url blocks (max 6, same
+    // selection as before: all when <=6, else the first 5 plus the last).
+    var _refreshUrls = (Array.isArray(refreshPhotoUrls) ? refreshPhotoUrls : []).map(function(p){
+      if(p && typeof p === 'object') return String(p.url || p.src || p.href || '');
+      return String(p == null ? '' : p);
+    }).filter(function(u){ return u.indexOf('i.ebayimg.com') >= 0; });
+    if(_refreshUrls.length > 6){ _refreshUrls = _refreshUrls.slice(0, 5).concat([_refreshUrls[_refreshUrls.length - 1]]); }
+    var _refreshBlocks = _refreshUrls.map(function(u){ return { type:'image_url', image_url:{ url: u } }; });
+    callOpenRouter({
+      model: 'google/gemini-2.5-flash',
+      max_tokens: 2500,
+      messages: [ { role:'system', content: sys }, { role:'user', content: _refreshBlocks.concat([{ type:'text', text: userMsg }]) } ]
+    }, function(err, gText){
+      var resp = { content: [ { type:'text', text: (gText || '') } ] };
+      if(err){ callback({ success:false, error:'AI request failed' }); return; }
       var data = extractFirstJson(extractText(resp.content));
       if(!data || !data.title){ callback({ success:false, error:'Could not parse generated listing' }); return; }
       var q = readRefreshQueue(); var it = null;
@@ -3147,9 +3096,9 @@ function processBatch(pending) {
   processNext();
 }
 
-// ── LISTING GENERATION (Anthropic Sonnet) — FIX 1 ──
-// Step 1: vision ID via claude-sonnet-4-5 (skipped if identifier screen already ran)
-// Step 2: listing write via claude-sonnet-4-5 with web_search tool enabled
+// ── LISTING GENERATION (Gemini 2.5 Flash via OpenRouter) — FIX 1 ──
+// Step 1: vision ID via Gemini 2.5 Flash (skipped if identifier screen already ran)
+// Step 2: listing write via Gemini 2.5 Flash (OpenRouter)
 // ── LISTING GENERATION QUEUE ──
 // Handles 50+ items/shift without rate-limit errors: one item at a time, an
 // 8s gap between API calls, 60s pause on a 429, max 3 retries before failed.
@@ -3229,12 +3178,12 @@ function detectWeightAndDims(photoB64Array, callback){
   if(!photoB64Array || photoB64Array.length === 0){ callback(null); return; }
   var content = [];
   photoB64Array.slice(0,8).forEach(function(b64, i){
-    content.push({type:'text', text:'Photo '+(i+1)+':'});
-    content.push({type:'image', source:{type:'base64', media_type:'image/jpeg', data:b64}});
+    content.push({text:'Photo '+(i+1)+':'});
+    content.push({b64: b64});
   });
   // FIX 3: explicit two-number scale prompt (LEFT = pounds, RIGHT = ounces). Extra JSON fields are kept
   // so the existing pipeline (confidence gate, weight photo index, dimensions) is unaffected.
-  content.push({type:'text', text:[
+  content.push({text:[
     'This is a photo of a postal or shipping scale with a digital display. The display shows TWO separate numbers:',
     '- LEFT side or LEFT display: the POUNDS value',
     '- RIGHT side or RIGHT display: the OUNCES value',
@@ -3267,7 +3216,7 @@ function detectWeightAndDims(photoB64Array, callback){
     'If this is NOT a scale photo (a normal product photo), return: { "is_scale_photo": false, "lbs": null, "oz": null, "display_reading": null, "confidence": "low" }',
     'Do not guess. Only return values you can clearly read.'
   ].join('\n')});
-  callClaude({ model:'claude-sonnet-4-5', max_tokens:512, messages:[{role:'user', content:content}] }, function(err, resp){
+  callGeminiVisionParts(content, 512, function(err, resp){
     if(err || !resp){ callback(null); return; }
     var data = extractFirstJson(extractText(resp.content));
     if(!data){ callback(null); return; }
@@ -3495,17 +3444,21 @@ function regenerateListing(sku, userNotes, callback){
   ].join('\n');
 
   // CHANGE 5: regenerate uses base64 LOCAL photos when they still exist on disk (scale photo excluded).
-  // FIX 1: photos are compressed for Sonnet (async) before the call; originals on disk are untouched.
+  // FIX 1: photos are compressed for the model (async) before the call; originals on disk are untouched.
+  // MIGRATION: regenerate now uses Gemini 2.5 Flash via OpenRouter, matching the main listing pipeline
+  // exactly (same model, same transport, same system+user message shape, no Anthropic web_search tool).
   var regenPhotoCount = 0;
   while(fs.existsSync(path.join(itemDir, 'photo_' + (regenPhotoCount + 1) + '.jpg'))) regenPhotoCount++;
   buildLocalPhotoBase64Blocks(itemDir, regenPhotoCount, meta.weightPhotoIndex || null, meta.testingPhotos, sku, function(regenPhotoBlocks){
-  callClaudeWithImageBlocks({
-    model: 'claude-sonnet-4-5',
+  var _regenOrBlocks = toOpenRouterImageBlocks(regenPhotoBlocks);
+  console.log('[REGEN] SKU ' + sku + ' regenerating with ' + _regenOrBlocks.length + ' photos (Gemini)');
+  callOpenRouter({
+    model: 'google/gemini-2.5-flash',
     max_tokens: 2500,
-    system: systemPrompt,
-    tools: [{type:'web_search_20250305', name:'web_search', max_uses:5}]
-  }, userMessage, regenPhotoBlocks, sku, function(err, resp){
-    if(err || !resp){ callback({success:false, error:'AI request failed'}); return; }
+    messages: [ { role:'system', content: systemPrompt }, { role:'user', content: _regenOrBlocks.concat([{ type:'text', text: userMessage }]) } ]
+  }, function(err, gText){
+    var resp = { content: [ { type:'text', text: (gText || '') } ] };
+    if(err){ callback({success:false, error:'AI request failed'}); return; }
     var data = extractFirstJson(extractText(resp.content));
     if(!data || !data.title){ callback({success:false, error:'Could not parse regenerated listing'}); return; }
     record.listing = record.listing || {};
@@ -3527,7 +3480,7 @@ function regenerateListing(sku, userNotes, callback){
 
 // ══════════════════════════════════════════════════════════════════════════════
 // DUAL PIPELINE (ADDITIVE) — parallel Gemini Flash listing generation + a Checker
-// agent, running ALONGSIDE the existing Anthropic Sonnet pipeline. Every function
+// agent, running ALONGSIDE the main listing pipeline. Every function
 // below is new and self-contained. It never mutates the existing Sonnet generation
 // logic, and a Gemini/Checker failure never blocks Sonnet generation or eBay posting.
 // All OpenRouter calls reuse the existing OPENROUTER_KEY variable.
@@ -4373,7 +4326,7 @@ function verifySpecs(sku, listing, pipeline, humanFacts, callback){
 // post-generation stage runs the Spec Verifier (web-search accuracy check) and then the Checker
 // (photo vs listing), applying corrections to record.listing in place. Legacy dual-test records
 // (record.gemini present but record.listing empty) fall back to record.gemini. Never blocks.
-// The Anthropic Sonnet generator is NOT used here (kept in the file only for the regenerate route).
+// All generation here runs on Gemini 2.5 Flash via OpenRouter (the Anthropic generator was removed).
 function runDualPipeline(sku, callback){
   callback = typeof callback === 'function' ? callback : function(){};
   var itemDir = path.join(DATA_DIR, 'items', String(sku));
@@ -4673,9 +4626,9 @@ function processItem(item, callback) {
     function runListingClaude(){
     var listingPrompt = promptLines.join('\n');
     // CHANGE 1 (Gemini single pipeline): new items are generated by Gemini Flash via OpenRouter.
-    // The Anthropic Sonnet listing generator (callClaudeWithImageBlocks / callClaude) is kept in the
-    // file for the regenerate route but is NO LONGER called automatically for new items. Photos are
-    // still compressed via buildLocalPhotoBase64Blocks, then converted to OpenRouter image_url blocks.
+    // MIGRATION: the Anthropic Sonnet generator has been removed entirely — every AI call in XRT now
+    // runs on Gemini 2.5 Flash via OpenRouter. Photos are still compressed via
+    // buildLocalPhotoBase64Blocks, then converted to OpenRouter image_url blocks.
     buildLocalPhotoBase64Blocks(itemDir, photoCount, weightIdx, meta.testingPhotos, sku, function(listingPhotoBlocks){
     var _orBlocks = toOpenRouterImageBlocks(listingPhotoBlocks);
     console.log('[PIPELINE] SKU ' + sku + ' using Gemini Flash single pipeline');
@@ -4687,11 +4640,10 @@ function processItem(item, callback) {
       max_tokens: 2500,
       messages: [ { role:'system', content: listingSystemPrompt }, { role:'user', content: _orBlocks.concat([{ type:'text', text: listingPrompt }]) } ]
     }, function(gErr, gText) {
-      // Synthesize an Anthropic-shaped response so the assembly code below stays unchanged.
+      // Synthesize a content-block-shaped response so the assembly code below stays unchanged.
       var resp2 = { content: [ { type:'text', text: (gText || '') } ] };
-      // Rate limited — do not save a fallback listing; signal the queue to pause + retry (Gemini path
-      // never sets this, but the guard is preserved so behavior is identical for any future change).
-      if(isClaudeRateLimited(resp2)){ callback({sku:sku, meta:meta, rateLimited:true}); return; }
+      // (The former Anthropic rate-limit guard was removed with the Sonnet layer; it could never fire
+      // on a Gemini response. The queue's `rateLimited` pause/retry handling is left intact.)
       var listing = {};
       var listingText = resp2 ? extractText(resp2.content) : '';
       var parsedListing = extractFirstJson(listingText);
@@ -4820,14 +4772,10 @@ function processItem(item, callback) {
       });
       return;
     }
-    callClaude({
-      model: 'claude-sonnet-4-5',
-      max_tokens: 1024,
-      messages:[{role:'user',content:[
-        {type:'image', source:{type:'base64', media_type:'image/jpeg', data:photo1B64}},
-        {type:'text',text:'You are an expert electronics appraiser creating eBay listings for an e-waste resale business. Examine this image and identify the item with precision. Return ONLY a JSON object, no markdown, with: item_name (full descriptive name with brand and model), brand, model, serial_number (if visible), category (eBay category path), claude_grade (your own assessment: A=like new, B=normal used, C=heavy wear, D=parts/untested), condition_notes (honest description of what you observe).'}
-      ]}]
-    }, function(err1, resp1) {
+    callGeminiVisionParts([
+      { b64: photo1B64 },
+      { text: 'You are an expert electronics appraiser creating eBay listings for an e-waste resale business. Examine this image and identify the item with precision. Return ONLY a JSON object, no markdown, with: item_name (full descriptive name with brand and model), brand, model, serial_number (if visible), category (eBay category path), claude_grade (your own assessment: A=like new, B=normal used, C=heavy wear, D=parts/untested), condition_notes (honest description of what you observe).' }
+    ], 1024, function(err1, resp1) {
       var visionData = {};
       if(!err1 && resp1){
         var vt = extractText(resp1.content);
@@ -6022,8 +5970,8 @@ function buildDualCardHtml(r, i, colors, ebayStat){
   function pcard(pl, view){
     view = view || {};
     var accent = pl === 'gemini' ? '#00838f' : '#6a1b9a';
-    var label = pl === 'gemini' ? '&#9889; Gemini Flash' : '&#129302; Anthropic Sonnet';
-    var otherName = pl === 'gemini' ? 'Anthropic Sonnet' : 'Gemini Flash';
+    var label = pl === 'gemini' ? '&#9889; Gemini Flash (B)' : '&#9881; Main Pipeline (Gemini Flash)';
+    var otherName = pl === 'gemini' ? 'Main Pipeline' : 'Gemini Flash (B)';
     var status = view.status || 'complete';
     var listedThis = (r.listed_pipeline === pl) && r.ebay_item_id;
     var isSuperseded = (status === 'superseded') || (r.listed_pipeline && r.listed_pipeline !== pl);
