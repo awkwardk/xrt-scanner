@@ -1844,6 +1844,32 @@ const server = http.createServer(function(req, res) {
     return;
   }
 
+  // ── MAINTENANCE: drop stale Checker / Spec Verifier state for a SKU ──
+  // Removes listing.checker and listing.spec_verifier so the item re-evaluates from scratch on the
+  // next Regenerate instead of carrying findings written by an older build. Copy, photos, pricing,
+  // shipping and every other field are untouched. Accepts a comma-separated list of SKUs.
+  if(req.method==='POST' && /^\/api\/listings\/clear-checker\/[\d,]+$/.test(req.url.split('?')[0])){
+    var ccList = String(req.url.split('?')[0].split('/').pop() || '').split(',')
+      .map(function(s){ return s.trim(); }).filter(function(s){ return /^\d+$/.test(s); });
+    var ccDone = [], ccMissing = [];
+    ccList.forEach(function(ccSku){
+      var ccHad = false;
+      var ccRec = saveDualRecord(ccSku, function(rec){
+        rec.listing = rec.listing || {};
+        ccHad = !!(rec.listing.checker || rec.listing.spec_verifier);
+        delete rec.listing.checker;
+        delete rec.listing.spec_verifier;
+        if(rec.sonnet) delete rec.sonnet.checker;
+        if(rec.gemini) delete rec.gemini.checker;
+      });
+      if(ccRec){ ccDone.push({ sku: Number(ccSku), had_state: ccHad }); console.log('[MAINT] SKU ' + ccSku + ' checker/spec state cleared (had_state=' + ccHad + ')'); }
+      else { ccMissing.push(Number(ccSku)); }
+    });
+    try { loadListings(); } catch(e){}
+    sendJSON(res, 200, { success: ccMissing.length === 0, cleared: ccDone, not_found: ccMissing });
+    return;
+  }
+
   // ── PRE-PUBLISH GATE: acknowledge (dismiss) the Checker findings for a SKU ──
   // Records WHO cleared the gate and HOW on listing.checker.acknowledged. Never deletes findings —
   // the report stays on the record for audit; it only stops blocking publication.
@@ -3521,6 +3547,11 @@ function stripHtmlExcerpt(html, n){
 // review. Only a pathological description (> REVIEW_TEXT_MAX) is cut, and when that happens the cut
 // is labelled explicitly so the model never mistakes the boundary for the end of the listing.
 var REVIEW_TEXT_MAX = 12000;
+// Checker result schema version. Bumped whenever the Checker's issue shape or scope changes, so a
+// result produced by an OLDER build is recognisable as obsolete instead of being rendered forever as
+// if it were current. v2 = post-truncation-fix: scoped issue types, `old_text` + `suggested_fix` on
+// every issue. A stored result without this stamp predates the fix and must not be shown or gated on.
+var CHECKER_SCHEMA = 2;
 function descriptionTextForReview(html){
   var full = String(html == null ? '' : html).replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim();
   if(full.length <= REVIEW_TEXT_MAX) return full;
@@ -3702,7 +3733,7 @@ function checkListing(sku, listing, photos, pipeline, humanFacts, callback){
         var issues = Array.isArray(parsed.issues) ? parsed.issues : [];
         var conflicts = Array.isArray(parsed.conflicts) ? parsed.conflicts : [];
         var summary = String(parsed.summary || '');
-        var result = { verdict: verdict, issues: issues, conflicts: conflicts, summary: summary, corrections_made: [], could_not_fix: [], rejected: [], listing_updated: false };
+        var result = { schema: CHECKER_SCHEMA, verdict: verdict, issues: issues, conflicts: conflicts, summary: summary, corrections_made: [], could_not_fix: [], rejected: [], listing_updated: false };
         console.log('[CHECKER] SKU ' + sku + ' ' + pipeline + ' — verdict: ' + verdict + (conflicts.length ? (' | ' + conflicts.length + ' human-fact conflict(s) flagged') : ''));
 
         var fixable = issues.filter(function(x){ return x && x.fixable === true; });
@@ -4343,22 +4374,50 @@ function regenerateListingPipeline(sku, pipeline, notes, callback){
   if(!fs.existsSync(lp)){ callback({success:false, error:'Listing not found for SKU ' + sku}); return; }
 
   if(pipeline === 'sonnet'){
-    // Reuse the existing (UNCHANGED) Sonnet regenerator, then refresh the sonnet view + checker.
+    // ── FIX (stale-review bug) ──
+    // This branch used to build a detached `view` object, run ONLY the Checker against it, and save
+    // the result to record.sonnet.checker. The listings card renders record.listing.checker, which
+    // only runDualPipeline() ever wrote — so after a regenerate the card kept re-rendering the
+    // ORIGINAL Checker output forever, describing text that no longer existed. The Spec Verifier was
+    // skipped outright, and applyHumanFactGuards' note-restoration landed on the detached view
+    // instead of the displayed copy.
+    // It now mirrors runDualPipeline exactly: both review layers run against record.listing itself,
+    // every mutation lands on the displayed copy, and the verdict is written to record.listing.checker.
+    // record.sonnet is still maintained so the dual-pipeline view stays backward compatible.
     regenerateListing(sku, notes, function(result){
       if(!result || !result.success){ callback(result || {success:false, error:'Regeneration failed'}); return; }
       var rec; try { rec = JSON.parse(fs.readFileSync(lp, 'utf8')); } catch(e){ result.pipeline = 'sonnet'; callback(result); return; }
-      var view = dualPipelineView(rec.listing, 'sonnet', 'complete');
+      if(!rec.listing){ result.pipeline = 'sonnet'; callback(result); return; }
       var hf = rec.human_facts || buildHumanFacts(rec.meta, rec.visionData);
       buildDualPhotoBlocksForRecord(rec, itemDir, function(orBlocks){
-        checkListing(sku, view, orBlocks, 'sonnet', hf, function(chk){
-          chk = applyHumanFactGuards(sku, view, hf, chk);
-          view.checker = chk;
-          saveDualRecord(sku, function(r){ r.sonnet = view; if(r.gemini) r.dual_pipeline = true; });
-          try { loadListings(); } catch(e){}
-          result.pipeline = 'sonnet';
-          result.verdict = chk ? chk.verdict : 'UNKNOWN';
-          result.checker = chk;
-          callback(result);
+        // Stage: Spec Verifier (was skipped entirely on this path) — mutates rec.listing in place.
+        verifySpecs(sku, rec.listing, 'sonnet', hf, function(){
+          // Stage: Checker (photo vs listing) — mutates rec.listing in place (surgical only).
+          checkListing(sku, rec.listing, orBlocks, 'sonnet', hf, function(chk){
+            // Deterministic guards now operate on the DISPLAYED copy, so restored notes reach it.
+            chk = applyHumanFactGuards(sku, rec.listing, hf, chk);
+            var view = dualPipelineView(rec.listing, 'sonnet', 'complete');
+            view.checker = chk;
+            saveDualRecord(sku, function(r){
+              r.listing = r.listing || {};
+              ['title','condition_box','description_html','item_specifics','avg_sold_price','price_low','price_high','suggested_price','accept_price','decline_price','lot_quantity','is_lot','spec_verifier'].forEach(function(k){ if(rec.listing[k] !== undefined) r.listing[k] = rec.listing[k]; });
+              r.listing.checker = chk;          // <-- the field the card actually renders
+              r.human_facts = hf;
+              r.sonnet = view;                  // keep the dual view in sync (backward compat)
+              if(r.gemini) r.dual_pipeline = true;
+            });
+            try { loadListings(); } catch(e){}
+            var rspec = rec.listing.spec_verifier || {};
+            console.log('[REGEN] SKU ' + sku + ' sonnet complete — Checker: ' + (chk ? chk.verdict : 'UNKNOWN') + ((chk && chk.conflicts && chk.conflicts.length) ? (' (' + chk.conflicts.length + ' conflict)') : '') + ' | Spec: ' + ((rspec.corrections_made && rspec.corrections_made.length) ? (rspec.corrections_made.length + ' fixed') : (rspec.item_confirmed ? 'verified' : 'see report')));
+            // Return the POST-verifier / POST-guard copy so the card updates to what was actually saved.
+            result.pipeline = 'sonnet';
+            result.title = rec.listing.title;
+            result.condition_box = rec.listing.condition_box;
+            result.description_html = rec.listing.description_html;
+            result.verdict = chk ? chk.verdict : 'UNKNOWN';
+            result.checker = chk;
+            callback(result);
+          });
         });
       });
     });
@@ -5673,8 +5732,12 @@ function sanitizeForFilename(s){
 function checkerGateState(listing){
   listing = listing || {};
   var chk = listing.checker || null;
-  var out = { blocked:false, issues:[], conflicts:[], acked:null, verdict:'UNKNOWN' };
+  var out = { blocked:false, issues:[], conflicts:[], acked:null, verdict:'UNKNOWN', stale:false };
   if(!chk) return out;                                  // never run -> do not block (backward compat)
+  // A result from an older build describes copy that may since have been rewritten (that is exactly
+  // how obsolete findings survived a regenerate and kept gating). Treat it as "not run": surface it
+  // as stale in the UI and never block publication on it.
+  if(Number(chk.schema || 0) !== CHECKER_SCHEMA){ out.stale = true; return out; }
   out.verdict = String(chk.verdict || 'UNKNOWN').toUpperCase();
   out.issues = (Array.isArray(chk.issues) ? chk.issues : []).filter(function(x){ return x && !x.resolved; });
   out.conflicts = Array.isArray(chk.conflicts) ? chk.conflicts : [];
@@ -5692,13 +5755,17 @@ function renderListingBadges(sku, listing){
   listing = listing || {};
   var skuStr = String(sku);
   function esc(s){ return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
-  var chk = listing.checker || null;
-  var spec = listing.spec_verifier || null;
+  var gateEarly = checkerGateState(listing);
+  // A pre-fix Checker result is NOT shown as if it were current — its findings may describe copy that
+  // has since been rewritten. Render it as stale and hide the obsolete findings entirely.
+  var chk = (gateEarly.stale ? null : (listing.checker || null));
+  var spec = gateEarly.stale ? null : (listing.spec_verifier || null);
 
   // Checker badge (photos vs listing)
   var cv = (chk && chk.verdict) ? String(chk.verdict).toUpperCase() : 'UNKNOWN';
   var cmap = { PASS:['#2e7d32', '&#9989; PASS'], WARN:['#f9a825', '&#9888; WARN'], FLAG:['#c62828', '&#128680; FLAG'], UNKNOWN:['#757575', '&#10067; Not run'] };
   var cm = cmap[cv] || cmap.UNKNOWN;
+  if(gateEarly.stale) cm = ['#8d6e00', '&#8635; Stale &mdash; regenerate to re-check'];
   var checkerBadge = '<span onclick="toggleCardChecker(\'' + skuStr + '\')" title="Checker — photos vs listing. Click for report." style="display:inline-block;cursor:pointer;background:' + cm[0] + ';color:#fff;padding:3px 10px;border-radius:11px;font-size:12px;font-weight:bold;">Checker: ' + cm[1] + '</span>';
   // Human-fact conflict flag — photo contradicts a human-entered fact; NEVER auto-changed, Kendall judges.
   var chkConflicts = (chk && Array.isArray(chk.conflicts)) ? chk.conflicts : [];
@@ -5748,6 +5815,9 @@ function renderListingBadges(sku, listing){
     if(corr.length){ cpan += '<div style="font-weight:bold;color:#2e7d32;margin-top:6px;">Corrections made automatically:</div><ul style="margin:4px 0 4px 18px;">'; corr.forEach(function(c){ cpan += '<li>' + fmtCorr(c) + '</li>'; }); cpan += '</ul>'; }
     if(cnf.length){ cpan += '<div style="font-weight:bold;color:#8d6e00;margin-top:6px;">Blocked (protected — not changed):</div><ul style="margin:4px 0 4px 18px;">'; cnf.forEach(function(c){ cpan += '<li>' + esc(c) + '</li>'; }); cpan += '</ul>'; }
     if(!issues.length && !corr.length && !cnf.length && !chkConflicts.length){ cpan += '<div style="color:#2e7d32;">No issues found.</div>'; }
+  } else if(gateEarly.stale){
+    cpan += '<div style="color:#8d6e00;font-weight:bold;">This item was last checked by an older build.</div>'
+      + '<div style="margin-top:4px;color:#555;">Its findings were written before the current Checker and may describe wording that has since been rewritten, so they are not shown and do not block listing. Click Regenerate to re-check this item against the current code.</div>';
   } else { cpan += '<div style="color:#757575;">Checker has not run for this listing yet.</div>'; }
   cpan += '</div>';
 
@@ -6273,7 +6343,7 @@ function generateListingsPage(listings, ebayStat){
     +'function toggleRegen(sku){var pa=document.getElementById("regpanel_"+sku);if(!pa)return;var show=(pa.style.display==="none"||!pa.style.display);pa.style.display=show?"block":"none";if(show){var t=document.getElementById("regnotes_"+sku);if(t)t.focus();}}'
     +'function cancelRegen(sku){var pa=document.getElementById("regpanel_"+sku);if(pa)pa.style.display="none";var m=document.getElementById("regmsg_"+sku);if(m)m.textContent="";}'
     +'function applyRegen(sku,d){var tt=document.getElementById("t_"+sku);if(tt&&d.title!=null)tt.value=d.title;var cc=document.getElementById("c_"+sku);if(cc&&d.condition_box!=null)cc.value=d.condition_box;var hh=document.getElementById("h_"+sku);if(hh&&d.description_html!=null)hh.value=d.description_html;var ts=document.getElementById("title_"+sku);if(ts&&d.title!=null){ts.setAttribute("data-raw",d.title);ts.textContent=d.title;}var sg=document.getElementById("sug_"+sku);if(sg&&d.suggested_price!=null)sg.textContent=d.suggested_price;}'
-    +'function doRegen(sku){var inp=document.getElementById("regnotes_"+sku);var notes=inp?inp.value:"";var st=document.getElementById("regmsg_"+sku);var btn=document.getElementById("regbtn_"+sku);if(st){st.style.color="#8d6e00";st.textContent="Regenerating...";}if(btn){btn.disabled=true;btn.innerHTML="Regenerating...";}fetch("/api/regenerate-listing/"+sku,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({notes:notes})}).then(function(r){return r.json();}).then(function(d){if(btn){btn.disabled=false;btn.innerHTML="&#8634; Regenerate";}if(d&&d.success){applyRegen(sku,d);if(st){st.style.color="#2e7d32";st.textContent="Updated \\u2713";}setTimeout(function(){cancelRegen(sku);},1400);}else{if(st){st.style.color="#c62828";st.textContent=(d&&d.error)||"Failed";}}}).catch(function(){if(btn){btn.disabled=false;btn.innerHTML="&#8634; Regenerate";}if(st){st.style.color="#c62828";st.textContent="Network error";}});}'
+    +'function doRegen(sku){var inp=document.getElementById("regnotes_"+sku);var notes=inp?inp.value:"";var st=document.getElementById("regmsg_"+sku);var btn=document.getElementById("regbtn_"+sku);if(st){st.style.color="#8d6e00";st.textContent="Regenerating...";}if(btn){btn.disabled=true;btn.innerHTML="Regenerating...";}fetch("/api/regenerate-listing/"+sku,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({notes:notes})}).then(function(r){return r.json();}).then(function(d){if(btn){btn.disabled=false;btn.innerHTML="&#8634; Regenerate";}if(d&&d.success){applyRegen(sku,d);if(st){st.style.color="#2e7d32";st.textContent="Updated \\u2713 (reloading)";}setTimeout(function(){location.reload();},1200);}else{if(st){st.style.color="#c62828";st.textContent=(d&&d.error)||"Failed";}}}).catch(function(){if(btn){btn.disabled=false;btn.innerHTML="&#8634; Regenerate";}if(st){st.style.color="#c62828";st.textContent="Network error";}});}'
     +'function setupStrip(strip){function thumbs(){return Array.prototype.slice.call(strip.querySelectorAll(".lp-thumb"));}thumbs().forEach(function(thumb){thumb.style.cursor="grab";thumb.style.touchAction="none";var dragging=false,moved=false,sku=thumb.getAttribute("data-sku");thumb.addEventListener("pointerdown",function(e){if(e.target.closest&&e.target.closest(".thumb-del-btn"))return;e.preventDefault();try{thumb.setPointerCapture(e.pointerId);}catch(_e){}dragging=true;moved=false;});thumb.addEventListener("pointermove",function(e){if(!dragging)return;e.preventDefault();if(!moved){moved=true;thumb.style.opacity="0.7";thumb.style.cursor="grabbing";thumb.style.borderLeft="3px solid #1565c0";}var over=document.elementFromPoint(e.clientX,e.clientY);var t=(over&&over.closest)?over.closest(".lp-thumb"):null;if(t&&t!==thumb&&t.parentNode===strip){var rect=t.getBoundingClientRect();var before=(e.clientX<rect.left+rect.width/2);strip.insertBefore(thumb,before?t:t.nextSibling);}});function end(e){if(!dragging)return;dragging=false;try{thumb.releasePointerCapture(e.pointerId);}catch(_e){}thumb.style.opacity="";thumb.style.cursor="grab";thumb.style.borderLeft="";if(moved){var order=thumbs().map(function(x){return x.getAttribute("data-stem");});savePhotoOrder(sku,order,strip);}else{var im=thumb.querySelector("img");if(im)openLightbox(im);}}thumb.addEventListener("pointerup",end);thumb.addEventListener("pointercancel",function(e){if(dragging){dragging=false;thumb.style.opacity="";thumb.style.cursor="grab";thumb.style.borderLeft="";try{thumb.releasePointerCapture(e.pointerId);}catch(_e){}}});});}'
     +'function editWeight(span){if(span.dataset.editing)return;span.dataset.editing="1";var sku=span.getAttribute("data-sku");var clbs=parseInt(span.getAttribute("data-lbs"),10)||0;var coz=parseFloat(span.getAttribute("data-oz"))||0;var prev=span.innerHTML;var msg=document.getElementById("wtmsg2_"+sku);span.innerHTML="";var lb=document.createElement("input");lb.type="number";lb.min="0";lb.step="1";lb.value=clbs;lb.style.cssText="width:52px;padding:2px 4px;border:1px solid #1565c0;border-radius:3px;font-size:12.5px;";var oz=document.createElement("input");oz.type="number";oz.min="0";oz.step="0.1";oz.value=coz;oz.style.cssText="width:52px;padding:2px 4px;border:1px solid #1565c0;border-radius:3px;font-size:12.5px;margin-left:4px;";var rc=document.createElement("button");rc.textContent="Recalculate";rc.style.cssText="margin-left:6px;padding:3px 10px;border:none;border-radius:4px;background:#1565c0;color:#fff;font-size:12px;font-weight:bold;cursor:pointer;";span.appendChild(lb);span.appendChild(document.createTextNode(" lb "));span.appendChild(oz);span.appendChild(document.createTextNode(" oz "));span.appendChild(rc);lb.focus();lb.select();var done=false;function restore(){span.removeAttribute("data-editing");span.innerHTML=prev;}function save(){if(done)return;done=true;var L=parseInt(lb.value,10);if(isNaN(L))L=0;var O=parseFloat(oz.value);if(isNaN(O))O=0;if(L<0||O<0||(L===0&&O===0)){if(msg){msg.style.color="#c62828";msg.textContent="Enter lb and/or oz";}restore();return;}if(msg){msg.style.color="#8d6e00";msg.textContent="Recalculating...";}fetch("/api/listings/"+sku,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({weight_lbs:L,weight_oz:O})}).then(function(r){return r.json();}).then(function(d){span.removeAttribute("data-editing");if(d&&d.success){span.setAttribute("data-lbs",d.weight_lbs);span.setAttribute("data-oz",d.weight_oz);span.innerHTML=d.weight_lbs+" lbs "+d.weight_oz+" oz &rarr; Tier "+d.tier+" | "+d.box_size;var dim=document.getElementById("dim_"+sku);if(dim&&d.box_dimensions){dim.textContent=d.box_dimensions;}if(msg){msg.style.color="#2e7d32";msg.textContent="Weight updated - Tier "+d.tier;setTimeout(function(){msg.textContent="";},2500);}}else{span.innerHTML=prev;if(msg){msg.style.color="#c62828";msg.textContent=(d&&d.error)||"Failed";}}}).catch(function(){span.removeAttribute("data-editing");span.innerHTML=prev;if(msg){msg.style.color="#c62828";msg.textContent="Network error";}});}rc.addEventListener("click",save);lb.addEventListener("keydown",function(e){if(e.key==="Enter"){e.preventDefault();oz.focus();}else if(e.key==="Escape"){done=true;restore();}});oz.addEventListener("keydown",function(e){if(e.key==="Enter"){e.preventDefault();save();}else if(e.key==="Escape"){done=true;restore();}});}'
     +'var lpLbList=[],lpLbIdx=0,lpTouchX=0;'
