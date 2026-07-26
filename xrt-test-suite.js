@@ -688,6 +688,23 @@ test('neutral wording marked correct',           has('is the CORRECT treatment, 
 test('human note is the only exception',         has('a human note above that directly states what is or is not installed'));
 test('guessing framed as the failure mode',      has('whether the guess is worded as a spec, as a missing part, or as a completeness/condition problem'));
 
+section('COVERS / PANELS SHOWN OPEN OR REMOVED (documentation photos)');
+// Generator: an open/removed cover in one frame is a documentation shot, not a missing part.
+test('generator rule present',                 has('COVERS, PANELS, DOORS AND COMPARTMENTS SHOWN OPEN OR REMOVED'));
+test('framed as a documentation photo',        has('is almost always a DOCUMENTATION photo'));
+test('judge across whole photo set',           has('Judge presence across the WHOLE photo set, never from a single frame'));
+test('assembled majority means included',      has('that part IS present and') && has('included — describe it as included'));
+test('no missing/absent wording',              has('"missing", "not included", "absent" or'));
+test('no condition downgrade for it',          has('do NOT downgrade the condition or grade because of it'));
+test('two explicit exceptions only',           has('no photo anywhere shows it in place') && has('the seller notes explicitly say it is missing'));
+test('describe what the photo documents',      has('describe what it DOCUMENTS'));
+test('covers closures generally',              has('battery covers and doors, access and service panels'));
+// Checker: same case is out of scope.
+test('open/removed cover out of Checker scope', has('appears OPEN or REMOVED in some photos while other'));
+test('documentation shot named in scope',       has('That is a documentation shot'));
+test('not an over-claim either',                has('listing as over-claiming by describing the part as included'));
+test('genuine-missing test (a) and (b)',        has('NO photo anywhere shows it in place or attached, or (b) a human note above'));
+
 section('DESCRIPTION TEMPLATE LOCK');
 test('template block present',                 has('REQUIRED DESCRIPTION TEMPLATE — MANDATORY, EVERY ITEM, EVERY TIME'));
 test('Overview section required',              has('<h3>Overview</h3>'));
