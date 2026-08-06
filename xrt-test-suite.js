@@ -252,7 +252,7 @@ test('Top category by percent',        has('PercentItemFound') && has('highest p
 test('Suggested category stored',      has('ebay_category_id') && has('ebay_category_name'));
 test('183446 fallback path',           has('function fallbackCategory(') && has('falling back to 183446'));
 test('Leaf validation via Features',   has('confirmed LEAF') && has('NOT a leaf') && has('leaf: leaf'));
-test('GetCategoryFeatures leaf parse', has("parseXmlTag(body, 'LeafCategory')"));
+test('GetCategoryFeatures leaf parse', has("parseXmlTag(scope, 'LeafCategory')") && has("parseXmlTag(scope, 'ConditionValues')"));
 test('Iterate suggestions for leaf',   has('function tryNext(') && has('trying next suggestion'));
 test('Max 5 leaf attempts',            has('Math.min(5, cats.length)') && has('max 5 attempts'));
 test('Suggested returns ranked list',  has('callback(null, cats)'));
@@ -267,7 +267,10 @@ test('List on eBay button',           has('List on eBay') && has('function listE
 test('Listed link after success',     has('Listed &#10003;'));
 test('No Publish button',             !has('Publish to eBay') && !has('function publishEbay'));
 test('conditionIdForCategory helper', has('function conditionIdForCategory('));
-test('Condition grade->ID map',       has('idMap = { A:1000, B:3000, C:5000, D:7000 }'));
+test('Condition grade->ID map',       has('idMap = { A:1000, B:3000, C:3000, D:7000 }'));
+test('Condition IDs are per-category',  has('function conditionIdForCategory(grade, categoryId, partsRepair, validIds)') && has('validIds && validIds.length'));
+test('Condition error != category error',has('21916883|invalid condition') && has('CONDITION ERROR for SKU') && !has('/category|not a leaf'));
+test('Category change re-derives cond',  has('function recheckCategory(') && has('restart the condition ladder'));
 test('eBay debug full fields',        has('env_user_token_present') && has('ebay_auth_scopes') && has('authorization_header_format'));
 
 section('eBay AddItem PRODUCTION HARDENING');
@@ -344,7 +347,7 @@ section('eBay AddItem 10-SCENARIO BUILDER (functional)');
       var xml = buildAddItemXml(r, {pictureUrls:pics, policies:pol, categoryId:r.listing.category_id});
       var t = (xml.match(/<Title>([\s\S]*?)<\/Title>/) || [])[1] || '';
       var cid = (xml.match(/<ConditionID>(\d+)<\/ConditionID>/) || [])[1];
-      var want = r.listing.parts_repair ? '7000' : ({A:'1000',B:'3000',C:'5000',D:'7000'}[r.meta.grade]);
+      var want = r.listing.parts_repair ? '7000' : ({A:'1000',B:'3000',C:'3000',D:'7000'}[r.meta.grade]);
       var vals = (xml.match(/<Value>([\s\S]*?)<\/Value>/g) || []).map(function(v){ return v.replace(/<\/?Value>/g,''); });
       var good = /<AddItemRequest[\s\S]*<\/AddItemRequest>$/.test(xml)
         && t.length <= 80

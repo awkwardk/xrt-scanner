@@ -441,10 +441,25 @@ function gradeToEbayCondition(grade, partsRepair){
 }
 // Map our grade -> the correct eBay condition ID for the item's category.
 // Most electronics and Audio/Musical instruments share the same mapping.
-function conditionIdForCategory(grade, categoryId, partsRepair){
-  var idMap = { A:1000, B:3000, C:5000, D:7000 };
+// Grade -> eBay ConditionID. `validIds` (from GetCategoryFeatures ConditionValues) is authoritative
+// when supplied — condition IDs are PER-CATEGORY, not global.
+//
+// ROOT-CAUSE FIX (error 21916883 "Invalid condition id ... for the selected primary category id"):
+// this used to be a fixed map with C -> 5000. IDs 4000/5000/6000 ("Very Good"/"Good"/"Acceptable")
+// are only offered in media-style categories; consumer-electronics categories (e.g. 14981 Receivers,
+// 15088 VCRs, 14990 Home Speakers) accept 1000/1500/2500/3000/7000 but NOT 5000 — so every grade-C
+// item in those categories was rejected. 3000 ("Used") is the safe cross-category default; 5000 is
+// still used when the category actually advertises it.
+function conditionIdForCategory(grade, categoryId, partsRepair, validIds){
+  var idMap = { A:1000, B:3000, C:3000, D:7000 };
+  if(validIds && validIds.length){
+    var prefByGrade = { A:[1000,1500,2000,2500,3000], B:[3000,2500,2000,4000,5000,1000], C:[5000,6000,3000,4000,7000], D:[7000,6000,5000] };
+    var pref = partsRepair ? [7000,6000,5000] : (prefByGrade[grade] || [3000,5000,1000]);
+    for(var i = 0; i < pref.length; i++){ if(validIds.indexOf(String(pref[i])) >= 0) return parseInt(pref[i], 10); }
+    return parseInt(validIds[0], 10);
+  }
   if(partsRepair) return 7000;
-  return idMap[grade] || 5000;
+  return idMap[grade] || 3000;
 }
 // eBay Inventory API uses condition enums; map an ID back to its enum.
 function conditionIdToEnum(id){
@@ -4950,7 +4965,9 @@ function buildAddItemXml(record, opts){
   var desc = cdataSafe(listing.description_html || listing.condition_box || ('<p>' + xmlEscape(title) + '</p>'));
   var categoryId = opts.categoryId || listing.category_id || 293;
   var price = listing.suggested_price || listing.avg_sold_price || 0;
-  var condId = opts.conditionId || conditionIdForCategory(meta.grade, categoryId, listing.parts_repair);
+  // opts.validConditions = this category's ConditionValues (authoritative). Without it we fall back to
+  // the safe cross-category default rather than a fixed grade map that can be invalid here.
+  var condId = opts.conditionId || conditionIdForCategory(meta.grade, categoryId, listing.parts_repair, opts.validConditions || record.ebay_valid_conditions);
   var condDesc = (listing.condition_box && listing.condition_box.trim()) ? listing.condition_box : ('Grade ' + (meta.grade || 'B') + ' - used, tested. See photos.');
   // FIX 4: quantity may be set on the listing record (PATCH /api/listings/:sku) or meta
   var qty = parseInt(listing.quantity || record.quantity || meta.quantity || 1, 10) || 1;
@@ -5229,9 +5246,26 @@ function getCategoryFeatures(categoryId, token, callback){
   ebayTradingCall('GetCategoryFeatures', xml, token, function(err, sc, body){
     if(err){ callback(err); return; }
     var ack = parseXmlTag(body, 'Ack') || '';
-    var leaf = String(parseXmlTag(body, 'LeafCategory') || '').toLowerCase() === 'true';
-    var cvBlock = parseXmlTag(body, 'ConditionValues') || '';
+    // ROOT-CAUSE FIX: a ReturnAll response contains BOTH the requested <Category> block and a
+    // <SiteDefaults> block, each with their own <LeafCategory> and <ConditionValues>. The old code
+    // used parseXmlTag(body,...) which returns the FIRST match in the whole document — so it could
+    // read SiteDefaults instead of the category, yielding a wrong leaf flag and (worse) a condition
+    // list that does not belong to this category. Anchor both reads to the matching <Category> block.
+    var scope = null;
+    parseXmlAll(body, 'Category').forEach(function(blk){
+      if(scope) return;
+      if(String(parseXmlTag(blk, 'CategoryID') || '').trim() === String(categoryId).trim()) scope = blk;
+    });
+    if(!scope){
+      console.log('[CATEGORY] ' + categoryId + ' — no matching <Category> block in GetCategoryFeatures response; conditions unknown');
+      if(ack === 'Success' || ack === 'Warning'){ callback(null, {leaf: null, conditions: [], unknown: true}); return; }
+      callback(new Error('GetCategoryFeatures Ack=' + (ack || '?')));
+      return;
+    }
+    var leaf = String(parseXmlTag(scope, 'LeafCategory') || '').toLowerCase() === 'true';
+    var cvBlock = parseXmlTag(scope, 'ConditionValues') || '';
     var ids = parseXmlAll(cvBlock, 'Condition').map(function(c){ return (parseXmlTag(c, 'ID') || '').trim(); }).filter(Boolean);
+    console.log('[CATEGORY] ' + categoryId + ' leaf=' + leaf + ' validConditions=[' + ids.join(',') + ']');
     if(ack === 'Success' || ack === 'Warning'){ callback(null, {leaf: leaf, conditions: ids}); return; }
     callback(new Error('GetCategoryFeatures Ack=' + (ack || '?')));
   });
@@ -5558,16 +5592,33 @@ function createEbayListing(sku, callback){
             fetchEbayPolicies(function(pe, pol){ if(!pe && pol) policies = pol; attempt(); });
             return;
           }
-          // Category not a leaf (error 87) — rare since GetSuggestedCategories returns leaves.
-          // Single fallback to 183446 (confirmed leaf, accepts all condition IDs).
-          if((/category|not a leaf|\b87\b/.test(blob)) && String(categoryId) !== '183446' && !triedLeafFallback){
+          // ── CONDITION errors MUST be tested before category errors ──
+          // eBay error 21916883 reads "Invalid condition id ... invalid for the selected primary
+          // CATEGORY id". The old category branch matched a bare /category/, so this condition error
+          // was mislabeled a CATEGORY ERROR and forced the listing into the 183446 fallback — which
+          // then failed its own leaf check (error 87). That is the real source of the "not a leaf"
+          // failures, and it is also why manually re-entering the correct category never helped:
+          // the category was never the problem, and the fallback overwrote it every time.
+          if(/21916883|invalid condition|condition id|conditionid/.test(blob) && condIdx < condFallbacks.length - 1){
+            condIdx++;
+            console.log('[EBAY] CONDITION ERROR for SKU', sku, '- condition rejected for category', categoryId,
+              '(' + (msgs.join('; ') || ('code ' + ebayErrorCodes(body).join(','))) + ')');
+            console.log('[EBAY] condition invalid — retrying with condition ID', condFallbacks[condIdx]);
+            attempt(); return;
+          }
+          // Category not a leaf (error 87). Matched ONLY on explicit leaf/87 signals — never on the
+          // bare word "category", which appears in unrelated error text (see above).
+          if((/\b87\b|not a leaf|leaf category/.test(blob)) && String(categoryId) !== '183446' && !triedLeafFallback){
             triedLeafFallback = true;
             console.log('[EBAY] CATEGORY ERROR for SKU', sku, '- category', categoryId,
               'rejected (' + (msgs.join('; ') || ('code ' + ebayErrorCodes(body).join(','))) + ') — falling back to 183446');
             categoryId = 183446;
-            attempt(); return;
+            // A category change invalidates the condition: valid IDs are per-category. Re-derive the
+            // condition (and required specifics) for the new category before retrying.
+            recheckCategory(183446, function(){ attempt(); });
+            return;
           }
-          // Condition invalid for category -> retry 3000, then 1000
+          // Any other condition-related rejection -> retry 3000, then 1000
           if(/condition/.test(blob) && condIdx < condFallbacks.length - 1){
             condIdx++;
             console.log('[EBAY] condition invalid — retrying with condition ID', condFallbacks[condIdx]);
@@ -5594,6 +5645,57 @@ function createEbayListing(sku, callback){
       // GetSuggestedCategories returns a ranked list. For each (max 5), call
       // GetCategoryFeatures to confirm it's a LEAF (LeafCategory=true) and read its
       // valid ConditionIDs. Use the first leaf found; if none in 5, fall back to 183446.
+      // Re-resolve everything that is PER-CATEGORY after the category changes mid-flight: leaf status,
+      // valid condition IDs, and required item specifics. Without this, a category fallback keeps the
+      // previous category's condition (invalid here) and its required specifics (wrong here), so the
+      // retry fails for a brand-new reason. Also self-heals the hardcoded 183446 fallback: if 183446
+      // is itself no longer a leaf, we search for a real leaf instead of retrying a dead constant.
+      function recheckCategory(newCatId, done, _depth){
+        _depth = _depth || 0;
+        if(_depth > 2){ console.log('[EBAY] SKU', sku, 'category recheck depth exceeded — retrying as-is'); done(); return; }
+        getCategoryFeatures(newCatId, token, function(fErr, feat){
+          var isLeaf = !!(feat && feat.leaf === true);
+          var conds = (feat && feat.conditions) || [];
+          if(!fErr && isLeaf){
+            categoryId = newCatId;
+            record.ebay_category_id = newCatId;
+            if(conds.length){
+              record.ebay_valid_conditions = conds;
+              forcedCondition = pickValidCondition(meta.grade, listing.parts_repair, conds);
+              condIdx = -1; // new category -> restart the condition ladder from the derived value
+              console.log('[EBAY] SKU', sku, 'category', newCatId, 'valid conditions [' + conds.join(',') + '] — using', forcedCondition);
+            }
+            getCategorySpecifics(newCatId, token, function(spErr, specs){
+              if(!spErr && specs && specs.required){
+                record.ebay_required_specifics = specs.required;
+                var is = record.listing.item_specifics = record.listing.item_specifics || {};
+                var have = Object.keys(is).map(function(k){ return k.toLowerCase(); });
+                specs.required.forEach(function(n){ if(have.indexOf(String(n).toLowerCase()) < 0) is[n] = 'Not Specified'; });
+              }
+              try { fs.writeFileSync(listingPath, JSON.stringify(record, null, 2)); } catch(_e){}
+              done();
+            });
+            return;
+          }
+          // 183446 (or whatever fallback) is not usable — find a genuine leaf instead of looping.
+          console.log('[EBAY] SKU', sku, 'fallback category', newCatId, 'is NOT a usable leaf' +
+            (fErr ? (' (' + fErr.message + ')') : '') + ' — searching for a real leaf category');
+          getSuggestedCategory(record.listing.title, token, function(scErr, cats){
+            if(scErr || !cats || !cats.length){ console.log('[EBAY] SKU', sku, 'no suggested categories available — retrying as-is'); done(); return; }
+            var i = 0, max = Math.min(5, cats.length);
+            (function tryNext(){
+              if(i >= max){ console.log('[EBAY] SKU', sku, 'no leaf found in top ' + max + ' suggestions — retrying as-is'); done(); return; }
+              var c = cats[i]; i++;
+              getCategoryFeatures(c.id, token, function(e2, f2){
+                if(!e2 && f2 && f2.leaf === true){
+                  console.log('[EBAY] SKU', sku, 'recovered leaf category', c.id, '(' + c.name + ')');
+                  recheckCategory(c.id, done, _depth + 1);
+                } else { tryNext(); }
+              });
+            })();
+          });
+        });
+      }
       function finalizeCategory(catId, catName, conditions){
         categoryId = catId;
         record.ebay_category_id = catId;
