@@ -446,8 +446,6 @@ test('surgical patch enforcer',             has('function applySurgicalCorrectio
 test('deterministic quantity guard',        has('function enforceQuantityGuard('));
 test('guard revert log line',               has('[GUARD] SKU'));
 test('verifier takes humanFacts',           has('function verifySpecs(sku, listing, pipeline, humanFacts, callback)'));
-test('checker takes humanFacts',            has('function checkListing(sku, listing, photos, pipeline, humanFacts, callback)'));
-test('checker conflict array',              has('"conflicts": [') && has('human-fact conflict'));
 test('verifier surgical contract',          has('NEVER return a rewritten description'));
 test('web search stays openrouter:web_search', has("'openrouter:web_search'"));
 test('scale is_scale_photo OCR field',      has('is_scale_photo'));
@@ -455,7 +453,6 @@ test('resolveScalePhoto helper',            has('function resolveScalePhoto('));
 test('no_scale_detected flag',              has('no_scale_detected'));
 test('scale manual toggle route',           has('/scale-toggle') && has('function toggleScalePhoto('));
 test('no-scale warning on page',            has('No scale photo detected'));
-test('conflict flag on badge',              has('Conflict') && has('&#128681;'));
 test('discrete lot qty field (processor)',  has('identLotQty'));
 
 section('HUMAN GROUND TRUTH — enforcement (functional)');
@@ -538,7 +535,7 @@ test('shared deterministic guard entry',       has('function applyHumanFactGuard
 test('claimStatedByHuman is note-derived (no vocab)', !has('keyPhrases') && !has('roller worn'));
 test('positive omission flagged not appended', has('flagged omitted positive note'));
 test('omission restore log line',              has('restored omitted human note'));
-test('guards run in pipeline',                 has('chk = applyHumanFactGuards(sku, record.listing, hf, chk)'));
+test('guards run in pipeline',                 has('applyHumanFactGuards(sku, record.listing, hf, null)'));
 test('lot qty field empty default (dirty/null)', has("placeholder='1'") && !has("step='1' value='1'"));
 
 section('OMISSION DEFENSE — presence check (functional)');
@@ -640,11 +637,8 @@ section('OMISSION DEFENSE — presence check (functional)');
 
 section('CHECKER INPUT — no truncated review text');
 test('descriptionTextForReview exists',        has('function descriptionTextForReview('));
-test('Checker gets full description',          has('var descFull = descriptionTextForReview(listing.description_html)'));
 test('Checker no longer excerpts to 500',      !has('stripHtmlExcerpt(listing.description_html, 500)'));
 test('Spec Verifier no longer excerpts to 800', !has('stripHtmlExcerpt(listing.description_html, 800)'));
-test('Checker labels text as complete',        has('Description (complete plain text): '));
-test('Checker told not to report truncation',  has('never report it as truncated or cut off'));
 (function(){
   // Functional: the real SKU 2364 failure shape — a ~1100 char description must reach the Checker
   // whole. The old 500-char excerpt cut mid-sentence and the Checker reported the cut as a defect.
@@ -667,13 +661,7 @@ test('Checker told not to report truncation',  has('never report it as truncated
 })();
 
 section('CHECKER SCOPE — photo-inferred claims only');
-test('checkerScopeBlock exists',               has('function checkerScopeBlock('));
-test('scope block wired into Checker prompt',  has('checkerScopeBlock(humanFacts)'));
 test('identity recorded in human facts',       has('identity_confirmed:'));
-test('brand/model/MPN out of scope',           has('The brand, model number, MPN, or item identity'));
-test('unreadable serial not flagged',          has('A serial number being unreadable'));
-test('unverifiable claims not flagged',        has('Silence is the correct response to an'));
-test('confirmed identification stated',        has('CONFIRMED BY THE OPERATOR before generation'));
 test('old awareness-flag rule removed',        !has('verified by research, not visible in photos'));
 
 section('UNCONFIRMED SLOTS / BAYS / MODULES');
@@ -686,11 +674,6 @@ test('seller notes are the only override',     has('The ONLY thing that override
 test('neutral default wording specified',      has('See photos for full details of included components/modules.'));
 test('covers slots/bays/ports generally',      has('drive bays, power-supply bays, and any comparable modular area'));
 // Checker: ambiguous bay/slot presence is not a discrepancy.
-test('bay/slot population out of Checker scope', has('other modular area is POPULATED or EMPTY'));
-test('ambiguous bay is not evidence',            has('evidence of absence and not evidence of presence'));
-test('neutral wording marked correct',           has('is the CORRECT treatment, not a defect to fix'));
-test('human note is the only exception',         has('a human note above that directly states what is or is not installed'));
-test('guessing framed as the failure mode',      has('whether the guess is worded as a spec, as a missing part, or as a completeness/condition problem'));
 
 section('COVERS / PANELS SHOWN OPEN OR REMOVED (documentation photos)');
 // Generator: an open/removed cover in one frame is a documentation shot, not a missing part.
@@ -704,10 +687,6 @@ test('two explicit exceptions only',           has('no photo anywhere shows it i
 test('describe what the photo documents',      has('describe what it DOCUMENTS'));
 test('covers closures generally',              has('battery covers and doors, access and service panels'));
 // Checker: same case is out of scope.
-test('open/removed cover out of Checker scope', has('appears OPEN or REMOVED in some photos while other'));
-test('documentation shot named in scope',       has('That is a documentation shot'));
-test('not an over-claim either',                has('listing as over-claiming by describing the part as included'));
-test('genuine-missing test (a) and (b)',        has('NO photo anywhere shows it in place or attached, or (b) a human note above'));
 
 section('DESCRIPTION TEMPLATE LOCK');
 test('template block present',                 has('REQUIRED DESCRIPTION TEMPLATE — MANDATORY, EVERY ITEM, EVERY TIME'));
@@ -720,63 +699,13 @@ test('no-repetition rule present',             has('NO-REPETITION RULE'));
 test('single-placement rule stated',           has('State each fact EXACTLY ONCE, in its designated section only'));
 test('closing paragraph banned',               has('Do NOT append a closing paragraph'));
 
-section('PRE-PUBLISH GATE');
-test('checkerGateState exists',                has('function checkerGateState('));
-test('gate bar rendered',                      has('Listing blocked &mdash; Checker found '));
-test('publish button gated',                   has('data-gated="1"'));
-test('bulk checkbox withheld when gated',      has('!r.ebay_item_id && !cardGate.blocked'));
-test('dismiss endpoint',                       has('/api/listings/checker-ack/'));
-test('apply-fix endpoint',                     has('/api/listings/apply-checker-fix/'));
-test('server-side publish enforcement',        has('checker_blocked:true'));
-test('apply-fix respects human facts',         has('the suggested wording overlaps a fact you recorded by hand'));
-test('Checker asked for old_text',             has('"old_text": "the exact wording currently in the listing'));
-test('Checker asked for suggested_fix',        has('"suggested_fix": "the corrected wording'));
-test('Apply suggested fix button',             has('Apply suggested fix'));
-test('client dismiss fn',                      has('function dismissChecker(sku)'));
-test('client apply fn',                        has('function applyCheckerFix(sku,ix)'));
-test('client unlock fn',                       has('function unlockGate(sku,action)'));
-(function(){
-  var s = content.indexOf('function checkerGateState(');
-  if(s < 0){ test('checkerGateState blocks/clears correctly', false); return; }
-  var d = 0, seen = false, e = -1;
-  for(var i = s; i < content.length; i++){ var c = content[i]; if(c === '{'){ d++; seen = true; } else if(c === '}'){ d--; if(seen && d === 0){ e = i + 1; break; } } }
-  var gbox = {};
-  try {
-    // CHECKER_SCHEMA is module-level in server.js; mirror it into the sandbox.
-    var schemaMatch = content.match(/var CHECKER_SCHEMA = (\d+);/);
-    eval('var CHECKER_SCHEMA = ' + (schemaMatch ? schemaMatch[1] : 2) + ';\n' + content.slice(s, e) + '\ngbox.g = checkerGateState;');
-    var G = gbox.g, SCH = schemaMatch ? Number(schemaMatch[1]) : 2;
-    var mk = function(o){ o.schema = SCH; return { checker:o }; };
-    test('gate: no checker -> not blocked (backward compat)', G({}).blocked === false);
-    test('gate: PASS with no findings -> not blocked', G(mk({ verdict:'PASS', issues:[], conflicts:[] })).blocked === false);
-    test('gate: WARN with an issue -> blocked', G(mk({ verdict:'WARN', issues:[{description:'x'}] })).blocked === true);
-    test('gate: conflicts alone -> blocked', G(mk({ verdict:'PASS', conflicts:[{note:'x'}] })).blocked === true);
-    test('gate: FLAG with no itemised issue -> blocked', G(mk({ verdict:'FLAG' })).blocked === true);
-    test('gate: acknowledged -> unblocked', G(mk({ verdict:'FLAG', issues:[{description:'x'}], acknowledged:{action:'dismissed'} })).blocked === false);
-    test('gate: resolved issues do not block', G(mk({ verdict:'WARN', issues:[{description:'x', resolved:true}] })).blocked === false);
-    // ── STALE-RESULT DETECTION (the bug that made obsolete findings survive a regenerate) ──
-    var staleChk = { checker:{ verdict:'FLAG', issues:[{description:'obsolete'}], conflicts:[{note:'obsolete'}] } };
-    test('gate: unstamped (pre-fix) result flagged stale', G(staleChk).stale === true);
-    test('gate: unstamped (pre-fix) result does NOT block', G(staleChk).blocked === false);
-    test('gate: older schema flagged stale', G({ checker:{ schema: SCH - 1, verdict:'FLAG', issues:[{description:'x'}] } }).stale === true);
-    test('gate: current schema not stale', G(mk({ verdict:'PASS' })).stale === false);
-  } catch(err){ test('checkerGateState blocks/clears correctly', false); console.log('    ERROR:', err.message); }
-})();
 
 section('REGENERATE — writes review state where the UI reads it');
 test('sonnet branch runs Spec Verifier',       has("verifySpecs(sku, rec.listing, 'sonnet', hf,"));
-test('sonnet branch checks rec.listing',       has("checkListing(sku, rec.listing, orBlocks, 'sonnet', hf,"));
-test('guards mutate the displayed copy',       has('applyHumanFactGuards(sku, rec.listing, hf, chk)'));
-test('checker written to listing.checker',     has('r.listing.checker = chk;'));
+test('guards mutate the displayed copy',       has('applyHumanFactGuards(sku, rec.listing, hf, null)'));
 test('sonnet view still maintained',           has('r.sonnet = view;'));
 test('regen returns post-guard copy',          has('result.description_html = rec.listing.description_html;'));
 test('regen reloads card to show new verdict', has('(reloading)'));
-test('Checker result carries schema stamp',    has('var result = { schema: CHECKER_SCHEMA,'));
-test('CHECKER_SCHEMA defined',                 has('var CHECKER_SCHEMA ='));
-test('stale results hidden in badges',         has('gateEarly.stale ? null : (listing.checker || null)'));
-test('stale badge label',                      has('Stale &mdash; regenerate to re-check'));
-test('clear-checker endpoint',                 has('clear-checker') && has('[MAINT] SKU '));
-test('clear-checker drops both reports',       has('delete rec.listing.spec_verifier;'));
 
 section('SYNTAX CHECK');
 try {
