@@ -803,12 +803,15 @@ test('voice never re-implements ship', has('shippingPolicyName(tier.shippingPoli
 
 section('VOICE RECORDING (stutter / cutoff / mic states)');
 test('tracks explicit recording intent', has('var voiceIsRecording=false;'));
-test('accumulates final transcript',     has("var voiceFinal='';") && has('var voiceCommitted=0;'));
-test('commits each final result once',   has('if(i>=voiceCommitted){') && has('voiceCommitted=i+1;'));
-test('walks from event.resultIndex',     has('for(var i=ev.resultIndex;i<ev.results.length;i++)'));
-test('interim never accumulated',        has('else{interim+=txt;}') && has("voiceRender(interim);"));
-test('display = final + interim only',   has("ta.value=(voiceFinal+(interim?(' '+interim):''))"));
-test('auto-restart when not stopped',    has('r.onend=function(){if(voiceIsRecording){voiceRestarts++;'));
+test('interimResults disabled',          has('r.interimResults=false;'));
+test('continuous listening kept',        has('r.continuous=true;'));
+test('accumulates across sessions',      has("var voiceFinal='';"));
+test('onresult scans all results',       has('for(var i=0;i<event.results.length;i++)') && has('if(event.results[i].isFinal){'));
+test('no resultIndex delta tracking',    !has('ev.resultIndex') && !has('voiceCommitted'));
+test('android isFinal-inconsistency fix',has('if(!text.trim()&&event.results.length>0){') && has('text=event.results[event.results.length-1][0].transcript;'));
+test('textarea set from reconstructed text', has("textarea.value=(voiceFinal+' '+text)"));
+test('auto-restart when not stopped',    has('if(voiceIsRecording){voiceRestarts++;') && has('voiceRec=voiceCreateRecognition();voiceRec.start();'));
+test('restart preserves prior text',     has("voiceFinal=((ta&&ta.value)?ta.value:voiceFinal).replace(/\\\\s+/g,' ').trim();"));
 test('restart calls start() again',      has('voiceRec=voiceCreateRecognition();voiceRec.start();'));
 test('restart storm guarded',            has('if(voiceRestarts>60)'));
 test('explicit stop halts listening',    has('if(voiceIsRecording){voiceIsRecording=false;try{voiceRec.stop();}catch(e){}'));
