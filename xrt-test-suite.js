@@ -913,6 +913,11 @@ test('generateVoiceListingAI helper exists',    has('function generateVoiceListi
 test('assembleVoiceRecordFromAI helper exists', has('function assembleVoiceRecordFromAI(sku, shelf, saved, transcript, pvHints, winfo, weightPhotoIndex, noScaleDetected, tier, visionInfo, aiData){'));
 test('step 1 vision uses plain gemini-2.5-flash', has("'google/gemini-2.5-flash'") && has('function voiceIdentifyFromPhotos'));
 test('step 2 pricing uses :online grounding',   has("'google/gemini-2.5-flash:online'"));
+test('visual label override corrects phonetics', has('VISUAL LABEL OVERRIDE:') && has('"four team"') && has('"utah zero zero one"'));
+test('strict factuality rule present',          has('RULE OF STRICT FACTUALITY:'));
+test('no unverified positive assumptions rule', has('NO UNVERIFIED POSITIVE ASSUMPTIONS:') && has('"hinge is sturdy"'));
+test('missing parts accuracy rule',             has('MISSING PARTS ACCURACY:') && has('Battery and battery cover not included'));
+test('condition box stays 2-3 sentences',       has('Keep the condition box strictly factual and concise (2-3 sentences max'));
 test('scale reading stays last-photo-only',     has('detectWeightAndDims(scaleB64, function(winfo){'));
 test('scale photo excluded from id photos',     has('if(pi === weightPhotoIndex) continue;'));
 test('shipping tier stays server-computed',     has('tier = calculateShippingTier(winfo.lbs, winfo.oz, sku);'));

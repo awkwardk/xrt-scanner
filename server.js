@@ -490,6 +490,12 @@ function voiceIdentifyFromPhotos(transcript, photoB64Array, callback){
       'visible in the images (for example a label reading "Zebra P4T" or "Nintendo UTL-001") — reading the label directly',
       'is more accurate than the spoken description alone.',
       '',
+      'VISUAL LABEL OVERRIDE: Cross-reference manufacturer labels, serial stickers, and faceplates from the photos',
+      'against the voice transcript. Speech-to-text frequently mishears model numbers phonetically (e.g. "four team"',
+      'for "4T", "p forty" for "P40", "utah zero zero one" for "UTL-001"). If the transcript has a phonetic error like',
+      'this, correct the brand and model to match the EXACT alphanumeric text printed on the label in the photo —',
+      'the label is authoritative, the transcript is not, whenever the two disagree on spelling or numbering.',
+      '',
       'Also note what accessories/items are visible (What is Included) and any visible cosmetic condition.',
       '',
       'Return ONLY this JSON, no markdown:',
@@ -524,7 +530,12 @@ function generateVoiceListingAI(sku, transcript, shelf, pvHints, weightLine, vis
       'Extract the condition grade (A/B/C/D) and whether the item powers on/works from the seller\'s spoken notes below. Return them as "grade" and "parts_repair" in the JSON.\n' +
       'Grade scale: A = Like New/Open Box, B = Good/normal used, C = Fair/heavy wear, D = Parts or not working.\n' +
       'If the seller said the item does not power on, fails, or is for parts, OR you determine grade D, set parts_repair:true and include "For Parts or Repair" in the title.\n' +
-      'Also return "is_lot" (true if the seller described multiple identical units) and "lot_quantity" (the count, default 1).';
+      'Also return "is_lot" (true if the seller described multiple identical units) and "lot_quantity" (the count, default 1).\n\n' +
+      'STRICT ANTI-HALLUCINATION RULES FOR condition_box AND description_html:\n' +
+      'RULE OF STRICT FACTUALITY: Only state what is explicitly mentioned in the voice transcript or indisputably visible in the photos.\n' +
+      'NO UNVERIFIED POSITIVE ASSUMPTIONS: Do NOT guess or assume functional/mechanical integrity. Never say "hinge is sturdy", "buttons are responsive", "ports are clean", or "battery cover is present" unless specifically confirmed in the voice notes or clearly shown attached in photos.\n' +
+      'MISSING PARTS ACCURACY: If a compartment is open, empty, or missing in photos and the transcript notes something like "no battery" or "no charger", state only what is missing or visible (e.g. "Battery and battery cover not included"). Never hallucinate that missing covers or accessories are present.\n' +
+      'Keep the condition box strictly factual and concise (2-3 sentences max covering observed cosmetic flaws, testing result, and what is/isn\'t included).';
     var userMessage = [
       'Seller\'s spoken description (verbatim): ' + (transcript || '(none)'),
       '',
