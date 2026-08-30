@@ -900,6 +900,78 @@ test('whitespace regex not mangled',     has('.replace(/\\\\s+/g,\' \')') && !ha
   }
 })();
 
+
+section('VOICE INTAKE v2 (background submit, photo reorder, custom SKU)');
+// ── fix 1: background processing & instant UI release ──
+test('response sent before background generation', has("sendJSON(res,200,{ success:true, sku:sku, photos_saved:saved });") && has('setTimeout(function(){') && has('var record = buildVoiceListingRecord(sku, pv, shelf, saved, {});'));
+test('background block never crashes response', has('} catch(e2){') && has("console.log('[VOICE] SKU ' + sku + ' background generation error: ' + e2.message);"));
+test('photos saved before responding',   has("photos.forEach(function(b64, i){") && has("sendJSON(res,200,{ success:true, sku:sku"));
+test('client shows toast not alert on success', has("voiceToast('") && has('voiceResetFields();'));
+test('toast auto-hides itself',          has('voiceToastTimer=setTimeout(') && has("el.classList.remove('show');"));
+test('reset re-peeks SKU + clears fields', has('function voiceResetFields(){voicePhotos=[];') && has('voiceLoadNextSku();}'));
+
+// ── fix 2: photo order + reorder controls ──
+test('addVoicePhotos reads sequentially', has('function addVoicePhotos(input){') && has('function next(){') && !has('files.forEach(function(file)'));
+test('one FileReader in flight at a time', has('idx>=arr.length'));
+test('client-side compression to canvas', has('function voiceCompressImage(dataUrl,cb)') && has("canvas.toDataURL('image/jpeg',0.85)"));
+test('compression capped at 1600px',      has('voiceScaleDims(img.width,img.height,1600)'));
+test('compression failure falls back',    has('}catch(e){cb(null);}};') && has('if(!b64){var c=v.indexOf'));
+test('voiceScaleDims pure helper',        has('function voiceScaleDims(w,h,max){'));
+test('reverse button wired',              has("id='vReverseBtn'") && has('voiceReversePhotos()'));
+test('reverse function',                  has('function voiceReversePhotos(){voicePhotos.reverse();'));
+test('per-thumb shift buttons',           has('function voiceShiftPhoto(idx,dir)') && has("lb.onclick=function(){voiceShiftPhoto(idx,-1);};") && has("rb.onclick=function(){voiceShiftPhoto(idx,1);};"));
+test('shift buttons disabled at ends',    has('lb.disabled=(idx===0);') && has('rb.disabled=(idx===voicePhotos.length-1);'));
+test('thumbnails show position number',   has('num.textContent=String(idx+1);'));
+
+// ── fix 3: explicit Custom SKU field ──
+test('Custom SKU field above Shelf',      has("id='vCustomSku'"));
+test('prefilled from next-sku peek',      has("function voiceLoadNextSku(){fetch('/api/next-sku')") && has("f.value=String(d.sku);"));
+test('peek is non-claiming (GET)',        has("req.method==='GET' && req.url==='/api/next-sku'") && has('peekNextSku()'));
+test('manual override sent to server',    has('if(!isNaN(skuVal)&&skuVal>0)body.sku=skuVal;'));
+test('reserveSkuAtLeast keeps counter ahead', has('function reserveSkuAtLeast(n){') && has('if(n >= SKU_NEXT){ SKU_NEXT = n + 1; writeSkuFile(); }'));
+test('custom sku never overwrites existing item', has("!fs.existsSync(path.join(DATA_DIR, 'items', String(reqSku), 'listing.json'))"));
+test('collision falls back to auto-claim',   has("already in use — claiming next available instead"));
+test('custom_sku combines as [SKU]-[SHELF]', has("custom_sku: String(sku) + (shelf ? '-' + shelf : '')"));
+
+// ── fix 4: error resilience ──
+test('network failure shows alert',       has("alert('Network error - your description and photos were kept. Try submitting again.');"));
+test('server failure shows alert too',    has("alert('Could not submit: '+msg+"));
+test('failure keeps transcript/photos (no reset call in error paths)', (function(){
+  var i = content.indexOf('function submitVoiceIntake(){');
+  var body = content.slice(i, content.indexOf('function goToPhotos', i));
+  var errBranch = body.slice(body.indexOf('}else{'), body.indexOf('.catch(function(){')); // d.success===false branch
+  var catchBranch = body.slice(body.indexOf('.catch(function(){'));
+  return errBranch.indexOf('voiceResetFields') < 0 && catchBranch.indexOf('voiceResetFields') < 0;
+})());
+test('button re-enabled on both failure paths', (function(){
+  var i = content.indexOf('function submitVoiceIntake(){');
+  var body = content.slice(i, content.indexOf('function goToPhotos', i));
+  return (body.match(/b\.disabled=false;b\.textContent='Create Listing';/g) || []).length >= 1;
+})());
+
+// ── functional: voiceScaleDims math (pure, DOM-free) ──
+(function(){
+  function ex(n){
+    var s2 = content.indexOf('function ' + n + '(');
+    if (s2 < 0) return '';
+    var d = 0, seen = false, e = -1;
+    for (var i = s2; i < content.length; i++) { var c = content[i]; if (c === '{') { d++; seen = true; } else if (c === '}') { d--; if (seen && d === 0) { e = i + 1; break; } } }
+    return content.slice(s2, e);
+  }
+  try {
+    var box = {};
+    eval(ex('voiceScaleDims') + '\nbox.dims = voiceScaleDims;');
+    var D = box.dims;
+    test('(voice) scale dims: cap wide image',   JSON.stringify(D(3000, 2000, 1600)) === JSON.stringify({ w: 1600, h: 1067 }));
+    test('(voice) scale dims: cap tall image',   JSON.stringify(D(2000, 3000, 1600)) === JSON.stringify({ w: 1067, h: 1600 }));
+    test('(voice) scale dims: under cap unchanged', JSON.stringify(D(800, 600, 1600)) === JSON.stringify({ w: 800, h: 600 }));
+    test('(voice) scale dims: zero-size no crash', JSON.stringify(D(0, 0, 1600)) === JSON.stringify({ w: 0, h: 0 }));
+  } catch (e) {
+    test('voiceScaleDims functional eval', false);
+    console.log('    ERROR:', e.message);
+  }
+})();
+
 section('SYNTAX CHECK');
 try {
   require('child_process').execSync('node --check ' + serverFile, {stdio:'pipe'});
