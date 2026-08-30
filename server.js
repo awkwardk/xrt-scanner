@@ -623,7 +623,10 @@ function assembleVoiceRecordFromAI(sku, shelf, saved, transcript, pvHints, winfo
     shipping_policy: shipInfo.shipping_policy, shipping_profile_id: shipInfo.shipping_profile_id,
     listed_weight: shipInfo.listed_weight, listed_weight_unit: shipInfo.listed_weight_unit,
     box_dimensions: shipInfo.box_dimensions, polymailer: !!shipInfo.polymailer,
-    category_id: 0, is_lot: quantity > 1, lot_quantity: quantity
+    // category_id/primary_category_id are resolved to a real eBay LEAF category by the
+    // orchestrator (resolveLeafCategoryFromTitle) right after this record is built — 0 here
+    // is a placeholder only, never what gets written to listing.json on the success path.
+    category_id: 0, primary_category_id: 0, is_lot: quantity > 1, lot_quantity: quantity
   };
 
   var meta = {
@@ -633,7 +636,8 @@ function assembleVoiceRecordFromAI(sku, shelf, saved, transcript, pvHints, winfo
     weightLbs: tier ? tier.rawLbs : null, weightOzPart: tier ? tier.rawOz : null,
     shipping_tier: tier, noWeightFlag: !tier, scale_warning: !!(winfo && winfo.scale_warning),
     weightPhotoIndex: weightPhotoIndex, no_scale_detected: !!noScaleDetected,
-    photoCount: saved || 0, timestamp: new Date().toISOString(), processed: true
+    photoCount: saved || 0, timestamp: new Date().toISOString(), processed: true,
+    category_name: null
   };
 
   // Scale photo excluded from eBay listing downloads (established rules 26/27).
@@ -1767,12 +1771,42 @@ const server = http.createServer(function(req, res) {
                           try {
                             if(!aiData){ fallbackToDeterministic('Step 2 returned no data'); return; }
                             var record = assembleVoiceRecordFromAI(sku, shelf, saved, transcript, pvHints, winfo, weightPhotoIndex, noScaleDetected, tier, visionInfo, aiData);
-                            fs.writeFileSync(path.join(itemDir, 'meta.json'), JSON.stringify(record.meta, null, 2));
-                            fs.writeFileSync(path.join(itemDir, 'listing.json'), JSON.stringify(record, null, 2));
-                            try { loadListings(); } catch(e){}
-                            console.log('[VOICE] SKU ' + sku + ' generated — "' + record.listing.title + '" | grade ' + record.meta.grade +
-                              ' | condition ' + record.listing.condition_id + (record.listing.parts_repair ? ' | PARTS/REPAIR' : '') +
-                              ' | ' + record.listing.suggested_price + ' | ' + record.listing.shipping_policy);
+
+                            function writeVoiceRecord(){
+                              fs.writeFileSync(path.join(itemDir, 'meta.json'), JSON.stringify(record.meta, null, 2));
+                              fs.writeFileSync(path.join(itemDir, 'listing.json'), JSON.stringify(record, null, 2));
+                              try { loadListings(); } catch(e){}
+                              console.log('[VOICE] SKU ' + sku + ' generated — "' + record.listing.title + '" | grade ' + record.meta.grade +
+                                ' | condition ' + record.listing.condition_id + (record.listing.parts_repair ? ' | PARTS/REPAIR' : '') +
+                                ' | ' + record.listing.suggested_price + ' | ' + record.listing.shipping_policy +
+                                ' | category ' + (record.listing.category_id || 'UNRESOLVED'));
+                            }
+
+                            // Error [87] prevention: resolve a real eBay LEAF category ID from the generated
+                            // title BEFORE listing.json is written, so it never reaches /api/listings or the
+                            // publish route as 0/"(set)". Never blocks the write — on any failure the record
+                            // still gets saved with category_id 0 and createEbayListing's own pre-flight
+                            // resolver (Error [87] prevention, publish-time) recovers it at publish time.
+                            getEbayToken(function(catTokErr, catToken){
+                              if(catTokErr || !catToken){
+                                console.log('[VOICE] SKU ' + sku + ' category resolution skipped: no eBay token available');
+                                writeVoiceRecord();
+                                return;
+                              }
+                              resolveLeafCategoryFromTitle(record.listing.title, catToken, function(catErr, cat){
+                                if(catErr || !cat){
+                                  console.log('[VOICE] SKU ' + sku + ' leaf category resolution failed: ' + (catErr ? catErr.message : 'no leaf found') + ' — will resolve at publish time');
+                                } else {
+                                  record.listing.category_id = cat.id;
+                                  record.listing.primary_category_id = cat.id;
+                                  record.meta.category_name = cat.name;
+                                  record.ebay_category_id = cat.id;
+                                  record.ebay_category_name = cat.name;
+                                  console.log('[VOICE] SKU ' + sku + ' leaf category resolved: ' + cat.id + ' (' + cat.name + ')');
+                                }
+                                writeVoiceRecord();
+                              });
+                            });
                           } catch(eAssemble){ console.log('[VOICE] SKU ' + sku + ' assembly error: ' + eAssemble.message); fallbackToDeterministic('assembly error'); }
                         });
                       } catch(ePhotos){ console.log('[VOICE] SKU ' + sku + ' photo-block error: ' + ePhotos.message); fallbackToDeterministic('photo-block error'); }
@@ -5502,6 +5536,39 @@ function getCategoryFeatures(categoryId, token, callback){
     callback(new Error('GetCategoryFeatures Ack=' + (ack || '?')));
   });
 }
+// Resolve a numeric LEAF eBay category ID from an item title via GetSuggestedCategories,
+// confirming leaf status with GetCategoryFeatures for each candidate (ranked by match %,
+// max 5 tried). Shared pre-flight category resolver — used by the voice-intake background
+// generator (Error [87] prevention: resolve BEFORE listing.json is written) and by
+// createEbayListing (pre-flight + not-a-leaf recovery, right before AddItem).
+function resolveLeafCategoryFromTitle(title, token, callback){
+  getSuggestedCategory(title, token, function(scErr, cats){
+    if(scErr || !cats || !cats.length){ callback(scErr || new Error('no suggested categories for "' + title + '"')); return; }
+    var i = 0, max = Math.min(5, cats.length); // max 5 attempts to find a leaf
+    (function tryNext(){
+      if(i >= max){ callback(new Error('no leaf category found in top ' + max + ' suggestions for "' + title + '"')); return; }
+      var c = cats[i]; i++;
+      getCategoryFeatures(c.id, token, function(fErr, feat){
+        if(!fErr && feat && feat.leaf === true){
+          console.log('[CATEGORY] suggested category', c.id, '(' + c.name + ', ' + c.pct + '%) confirmed LEAF');
+          callback(null, { id: parseInt(c.id, 10) || c.id, name: c.name, conditions: feat.conditions || [] });
+        } else {
+          console.log('[CATEGORY] suggested category', c.id, '(' + c.name + ')', fErr ? ('error ' + fErr.message) : 'NOT a leaf', '— trying next suggestion');
+          tryNext();
+        }
+      });
+    })();
+  });
+}
+// True when a category id looks like a real, resolvable eBay category — false for missing,
+// zero, "(set)"/"set" placeholder text, or anything else that isn't a usable identifier.
+function isUsableCategoryId(v){
+  if(v === null || v === undefined) return false;
+  var s = String(v).trim();
+  if(!s || s === '0') return false;
+  if(/^\(?\s*set\s*\)?$/i.test(s)) return false;
+  return true;
+}
 // Choose a valid condition ID for the grade, constrained to the category's allowed set
 function pickValidCondition(grade, partsRepair, validIds){
   var prefByGrade = { A:[1000,1500,2000,2500,3000], B:[3000,2500,2000,4000,5000,1000], C:[5000,6000,3000,4000,7000], D:[7000,6000,5000] };
@@ -5982,15 +6049,23 @@ function createEbayListing(sku, callback){
           finalizeCategory(183446, 'Other Consumer Electronics (fallback)', (feat && feat.conditions) || []);
         });
       }
-      // Change 5: prefer a confirmed/known category (prior attempt -> identifier -> AI),
-      // leaf-validate it, and BLOCK with a structured error if it is not a leaf.
-      var knownCat = record.ebay_category_id
+      // Pre-flight category resolution (Error [87] prevention): prefer a confirmed/known category
+      // (prior attempt -> identifier -> AI), but treat missing/0/"(set)" as unusable up front — those
+      // fall straight through to auto-resolution via GetSuggestedCategories instead of ever reaching
+      // eBay. A known category that turns out NOT to be a leaf also auto-resolves now (previously this
+      // BLOCKED the listing with needs_category_review) — resolveLeafCategoryFromTitle guarantees a
+      // real leaf or falls back to 183446, so AddItem is never sent with a non-leaf or missing category.
+      var rawKnownCat = record.ebay_category_id
         || (meta.identified_item && meta.identified_item.ebay_category_id)
         || (listing && listing.category_id)
         || null;
+      var knownCat = isUsableCategoryId(rawKnownCat) ? rawKnownCat : null;
       var catSource = record.category_source
         || (meta.identified_item && meta.identified_item.category_source)
         || null;
+      if(!knownCat && rawKnownCat){
+        console.log('[EBAY] SKU', sku, 'category', JSON.stringify(rawKnownCat), 'is not usable (missing/0/"(set)") — auto-resolving via GetSuggestedCategories');
+      }
       if(knownCat && catSource === 'ebay_browse'){
         // eBay's Browse API leafCategoryIds are leaf categories by definition — trust, skip validation.
         console.log('[EBAY] SKU', sku, 'using known category', knownCat, '(leaf confirmed by Browse API — skipping validation)');
@@ -5999,6 +6074,13 @@ function createEbayListing(sku, callback){
           finalizeCategory(knownCat, nm, (feat && feat.conditions) || []);
         });
         return;
+      }
+      function autoResolveCategory(reason){
+        resolveLeafCategoryFromTitle(record.listing.title, token, function(rErr, cat){
+          if(rErr || !cat){ fallbackCategory(reason + (rErr ? (': ' + rErr.message) : ': no leaf found')); return; }
+          console.log('[EBAY] SKU', sku, '— ' + reason + ' — auto-resolved leaf category', cat.id, '(' + cat.name + ')');
+          finalizeCategory(cat.id, cat.name, cat.conditions || []);
+        });
       }
       if(knownCat){
         validateLeafCategory(knownCat, function(_kErr, isLeaf){
@@ -6009,30 +6091,12 @@ function createEbayListing(sku, callback){
               finalizeCategory(knownCat, nm, (feat && feat.conditions) || []);
             });
           } else {
-            console.log('[EBAY] SKU', sku, 'blocked — category', knownCat, 'is not a leaf');
-            callback(null, { blocked: true, category_id: knownCat, needs_category_review: true,
-              error: 'Category ' + knownCat + ' is not a leaf category and cannot be listed in. The item needs a more specific category. Open this listing to select the correct subcategory before posting.' });
+            autoResolveCategory('known category ' + knownCat + ' is not a leaf');
           }
         });
         return;
       }
-      getSuggestedCategory(record.listing.title, token, function(scErr, cats){
-        if(scErr || !cats || !cats.length){ fallbackCategory(scErr ? ('GetSuggestedCategories failed: ' + scErr.message) : 'no suggestions'); return; }
-        var i = 0, max = Math.min(5, cats.length); // max 5 attempts to find a leaf
-        (function tryNext(){
-          if(i >= max){ fallbackCategory('no leaf category in top ' + max + ' suggestions'); return; }
-          var c = cats[i]; i++;
-          getCategoryFeatures(c.id, token, function(fErr, feat){
-            if(!fErr && feat && feat.leaf){
-              console.log('[EBAY] suggested category', c.id, '(' + c.name + ', ' + c.pct + '%) confirmed LEAF');
-              finalizeCategory(c.id, c.name, feat.conditions || []);
-            } else {
-              console.log('[EBAY] suggested category', c.id, '(' + c.name + ')', fErr ? ('error ' + fErr.message) : 'NOT a leaf', '— trying next suggestion');
-              tryNext();
-            }
-          });
-        })();
-      });
+      autoResolveCategory('no known category');
     });
   }
 }

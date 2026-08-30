@@ -429,10 +429,23 @@ test('identify sets new fields',          has('data.ebay_category_id = result.ca
 test('Level 1 price overrides estimate',  has('data.estimated_low = result.price_low') && has("data.pricing_source = 'ebay_completed'"));
 test('Listing uses confirmed category',   has('var confirmedCategoryId = null') && has('using confirmed category') && has('listing.category_id = confirmedCategoryId;'));
 test('Listing prompt has confirmed cat',  has('Confirmed eBay category from completed sold listings'));
-test('send-to-ebay category priority',    has('var knownCat = record.ebay_category_id'));
+test('send-to-ebay category priority',    has('var rawKnownCat = record.ebay_category_id'));
 test('send-to-ebay leaf-validates known', has('validateLeafCategory(knownCat'));
-test('Non-leaf structured error',         has('needs_category_review: true') && has('is not a leaf category and cannot be listed in'));
 test('Route returns needs_category_review', has('info.blocked') && has('needs_category_review:true'));
+
+// ── LEAF CATEGORY PRE-FLIGHT (Error [87] prevention) ──
+// A known category that fails leaf validation now auto-resolves via GetSuggestedCategories
+// instead of blocking the listing (previous behavior encoded in "Non-leaf structured error",
+// removed above — replaced by the tests in this section).
+section('LEAF CATEGORY PRE-FLIGHT (auto-resolve, never block)');
+test('resolveLeafCategoryFromTitle exists', has('function resolveLeafCategoryFromTitle(title, token, callback){'));
+test('isUsableCategoryId helper exists',    has('function isUsableCategoryId(v){'));
+test('isUsableCategoryId rejects (set)',    has('/^\\(?\\s*set\\s*\\)?$/i.test(s)'));
+test('missing/0/"(set)" auto-resolves',     has('var knownCat = isUsableCategoryId(rawKnownCat) ? rawKnownCat : null;'));
+test('non-leaf known category auto-resolves not blocked', has("autoResolveCategory('known category ' + knownCat + ' is not a leaf');") && !has('needs_category_review: true'));
+test('no known category auto-resolves',    has("autoResolveCategory('no known category');"));
+test('auto-resolve falls back to 183446 if none found', has('function autoResolveCategory(reason){') && has("fallbackCategory(reason + (rErr ? (': ' + rErr.message) : ': no leaf found'));"));
+test('createEbayListing pre-flight reuses shared resolver', has('resolveLeafCategoryFromTitle(record.listing.title, token, function(rErr, cat){'));
 
 section('HUMAN GROUND TRUTH — presence');
 test('human_facts captured on record',      has('human_facts: buildHumanFacts(meta, visionData)'));
@@ -986,6 +999,85 @@ test('button re-enabled on both failure paths', (function(){
     test('(voice) scale dims: zero-size no crash', JSON.stringify(D(0, 0, 1600)) === JSON.stringify({ w: 0, h: 0 }));
   } catch (e) {
     test('voiceScaleDims functional eval', false);
+    console.log('    ERROR:', e.message);
+  }
+})();
+
+// ── functional: full voice-submitted payload -> AddItem XML builder (pre-flight simulation) ──
+// Simulates what createEbayListing actually sends after leaf-category resolution: build a
+// voice-intake record with assembleVoiceRecordFromAI (same function the fast-submit background
+// worker calls), attach a resolved leaf category ID (as resolveLeafCategoryFromTitle would), and
+// run it through buildAddItemXml — the exact function that produces the AddItem request body.
+section('VOICE INTAKE -> ADDITEM BUILDER (pre-flight simulation)');
+(function(){
+  function ex(n){
+    var s2 = content.indexOf('function ' + n + '(');
+    if (s2 < 0) return '';
+    var d = 0, seen = false, e = -1;
+    for (var i = s2; i < content.length; i++) { var c = content[i]; if (c === '{') { d++; seen = true; } else if (c === '}') { d--; if (seen && d === 0) { e = i + 1; break; } } }
+    return content.slice(s2, e);
+  }
+  try {
+    var box = {};
+    var code = 'var MIN_THRESHOLD = 30;\n'
+      + ex('splitToLimit') + '\n' + ex('trimAspects') + '\n'
+      + ex('calculateShippingTier') + '\n' + ex('shippingPolicyName') + '\n' + ex('calcShipping') + '\n'
+      + ex('voiceGradeConditionId') + '\n' + ex('buildCassiniTitle') + '\n' + ex('assembleVoiceRecordFromAI') + '\n'
+      + ex('xmlEscape') + '\n' + ex('cdataSafe') + '\n' + ex('conditionIdForCategory') + '\n'
+      + ex('estimateShipCost') + '\n' + ex('buildItemSpecificsXml') + '\n' + ex('buildAddItemXml') + '\n'
+      + 'box.assemble = assembleVoiceRecordFromAI; box.buildXml = buildAddItemXml; box.tier = calculateShippingTier;';
+    var _log = console.log; console.log = function(){};
+    eval(code);
+    console.log = _log;
+
+    // Simulates uploadAllPhotos(): one CDN-style URL per record.outputPhotos stem, in order —
+    // outputPhotos already excludes the scale/weight photo (assembleVoiceRecordFromAI rule).
+    function simulatePictureUrls(record){
+      return (record.outputPhotos || []).map(function(stem){ return 'https://i.ebayimg.com/00/s/' + stem + '.jpg'; });
+    }
+
+    // ── Zebra P4T thermal label printer — saved=4 photos, photo_4 is the scale photo ──
+    var zTier = box.tier(3, 2, 601);
+    var zVision = { item_name: 'Zebra P4T Direct Thermal Label Printer', brand: 'Zebra', model: 'P4T', category: 'Label Printers', includes: 'AC power adapter', condition_notes: 'light scuffing on case' };
+    var zPvHints = { grade: 'B', power_test: 'Pass', brand: 'Zebra', model: 'P4T', product_type: 'Label Printer', includes: ['power adapter'], features: [], quantity: 1 };
+    var zAiData = { title: 'Zebra P4T Direct Thermal Label Printer - Tested', grade: 'B', parts_repair: false,
+      condition_box: 'Light scuffing on case. Powers on and prints test label. AC adapter included.',
+      description_html: '<h3>Overview</h3><p>Zebra P4T label printer.</p>',
+      avg_sold_price: 62, price_low: 45, price_high: 78, suggested_price: 58, accept_price: 46, decline_price: 35,
+      item_specifics: { Brand: 'Zebra', Model: 'P4T', Type: 'Label Printer' }, is_lot: false, lot_quantity: 1 };
+    var zRecord = box.assemble('601', 'A3', 4, 'zebra p forty printer grade B powers on prints test label', zPvHints, { lbs: 3, oz: 2 }, 4, false, zTier, zVision, zAiData);
+    // Simulate the pre-flight leaf resolution (Error [87] prevention) that runs before this write —
+    // 175677 = Label/Thermal Printers, a real eBay leaf category.
+    zRecord.listing.category_id = 175677; zRecord.listing.primary_category_id = 175677; zRecord.meta.category_name = 'Label/Thermal Printers';
+    var zXml = box.buildXml(zRecord, { categoryId: zRecord.listing.category_id, pictureUrls: simulatePictureUrls(zRecord), conditionId: null, policies: null });
+
+    test('(zebra) leaf category resolved in AddItem XML', zXml.indexOf('<PrimaryCategory><CategoryID>175677</CategoryID></PrimaryCategory>') >= 0);
+    test('(zebra) price formatted correctly',              zXml.indexOf('<StartPrice currencyID="USD">58</StartPrice>') >= 0);
+    test('(zebra) custom SKU matches [SKU]-[SHELF]',        zXml.indexOf('<SKU>601-A3</SKU>') >= 0 && zRecord.listing.custom_sku === '601-A3');
+    test('(zebra) scale photo stripped from listing images', zRecord.outputPhotos.indexOf('photo_4') < 0 && zRecord.outputPhotos.length === 3 && zXml.indexOf('photo_4') < 0);
+    test('(zebra) three non-scale photos uploaded',         (zXml.match(/<PictureURL>/g) || []).length === 3);
+
+    // ── Nintendo Switch OLED console — saved=6 photos, photo_6 is the scale photo ──
+    var nTier = box.tier(2, 4, 602);
+    var nVision = { item_name: 'Nintendo Switch OLED Console', brand: 'Nintendo', model: 'UTL-001', category: 'Video Game Consoles', includes: 'dock, HDMI cable, one Joy-Con', condition_notes: 'screen has minor scratches' };
+    var nPvHints = { grade: 'C', power_test: 'Pass', brand: 'Nintendo', model: 'UTL-001', product_type: 'Game Console', includes: ['dock', 'HDMI cable'], features: [], quantity: 1 };
+    var nAiData = { title: 'Nintendo Switch OLED Console UTL-001 with Dock - For Parts Missing Joy-Con', grade: 'C', parts_repair: false,
+      condition_box: 'Screen has minor scratches. Powers on and boots to home menu. Dock and HDMI cable included; only one Joy-Con included.',
+      description_html: '<h3>Overview</h3><p>Nintendo Switch OLED console.</p>',
+      avg_sold_price: 145, price_low: 110, price_high: 175, suggested_price: 139.99, accept_price: 120, decline_price: 95,
+      item_specifics: { Brand: 'Nintendo', Model: 'UTL-001', Console: 'Nintendo Switch' }, is_lot: false, lot_quantity: 1 };
+    var nRecord = box.assemble('602', 'C1', 6, 'nintendo utah zero zero one switch grade C powers on boots to home menu missing one joy con', nPvHints, { lbs: 2, oz: 4 }, 6, false, nTier, nVision, nAiData);
+    // 139971 = Video Game Consoles, a real eBay leaf category (per spec example).
+    nRecord.listing.category_id = 139971; nRecord.listing.primary_category_id = 139971; nRecord.meta.category_name = 'Video Game Consoles';
+    var nXml = box.buildXml(nRecord, { categoryId: nRecord.listing.category_id, pictureUrls: simulatePictureUrls(nRecord), conditionId: null, policies: null });
+
+    test('(nintendo) leaf category resolved in AddItem XML', nXml.indexOf('<PrimaryCategory><CategoryID>139971</CategoryID></PrimaryCategory>') >= 0);
+    test('(nintendo) price formatted correctly (decimal preserved)', nXml.indexOf('<StartPrice currencyID="USD">139.99</StartPrice>') >= 0);
+    test('(nintendo) custom SKU matches [SKU]-[SHELF]',      nXml.indexOf('<SKU>602-C1</SKU>') >= 0 && nRecord.listing.custom_sku === '602-C1');
+    test('(nintendo) scale photo stripped from listing images', nRecord.outputPhotos.indexOf('photo_6') < 0 && nRecord.outputPhotos.length === 5 && nXml.indexOf('photo_6') < 0);
+    test('(nintendo) five non-scale photos uploaded',        (nXml.match(/<PictureURL>/g) || []).length === 5);
+  } catch(e){
+    test('voice -> AddItem builder functional eval', false);
     console.log('    ERROR:', e.message);
   }
 })();
