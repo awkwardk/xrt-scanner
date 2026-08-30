@@ -800,6 +800,103 @@ test('voice never re-implements ship', has('shippingPolicyName(tier.shippingPoli
   }
 })();
 
+
+section('VOICE RECORDING (stutter / cutoff / mic states)');
+test('tracks explicit recording intent', has('var voiceIsRecording=false;'));
+test('accumulates final transcript',     has("var voiceFinal='';") && has('var voiceCommitted=0;'));
+test('commits each final result once',   has('if(i>=voiceCommitted){') && has('voiceCommitted=i+1;'));
+test('walks from event.resultIndex',     has('for(var i=ev.resultIndex;i<ev.results.length;i++)'));
+test('interim never accumulated',        has('else{interim+=txt;}') && has("voiceRender(interim);"));
+test('display = final + interim only',   has("ta.value=(voiceFinal+(interim?(' '+interim):''))"));
+test('auto-restart when not stopped',    has('r.onend=function(){if(voiceIsRecording){voiceRestarts++;'));
+test('restart calls start() again',      has('voiceRec=voiceCreateRecognition();voiceRec.start();'));
+test('restart storm guarded',            has('if(voiceRestarts>60)'));
+test('explicit stop halts listening',    has('if(voiceIsRecording){voiceIsRecording=false;try{voiceRec.stop();}catch(e){}'));
+test('mic UI has two states',            has('function voiceSetMicUI(rec)') && has("mb.className='vmic-rec'") && has("mb.className='vmic-idle'"));
+test('stop label while recording',       has("mb.innerHTML='&#9209; Stop Recording'"));
+test('pulsing red recording style',      has('.vmic-rec{') && has('@keyframes vpulse'));
+test('permission denial stops cleanly',  has("err==='not-allowed'") && has('voiceBlocked=true'));
+test('whitespace regex not mangled',     has('.replace(/\\\\s+/g,\' \')') && !has('.replace(/s+/g,'));
+
+// ── functional: drive the real client code through a simulated SpeechRecognition lifecycle ──
+(function(){
+  try {
+    var k = 'PROCESSOR_HTML = "';
+    var st = content.indexOf(k) + k.length - 1;
+    var qc = content[st], j = st + 1, esc = false;
+    for(; j < content.length; j++){ var ch = content[j]; if(esc){ esc = false; continue; } if(ch === '\\'){ esc = true; continue; } if(ch === qc) break; }
+    var html = eval(content.slice(st, j + 1));
+    var script = (html.match(/<script>([\s\S]*?)<\/script>/) || [])[1];
+
+    var els = {};
+    function stub(id){ return { id:id, value:'', textContent:'', innerHTML:'', className:'', disabled:false, style:{}, classList:{add:function(){},remove:function(){},toggle:function(){}}, appendChild:function(){}, addEventListener:function(){}, focus:function(){} }; }
+    ['vTranscript','vShelf','vThumbs','vErr','vMicStatus','vMicBtn','vSubmitBtn'].forEach(function(id){ els[id] = stub(id); });
+    var timers = [];
+    var sandbox = {
+      document: { getElementById:function(id){ return els[id] || stub(id); }, querySelectorAll:function(){ return []; }, addEventListener:function(){}, createElement:function(){ return stub('x'); }, body:{appendChild:function(){},removeChild:function(){}} },
+      window: { addEventListener:function(){}, removeEventListener:function(){} },
+      alert:function(){}, setTimeout:function(fn){ timers.push(fn); return timers.length; }, clearTimeout:function(){}, setInterval:function(){ return 0; },
+      FileReader:function(){}, localStorage:{ getItem:function(){ return null; }, setItem:function(){}, removeItem:function(){} },
+      navigator:{ mediaDevices:{ getUserMedia:function(){ return new Promise(function(){}); } } },
+      AudioContext:function(){ return { createBuffer:function(){ return {getChannelData:function(){ return []; }}; }, createBufferSource:function(){ return {connect:function(){},start:function(){}}; }, createGain:function(){ return {connect:function(){},gain:{}}; }, destination:{}, sampleRate:44100, close:function(){} }; },
+      screen:{ orientation:{angle:0} }, fetch:function(){ return new Promise(function(){}); }
+    };
+    var live = null, startCalls = 0;
+    function FakeSR(){ live = this; }
+    FakeSR.prototype.start = function(){ startCalls++; if(this.onstart) this.onstart(); };
+    FakeSR.prototype.stop = function(){ if(this.onend) this.onend(); };
+    FakeSR.prototype.abort = function(){};
+    sandbox.window.SpeechRecognition = FakeSR;
+
+    var runner = new Function('document','window','alert','setTimeout','clearTimeout','setInterval','FileReader','localStorage','navigator','AudioContext','screen','fetch',
+      script + '\nreturn { start:startVoiceIntake, toggle:toggleVoiceMic, rec:function(){ return voiceIsRecording; } };');
+    var api = runner(sandbox.document, sandbox.window, sandbox.alert, sandbox.setTimeout, sandbox.clearTimeout, sandbox.setInterval,
+      sandbox.FileReader, sandbox.localStorage, sandbox.navigator, sandbox.AudioContext, sandbox.screen, sandbox.fetch);
+
+    function res(list){ var r = list.map(function(x){ return { isFinal:x.f, 0:{ transcript:x.t } }; }); r.length = list.length; return r; }
+    function fire(idx, list){ live.onresult({ resultIndex:idx, results:res(list) }); }
+    function flush(){ timers.splice(0).forEach(function(f){ f(); }); }
+    var T = function(){ return els.vTranscript.value; };
+
+    api.start(); api.toggle();
+    test('(rec) enters recording state',  api.rec() === true && els.vMicBtn.className === 'vmic-rec');
+
+    fire(0,[{t:'Dell',f:false}]);
+    fire(0,[{t:'Dell Latitude E5470',f:false}]);
+    test('(rec) interim shown live',      T() === 'Dell Latitude E5470');
+    fire(0,[{t:'Dell Latitude E5470',f:true}]);
+    fire(0,[{t:'Dell Latitude E5470',f:true}]);
+    test('(rec) no stutter on re-report', (T().match(/Latitude/g) || []).length === 1);
+
+    fire(1,[{t:'Dell Latitude E5470',f:true},{t:' powers on includes charger',f:true}]);
+    test('(rec) letters not eaten',       /powers on includes charger/.test(T()));
+    test('(rec) no double spacing',       !/  /.test(T()));
+
+    var kept = T(), sb = startCalls;
+    live.onend(); flush();
+    test('(rec) auto-restarts on cutoff', startCalls > sb && api.rec() === true);
+    test('(rec) transcript survives',     T() === kept);
+
+    fire(0,[{t:'4 pounds 8 ounces',f:true}]);
+    test('(rec) appends after restart',   /E5470/.test(T()) && /4 pounds 8 ounces/.test(T()));
+
+    var sb2 = startCalls;
+    api.toggle(); flush();
+    test('(rec) explicit stop ends it',   api.rec() === false && startCalls === sb2);
+    test('(rec) button returns to idle',  els.vMicBtn.className === 'vmic-idle');
+
+    api.toggle(); live.onerror({ error:'not-allowed' }); live.onend(); flush();
+    test('(rec) mic denial no loop',      api.rec() === false && timers.length === 0);
+    test('(rec) denial message kept',     /Microphone blocked/.test(els.vMicStatus.textContent));
+
+    api.start(); els.vTranscript.value = 'typed by hand'; api.toggle(); fire(0,[{t:'and spoken',f:true}]);
+    test('(rec) typed text preserved',    T() === 'typed by hand and spoken');
+  } catch(e){
+    test('voice recording functional eval', false);
+    console.log('    ERROR:', e.message);
+  }
+})();
+
 section('SYNTAX CHECK');
 try {
   require('child_process').execSync('node --check ' + serverFile, {stdio:'pipe'});
