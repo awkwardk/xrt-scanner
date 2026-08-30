@@ -903,8 +903,21 @@ test('whitespace regex not mangled',     has('.replace(/\\\\s+/g,\' \')') && !ha
 
 section('VOICE INTAKE v2 (background submit, photo reorder, custom SKU)');
 // ── fix 1: background processing & instant UI release ──
-test('response sent before background generation', has("sendJSON(res,200,{ success:true, sku:sku, photos_saved:saved });") && has('setTimeout(function(){') && has('var record = buildVoiceListingRecord(sku, pv, shelf, saved, {});'));
+test('response sent before background generation', has("sendJSON(res,200,{ success:true, sku:sku, photos_saved:saved });") && has('setTimeout(function(){'));
 test('background block never crashes response', has('} catch(e2){') && has("console.log('[VOICE] SKU ' + sku + ' background generation error: ' + e2.message);"));
+
+// ── fast-submit now runs the OpenRouter Gemini 2.5 Flash pipeline, not the deterministic parser ──
+section('VOICE INTAKE AI PIPELINE (fast-submit primary path)');
+test('voiceIdentifyFromPhotos helper exists',   has('function voiceIdentifyFromPhotos(transcript, photoB64Array, callback){'));
+test('generateVoiceListingAI helper exists',    has('function generateVoiceListingAI(sku, transcript, shelf, pvHints, weightLine, visionInfo, photoBlocks, callback){'));
+test('assembleVoiceRecordFromAI helper exists', has('function assembleVoiceRecordFromAI(sku, shelf, saved, transcript, pvHints, winfo, weightPhotoIndex, noScaleDetected, tier, visionInfo, aiData){'));
+test('step 1 vision uses plain gemini-2.5-flash', has("'google/gemini-2.5-flash'") && has('function voiceIdentifyFromPhotos'));
+test('step 2 pricing uses :online grounding',   has("'google/gemini-2.5-flash:online'"));
+test('scale reading stays last-photo-only',     has('detectWeightAndDims(scaleB64, function(winfo){'));
+test('scale photo excluded from id photos',     has('if(pi === weightPhotoIndex) continue;'));
+test('shipping tier stays server-computed',     has('tier = calculateShippingTier(winfo.lbs, winfo.oz, sku);'));
+test('AI failure falls back to deterministic',  has('function fallbackToDeterministic(reason){') && has("if(!OPENROUTER_KEY){ fallbackToDeterministic('OPENROUTER_API_KEY not set'); return; }") && has("if(!aiData){ fallbackToDeterministic('Step 2 returned no data'); return; }"));
+test('fallback still writes a real record',    has('var fbRecord = buildVoiceListingRecord(sku, pv2, shelf, saved, {});'));
 test('photos saved before responding',   has("photos.forEach(function(b64, i){") && has("sendJSON(res,200,{ success:true, sku:sku"));
 test('client shows toast not alert on success', has("voiceToast('") && has('voiceResetFields();'));
 test('toast auto-hides itself',          has('voiceToastTimer=setTimeout(') && has("el.classList.remove('show');"));

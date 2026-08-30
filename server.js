@@ -454,6 +454,193 @@ function buildVoiceListingRecord(sku, parsedVoice, shelf, photoCount, extra){
   };
 }
 
+
+// ══════════════════════════════════════════════════════════════════════════════
+// VOICE INTAKE — AI PIPELINE (replaces the deterministic parser as the PRIMARY path).
+// Two OpenRouter/Gemini calls, run in the background after /api/fast-submit has already
+// responded:
+//   Step 1b: voiceIdentifyFromPhotos()   — vision-only, confirms brand/model by reading labels
+//   Step 2:  generateVoiceListingAI()    — :online (Google Search grounding), full listing + pricing
+// Step 1a (scale reading) reuses detectWeightAndDims() UNCHANGED — it is called with ONLY the
+// last photo, matching the established, already-fixed convention ("sending all photos caused the
+// scale reading to be missed"); the label-reading step below can safely use multiple photos since
+// that failure mode does not apply to it.
+// Shipping is ALWAYS server-computed via calculateShippingTier() — never trusted from AI output,
+// matching every other pipeline in this file.
+// If either AI call fails or returns unusable JSON, the /api/fast-submit background block falls
+// back to buildVoiceListingRecord() (the original deterministic parser) so the item is never left
+// completely unlisted.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// STEP 1b: confirm/correct the spoken item identity by reading labels/model plates from photos.
+// Vision-only (no search needed) — same model + transport as the scale reader. Returns null on any
+// failure so the caller falls back to the transcript-only guess.
+function voiceIdentifyFromPhotos(transcript, photoB64Array, callback){
+  try {
+    if(!photoB64Array || !photoB64Array.length){ callback(null); return; }
+    var parts = [];
+    photoB64Array.slice(0, 8).forEach(function(b64, i){
+      parts.push({ text: 'Photo ' + (i + 1) + ':' });
+      parts.push({ b64: b64 });
+    });
+    parts.push({ text: [
+      'The seller spoke this description while processing the item: "' + String(transcript || '').replace(/"/g, "'") + '"',
+      '',
+      'Examine the photos and CONFIRM or CORRECT the brand and model by reading any labels, nameplates, or model plates',
+      'visible in the images (for example a label reading "Zebra P4T" or "Nintendo UTL-001") — reading the label directly',
+      'is more accurate than the spoken description alone.',
+      '',
+      'Also note what accessories/items are visible (What is Included) and any visible cosmetic condition.',
+      '',
+      'Return ONLY this JSON, no markdown:',
+      '{',
+      '  "item_name": "full descriptive name with brand and model",',
+      '  "brand": "exact brand as printed on the label, or your best identification if no label is visible",',
+      '  "model": "exact model number as printed on the label, or empty string if none is visible",',
+      '  "category": "eBay category path or item type",',
+      '  "includes": "comma-separated list of accessories/items visible in the photos",',
+      '  "condition_notes": "honest description of visible cosmetic condition"',
+      '}'
+    ].join('\n') });
+    callGeminiVisionParts(parts, 700, function(err, resp){
+      if(err || !resp){ console.log('[VOICE] label-verification vision call failed: ' + (err ? err.message : 'empty response')); callback(null); return; }
+      var data = extractFirstJson(extractText(resp.content));
+      if(!data || !data.item_name){ console.log('[VOICE] label-verification returned no usable JSON'); callback(null); return; }
+      callback(data);
+    });
+  } catch(e){ console.log('[VOICE] label-verification error: ' + e.message); callback(null); }
+}
+
+// STEP 2: pricing research + full listing generation, with Google Search grounding via the
+// ":online" OpenRouter suffix so pricing reflects REAL completed-sale data (per spec). Reuses
+// buildListingSystemPrompt() verbatim — same Cassini-title / HTML-template / item-specifics rules
+// every other pipeline in this app already uses. Returns the parsed listing JSON, or null on failure.
+function generateVoiceListingAI(sku, transcript, shelf, pvHints, weightLine, visionInfo, photoBlocks, callback){
+  try {
+    var v = visionInfo || {};
+    var itemName = v.item_name || [pvHints.brand, pvHints.model, pvHints.product_type].filter(Boolean).join(' ');
+    var systemPrompt = buildListingSystemPrompt() + '\n\n' +
+      'VOICE INTAKE — ADDITIONAL RULES:\n' +
+      'Extract the condition grade (A/B/C/D) and whether the item powers on/works from the seller\'s spoken notes below. Return them as "grade" and "parts_repair" in the JSON.\n' +
+      'Grade scale: A = Like New/Open Box, B = Good/normal used, C = Fair/heavy wear, D = Parts or not working.\n' +
+      'If the seller said the item does not power on, fails, or is for parts, OR you determine grade D, set parts_repair:true and include "For Parts or Repair" in the title.\n' +
+      'Also return "is_lot" (true if the seller described multiple identical units) and "lot_quantity" (the count, default 1).';
+    var userMessage = [
+      'Seller\'s spoken description (verbatim): ' + (transcript || '(none)'),
+      '',
+      'Item identified from photos: ' + (itemName || '(see photos)'),
+      'Brand (from label, if read): ' + (v.brand || pvHints.brand || 'not confirmed'),
+      'Model (from label, if read): ' + (v.model || pvHints.model || 'not confirmed'),
+      'Category: ' + (v.category || pvHints.product_type || 'not specified'),
+      'Included items visible in photos: ' + (v.includes || (pvHints.includes && pvHints.includes.join(', ')) || 'see photos'),
+      'Condition notes from photos: ' + (v.condition_notes || 'see photos'),
+      'Detected from speech (confirm or correct): grade=' + (pvHints.grade || 'not stated') + ', power test=' + (pvHints.power_test || 'not stated') + ', quantity=' + (pvHints.quantity || 1),
+      'Shelf location: ' + (shelf || 'not recorded'),
+      'Weight: ' + (weightLine || 'not recorded — use standard small-item shipping'),
+      '',
+      'Look at the photos provided and generate a complete listing for this item. Use the photos as your primary source of truth for what the item is, what is included, and what condition it is in. Use the seller\'s spoken notes to add any details the photos may not show clearly.',
+      '',
+      'Search eBay sold listings for accurate current pricing for this exact item with these specifications. Return the listing JSON.'
+    ].join('\n');
+
+    var content = (photoBlocks || []).concat([{ type:'text', text: userMessage }]);
+    console.log('[VOICE] SKU ' + sku + ' Step 2 — generating listing with ' + (photoBlocks || []).length + ' photos via Gemini Flash (online search)');
+    callOpenRouter({
+      model: 'google/gemini-2.5-flash:online',
+      max_tokens: 2500,
+      messages: [ { role:'system', content: systemPrompt }, { role:'user', content: content } ]
+    }, function(err, text){
+      if(err || !text){ console.log('[VOICE] SKU ' + sku + ' Step 2 failed: ' + (err ? err.message : 'empty response')); callback(null); return; }
+      var data = parseGeminiJson(text);
+      if(!data || !data.title){ console.log('[VOICE] SKU ' + sku + ' Step 2 failed: could not parse listing JSON'); callback(null); return; }
+      callback(data);
+    });
+  } catch(e){ console.log('[VOICE] SKU ' + sku + ' Step 2 error: ' + e.message); callback(null); }
+}
+
+// Assemble the final listing.json record from the AI pipeline's output (Step 1 vision facts + Step 2
+// listing data), in the SAME shape buildVoiceListingRecord() produces so /api/listings, Regenerate,
+// and every other consumer of a voice-intake record keep working unchanged. Prices are never left at
+// $0: falls through the AI's own numbers, then a safe manual default (per spec).
+function assembleVoiceRecordFromAI(sku, shelf, saved, transcript, pvHints, winfo, weightPhotoIndex, noScaleDetected, tier, visionInfo, aiData){
+  var grade = String(aiData.grade || pvHints.grade || 'B').toUpperCase();
+  if(['A','B','C','D'].indexOf(grade) < 0) grade = 'B';
+  var partsRepair = !!(aiData.parts_repair || grade === 'D' || pvHints.power_test === 'Fail');
+  var quantity = (parseInt(aiData.lot_quantity, 10) > 1) ? parseInt(aiData.lot_quantity, 10) : ((pvHints.quantity && pvHints.quantity > 1) ? pvHints.quantity : 1);
+  var condId = voiceGradeConditionId(grade, partsRepair);
+
+  var shipInfo;
+  if(tier){
+    shipInfo = { shipping_policy: shippingPolicyName(tier.shippingPolicyId), shipping_profile_id: String(tier.shippingPolicyId),
+                 listed_weight: tier.finalLbs, listed_weight_unit: 'lbs', box_dimensions: tier.boxSize, polymailer: false };
+  } else {
+    shipInfo = calcShipping(null, null, {});
+  }
+
+  var v = visionInfo || {};
+  var specifics = (aiData.item_specifics && typeof aiData.item_specifics === 'object' && !Array.isArray(aiData.item_specifics)) ? aiData.item_specifics : {};
+  if(!specifics.Brand && (v.brand || pvHints.brand)) specifics.Brand = v.brand || pvHints.brand;
+  if(!specifics.Model && (v.model || pvHints.model)){ specifics.Model = v.model || pvHints.model; if(!specifics.MPN) specifics.MPN = specifics.Model; }
+  // Established rule: serial numbers are never surfaced in item_specifics.
+  Object.keys(specifics).forEach(function(k){ if(/^serial(\s|_)?(number|no\.?|#)?$/i.test(String(k).trim()) || /^s\/?n$/i.test(String(k).trim())) delete specifics[k]; });
+
+  var title = String(aiData.title || '').trim().slice(0, 80) ||
+    buildCassiniTitle({ brand: v.brand || pvHints.brand, model: v.model || pvHints.model, product_type: v.category || pvHints.product_type,
+                         features: pvHints.features, includes: pvHints.includes, grade: grade, parts_repair: partsRepair, quantity: quantity });
+
+  function num(x, fb){ var n = parseFloat(x); return (x != null && !isNaN(n) && n > 0) ? n : fb; }
+  var avg = num(aiData.avg_sold_price, 0);
+  var suggested = num(aiData.suggested_price, avg);
+  if(!(avg > 0) && !(suggested > 0)){ avg = 40; suggested = 40; console.log('[VOICE] SKU ' + sku + ' AI returned no price — using manual fallback $40'); }
+  if(!(avg > 0)) avg = suggested;
+  if(!(suggested > 0)) suggested = avg;
+  var priceLow = num(aiData.price_low, Math.round(avg * 0.7));
+  var priceHigh = num(aiData.price_high, Math.round(avg * 1.3));
+  var accept = num(aiData.accept_price, Math.round(suggested * 0.8));
+  var decline = num(aiData.decline_price, Math.round(suggested * 0.6));
+
+  var listing = {
+    title: title,
+    condition_box: String(aiData.condition_box || ('Grade ' + grade + '. ' + (v.condition_notes || 'See photos.'))).trim(),
+    description_html: String(aiData.description_html || ('<p>' + title + '</p>')),
+    item_specifics: specifics,
+    condition_id: condId,
+    parts_repair: partsRepair,
+    custom_sku: String(sku) + (shelf ? '-' + shelf : ''),
+    avg_sold_price: avg, price_low: priceLow, price_high: priceHigh,
+    suggested_price: suggested, accept_price: accept, decline_price: decline,
+    shipping_policy: shipInfo.shipping_policy, shipping_profile_id: shipInfo.shipping_profile_id,
+    listed_weight: shipInfo.listed_weight, listed_weight_unit: shipInfo.listed_weight_unit,
+    box_dimensions: shipInfo.box_dimensions, polymailer: !!shipInfo.polymailer,
+    category_id: 0, is_lot: quantity > 1, lot_quantity: quantity
+  };
+
+  var meta = {
+    sku: sku, grade: grade, powerTest: pvHints.power_test || (partsRepair ? 'Fail' : null), notes: transcript || '', shelf: shelf || '',
+    quantity: quantity, source: 'voice_intake', voice_transcript: transcript || '',
+    weight: tier ? (tier.rawLbs + 'lb ' + tier.rawOz + 'oz') : null,
+    weightLbs: tier ? tier.rawLbs : null, weightOzPart: tier ? tier.rawOz : null,
+    shipping_tier: tier, noWeightFlag: !tier, scale_warning: !!(winfo && winfo.scale_warning),
+    weightPhotoIndex: weightPhotoIndex, no_scale_detected: !!noScaleDetected,
+    photoCount: saved || 0, timestamp: new Date().toISOString(), processed: true
+  };
+
+  // Scale photo excluded from eBay listing downloads (established rules 26/27).
+  var outputPhotos = [];
+  for(var i = 1; i <= (saved || 0); i++){ if(i !== weightPhotoIndex) outputPhotos.push('photo_' + i); }
+
+  return {
+    sku: sku, meta: meta, listing: listing, source: 'voice_intake',
+    visionData: { item_name: v.item_name || title, brand: v.brand || pvHints.brand || '', model: v.model || pvHints.model || '' },
+    quantity: quantity, photoCount: saved || 0, outputPhotos: outputPhotos,
+    weight: meta.weight, shipping_tier: tier, shippingInfo: shipInfo,
+    partsRepair: partsRepair, condition_id: condId, weightPhotoIndex: weightPhotoIndex,
+    scale_warning: !!(winfo && winfo.scale_warning), no_scale_detected: !!noScaleDetected,
+    noWeightFlag: !tier, threshold: MIN_THRESHOLD, belowThreshold: (suggested > 0 && suggested < MIN_THRESHOLD),
+    generatedAt: meta.timestamp
+  };
+}
+
 // ── eBay TOKEN HELPERS (Feature 9) ──
 function readEbayTokens(){
   // OAuth tokens in ebay-tokens.json are the single source of truth. The
@@ -1502,25 +1689,90 @@ const server = http.createServer(function(req, res) {
         console.log('[VOICE] SKU ' + sku + ' accepted — ' + saved + ' photo(s) saved, generating in background');
         sendJSON(res,200,{ success:true, sku:sku, photos_saved:saved });
 
+        // CRITICAL FIX: the deterministic regex parser is no longer the primary path. The standard
+        // OpenRouter Gemini 2.5 Flash pipeline now drives generation:
+        //   Step 1a: detectWeightAndDims()      — scale reading (UNCHANGED, proven — last photo only)
+        //   Step 1b: voiceIdentifyFromPhotos()   — confirm brand/model by reading photo labels
+        //   Step 2:  generateVoiceListingAI()    — :online (Google Search grounding) pricing + listing
+        // buildVoiceListingRecord() (the original parser) is kept as the FAILURE fallback ONLY —
+        // if OpenRouter is unreachable or returns unusable output at any stage, the item still gets a
+        // real listing.json written (via fallbackToDeterministic below) so it is never left invisible.
         setTimeout(function(){
-          try {
-            var pv = parseVoiceTranscript(transcript);
-            if(parsed.grade) pv.grade = String(parsed.grade).toUpperCase();
-            if(parsed.powerTest) pv.power_test = String(parsed.powerTest);
-            if(pv.grade === 'D' || pv.power_test === 'Fail') pv.parts_repair = true;
+          var lastIdx = saved;
+          var scaleB64 = [];
+          if(lastIdx > 0){ try { scaleB64.push(fs.readFileSync(path.join(itemDir,'photo_'+lastIdx+'.jpg')).toString('base64')); } catch(e){} }
 
-            var record = buildVoiceListingRecord(sku, pv, shelf, saved, {});
-            fs.writeFileSync(path.join(itemDir, 'meta.json'), JSON.stringify(record.meta, null, 2));
-            fs.writeFileSync(path.join(itemDir, 'listing.json'), JSON.stringify(record, null, 2));
-            try { loadListings(); } catch(e){}
-
-            console.log('[VOICE] SKU ' + sku + ' generated — "' + record.listing.title + '" | grade ' + record.meta.grade +
-              ' | condition ' + record.listing.condition_id + (record.listing.parts_repair ? ' | PARTS/REPAIR' : '') +
-              ' | ' + record.listing.shipping_policy);
-          } catch(e2){
-            console.log('[VOICE] SKU ' + sku + ' background generation error: ' + e2.message);
+          function fallbackToDeterministic(reason){
+            try {
+              console.log('[VOICE] SKU ' + sku + ' AI pipeline unavailable (' + reason + ') — using deterministic fallback');
+              var pv2 = parseVoiceTranscript(transcript);
+              if(parsed.grade) pv2.grade = String(parsed.grade).toUpperCase();
+              if(parsed.powerTest) pv2.power_test = String(parsed.powerTest);
+              if(pv2.grade === 'D' || pv2.power_test === 'Fail') pv2.parts_repair = true;
+              var fbRecord = buildVoiceListingRecord(sku, pv2, shelf, saved, {});
+              fs.writeFileSync(path.join(itemDir, 'meta.json'), JSON.stringify(fbRecord.meta, null, 2));
+              fs.writeFileSync(path.join(itemDir, 'listing.json'), JSON.stringify(fbRecord, null, 2));
+              try { loadListings(); } catch(e){}
+              console.log('[VOICE] SKU ' + sku + ' fallback listing written — "' + fbRecord.listing.title + '"');
+            } catch(eFallback){ console.log('[VOICE] SKU ' + sku + ' fallback ALSO failed: ' + eFallback.message); }
           }
+
+          try {
+            if(!OPENROUTER_KEY){ fallbackToDeterministic('OPENROUTER_API_KEY not set'); return; }
+            var pvHints = parseVoiceTranscript(transcript);
+
+            // Step 1a: scale reading — reuses detectWeightAndDims() unchanged, last photo only.
+            detectWeightAndDims(scaleB64, function(winfo){
+              try {
+                var _sp = resolveScalePhoto(lastIdx, winfo ? winfo.is_scale_photo : true);
+                var weightPhotoIndex = _sp.weightPhotoIndex;
+                var noScaleDetected = _sp.no_scale_detected;
+                var suspectRead = !!(winfo && winfo.scale_warning);
+                var tier = null;
+                if(winfo && winfo.lbs !== null && winfo.lbs !== undefined && (winfo.lbs > 0 || winfo.oz > 0) && !suspectRead){
+                  tier = calculateShippingTier(winfo.lbs, winfo.oz, sku);
+                  console.log('[VOICE] SKU ' + sku + ' scale reading: ' + tier.rawLbs + 'lb ' + tier.rawOz + 'oz');
+                } else if(suspectRead){
+                  console.log('[VOICE] SKU ' + sku + ' scale read looks wrong — weight NOT set, flagged for manual confirmation');
+                } else {
+                  console.log('[VOICE] SKU ' + sku + ' no scale reading — flagged for manual entry');
+                }
+
+                var idPhotos = [];
+                for(var pi = 1; pi <= saved; pi++){
+                  if(pi === weightPhotoIndex) continue;
+                  try { idPhotos.push(fs.readFileSync(path.join(itemDir, 'photo_' + pi + '.jpg')).toString('base64')); } catch(e){}
+                }
+
+                // Step 1b: confirm brand/model by reading labels in the (non-scale) photos.
+                voiceIdentifyFromPhotos(transcript, idPhotos, function(visionInfo){
+                  try {
+                    buildLocalPhotoBase64Blocks(itemDir, saved, weightPhotoIndex, [], sku, function(localBlocks){
+                      try {
+                        var orBlocks = toOpenRouterImageBlocks(localBlocks);
+                        var weightLine = tier ? (tier.rawLbs + 'lb ' + tier.rawOz + 'oz') : null;
+                        // Step 2: pricing + full listing generation, :online search grounding.
+                        generateVoiceListingAI(sku, transcript, shelf, pvHints, weightLine, visionInfo, orBlocks, function(aiData){
+                          try {
+                            if(!aiData){ fallbackToDeterministic('Step 2 returned no data'); return; }
+                            var record = assembleVoiceRecordFromAI(sku, shelf, saved, transcript, pvHints, winfo, weightPhotoIndex, noScaleDetected, tier, visionInfo, aiData);
+                            fs.writeFileSync(path.join(itemDir, 'meta.json'), JSON.stringify(record.meta, null, 2));
+                            fs.writeFileSync(path.join(itemDir, 'listing.json'), JSON.stringify(record, null, 2));
+                            try { loadListings(); } catch(e){}
+                            console.log('[VOICE] SKU ' + sku + ' generated — "' + record.listing.title + '" | grade ' + record.meta.grade +
+                              ' | condition ' + record.listing.condition_id + (record.listing.parts_repair ? ' | PARTS/REPAIR' : '') +
+                              ' | ' + record.listing.suggested_price + ' | ' + record.listing.shipping_policy);
+                          } catch(eAssemble){ console.log('[VOICE] SKU ' + sku + ' assembly error: ' + eAssemble.message); fallbackToDeterministic('assembly error'); }
+                        });
+                      } catch(ePhotos){ console.log('[VOICE] SKU ' + sku + ' photo-block error: ' + ePhotos.message); fallbackToDeterministic('photo-block error'); }
+                    });
+                  } catch(eVision){ console.log('[VOICE] SKU ' + sku + ' vision-identify error: ' + eVision.message); fallbackToDeterministic('vision-identify error'); }
+                });
+              } catch(eWeight){ console.log('[VOICE] SKU ' + sku + ' weight-processing error: ' + eWeight.message); fallbackToDeterministic('weight-processing error'); }
+            });
+          } catch(e2){ console.log('[VOICE] SKU ' + sku + ' background generation error: ' + e2.message); fallbackToDeterministic('top-level error'); }
         }, 0);
+
       } catch(e){
         console.log('[VOICE] fast-submit error: ' + e.message);
         sendJSON(res,200,{success:false, error:'Server error'});
