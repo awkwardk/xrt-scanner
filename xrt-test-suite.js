@@ -707,6 +707,99 @@ test('sonnet view still maintained',           has('r.sonnet = view;'));
 test('regen returns post-guard copy',          has('result.description_html = rec.listing.description_html;'));
 test('regen reloads card to show new verdict', has('(reloading)'));
 
+
+section('VOICE INTAKE (additive)');
+test('mic button on processor',        has("id='vMicBtn'") && has('toggleVoiceMic'));
+test('Web Speech API used',            has('window.SpeechRecognition||window.webkitSpeechRecognition'));
+test('voice intake screen',            has("id='voiceScreen'") && has('startVoiceIntake'));
+test('home entry point',               has('Voice Intake'));
+test('transcript + shelf + photos UI', has("id='vTranscript'") && has("id='vShelf'") && has("id='vPhotoInput'"));
+test('unsupported browser handled',    has('Voice not supported on this browser'));
+test('fast-submit endpoint',           has("req.url==='/api/fast-submit'"));
+test('fast-submit writes listing.json',has("path.join(itemDir, 'listing.json')") && has('buildVoiceListingRecord('));
+test('fast-submit saves photos',       has("'photo_' + (i+1) + '.jpg'"));
+test('parseVoiceTranscript helper',    has('function parseVoiceTranscript('));
+test('buildCassiniTitle helper',       has('function buildCassiniTitle('));
+test('voice grade->condition map',     has('var map = { A:1000, B:3000, C:5000, D:7000 };'));
+test('voice parts/repair rule',        has("if(out.grade === 'D') out.parts_repair = true;") && has("return 'For Parts or Repair';"));
+test('voice reuses shipping tier',     has('tier = calculateShippingTier(p.weight_lbs || 0, p.weight_oz || 0, sku)'));
+test('voice never re-implements ship', has('shippingPolicyName(tier.shippingPolicyId)'));
+
+// ── functional: transcript -> listing data ──
+(function(){
+  function ex(n){
+    var st = content.indexOf('function ' + n + '(');
+    if(st < 0) return '';
+    var d = 0, seen = false, e = -1;
+    for(var i = st; i < content.length; i++){ var c = content[i]; if(c === '{'){ d++; seen = true; } else if(c === '}'){ d--; if(seen && d === 0){ e = i + 1; break; } } }
+    return content.slice(st, e);
+  }
+  try {
+    var box = {};
+    var code = (content.match(/var VOICE_BRANDS = \[[\s\S]*?\];/) || [''])[0] + '\n'
+      + (content.match(/var VOICE_TYPES = \[[\s\S]*?\];/) || [''])[0] + '\n'
+      + 'var MIN_THRESHOLD = 30;\n'
+      + ex('calculateShippingTier') + '\n' + ex('shippingPolicyName') + '\n' + ex('calcShipping') + '\n'
+      + ex('parseVoiceTranscript') + '\n' + ex('voiceGradeConditionId') + '\n' + ex('voiceConditionWord') + '\n'
+      + ex('buildCassiniTitle') + '\n' + ex('buildVoiceListingRecord') + '\n'
+      + 'box.parse = parseVoiceTranscript; box.title = buildCassiniTitle; box.cond = voiceGradeConditionId; box.rec = buildVoiceListingRecord;';
+    var _log = console.log; console.log = function(){};
+    eval(code);
+    console.log = _log;
+
+    var P = box.parse, T = box.title, C = box.cond, R = box.rec;
+    var a = P('Dell Latitude E5470 laptop grade B powers on includes charger and dock 4 pounds 8 ounces');
+    test('(voice) brand extracted',        a.brand === 'Dell');
+    test('(voice) model extracted',        a.model === 'E5470');
+    test('(voice) product type extracted', a.product_type === 'Laptop');
+    test('(voice) grade extracted',        a.grade === 'B');
+    test('(voice) power test extracted',   a.power_test === 'Pass');
+    test('(voice) weight extracted',       a.weight_lbs === 4 && a.weight_oz === 8);
+    test('(voice) bundle excludes weight', a.includes.indexOf('charger') >= 0 && !/pound|ounce/.test(a.includes.join(' ')));
+
+    var hp = P('HP LaserJet printer grade D no power for parts 12 lbs');
+    test('(voice) acronym brand casing',   hp.brand === 'HP');
+    test('(voice) grade D -> parts',       hp.parts_repair === true);
+    var hpT = T({ brand:hp.brand, model:hp.model, product_type:hp.product_type, features:hp.features, includes:hp.includes, grade:hp.grade, parts_repair:hp.parts_repair, quantity:1 });
+    test('(voice) parts title phrase',     /For Parts or Repair/.test(hpT));
+
+    var fail = P('Sony amplifier grade B no power 8 lbs');
+    test('(voice) power fail -> parts',    fail.parts_repair === true);
+
+    test('(voice) condition A=1000',       C('A', false) === 1000);
+    test('(voice) condition B=3000',       C('B', false) === 3000);
+    test('(voice) condition C=5000',       C('C', false) === 5000);
+    test('(voice) condition D=7000',       C('D', false) === 7000);
+    test('(voice) parts forces 7000',      C('B', true) === 7000);
+
+    var titles = [
+      'Dell Latitude E5470 laptop grade B powers on includes charger and docking station and extra battery and power adapter 4 pounds',
+      'Cisco Catalyst WS-C2960X-48TS-L network switch 48 ports gigabit poe grade A works includes rack ears and power cable 12 lbs'
+    ].map(function(x){ var p = P(x); return T({ brand:p.brand, model:p.model, product_type:p.product_type, features:p.features, includes:p.includes, grade:p.grade, parts_repair:p.parts_repair, quantity:p.quantity }); });
+    test('(voice) titles <= 80 chars',     titles.every(function(x){ return x.length <= 80 && x.length > 0; }));
+
+    var lot = P('Lot of 5 Polycom VVX411 phones grade B tested working 6 lbs');
+    var lotT = T({ brand:lot.brand, model:lot.model, product_type:lot.product_type, features:lot.features, includes:lot.includes, grade:lot.grade, parts_repair:lot.parts_repair, quantity:lot.quantity });
+    test('(voice) lot quantity in title',  /Lot of 5/.test(lotT));
+
+    // shipping tiers preserved: GA <= 6lb, FedEx 6-15lb, Heavy > 15lb
+    function pol(lbs){ return R(1, P('Dell server grade B ' + lbs + ' pounds'), 'A1', 0, {}).listing.shipping_policy; }
+    test('(voice) GA <= 6lb',              /GA/.test(pol(3)) && /GA/.test(pol(6)));
+    test('(voice) FedEx 6-15lb',           /FedEx/.test(pol(10)) && /FedEx/.test(pol(15)));
+    test('(voice) Heavy > 15lb',           /Heavy/.test(pol(20)));
+
+    var rec = R(2601, a, 'B3', 3, {});
+    test('(voice) record has listing',     !!(rec && rec.listing && rec.listing.title));
+    test('(voice) record renders fields',  ['condition_box','description_html','item_specifics','custom_sku','box_dimensions'].every(function(k){ return rec.listing[k] !== undefined; }));
+    test('(voice) record carries sku',     rec.sku === 2601 && rec.meta.shelf === 'B3');
+    test('(voice) item specifics built',   rec.listing.item_specifics.Brand === 'Dell' && rec.listing.item_specifics.Model === 'E5470');
+    test('(voice) source tagged',          rec.source === 'voice_intake' && rec.meta.source === 'voice_intake');
+  } catch(e){
+    test('voice intake functional eval', false);
+    console.log('    ERROR:', e.message);
+  }
+})();
+
 section('SYNTAX CHECK');
 try {
   require('child_process').execSync('node --check ' + serverFile, {stdio:'pipe'});
