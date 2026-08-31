@@ -247,15 +247,22 @@ test('setup-all summary',             has('/ebay-setup-all') && has('summary'));
 test('Business policy retry',         has('21919456') && has('seller uses business policies'));
 test('Photo source URL base',         has('/api/photo/'));
 test('Parse eBay XML errors',         has('function parseEbayErrors('));
-test('GetSuggestedCategories helper',  has('function getSuggestedCategory(') && has('GetSuggestedCategories') && has('<Query>'));
-test('Top category by percent',        has('PercentItemFound') && has('highest percentage match'));
+// getSuggestedCategory: migrated off the retired Trading API GetSuggestedCategories (HTTP 410
+// Gone in production) to the Taxonomy REST API's get_category_suggestions.
+test('getSuggestedCategory uses Taxonomy REST endpoint', has('function getSuggestedCategory(query, token, callback){') && has("path: '/commerce/taxonomy/v1/category_tree/0/get_category_suggestions?q=' + encodeURIComponent(query),"));
+test('Taxonomy request uses correct auth headers', has("'Authorization': 'Bearer ' + token,") && has("'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US',") && has("'Accept': 'application/json'"));
+test('Taxonomy request hostname respects EBAY_BASE (sandbox-safe)', has("hostname: EBAY_BASE.replace('https://', ''),\n    path: '/commerce/taxonomy/v1/category_tree/0/get_category_suggestions"));
+test('parses categorySuggestions[0].category as the top match', has('var suggestions = Array.isArray(body.categorySuggestions) ? body.categorySuggestions : [];') && has('var top = suggestions[0];') && has('var cat = top && top.category;'));
+test('returns {category_id, category_name} shape',   has("callback(null, { category_id: cat.categoryId, category_name: cat.categoryName || '' });"));
+test('0 suggestions treated as a failed attempt (not a crash)', has("if(!suggestions.length){ callback(new Error('get_category_suggestions returned 0 suggestions for \"' + query + '\"')); return; }"));
+test('logs the exact Taxonomy response for diagnosis', has("console.log('[CATEGORY] Taxonomy get_category_suggestions \"' + query + '\" -> HTTP ' + resp.statusCode + ': ' + (d ? d.slice(0, 500) : '(empty body)'));"));
 test('Suggested category stored',      has('ebay_category_id') && has('ebay_category_name'));
 test('183446 fallback path',           has('function fallbackCategory(') && has('falling back to 183446'));
-test('Leaf validation via Features',   has('confirmed LEAF') && has('NOT a leaf') && has('leaf: leaf'));
-test('GetCategoryFeatures leaf parse', has("parseXmlTag(scope, 'LeafCategory')") && has("parseXmlTag(scope, 'ConditionValues')"));
-test('Iterate suggestions for leaf',   has('function tryNext(') && has('trying next suggestion'));
-test('Max 5 leaf attempts',            has('Math.min(5, cats.length)') && has('max 5 attempts'));
-test('Suggested returns ranked list',  has('callback(null, cats)'));
+test('GetCategoryFeatures leaf parse', has("parseXmlTag(scope, 'LeafCategory')") && has("parseXmlTag(scope, 'ConditionValues')") && has('callback(null, {leaf: leaf, conditions: ids});'));
+// Taxonomy suggestions are already leaf-guaranteed, so trySuggestedLeaf no longer iterates/rejects
+// candidates — it fetches conditions for the one suggestion and trusts it even if that lookup fails.
+test('trySuggestedLeaf trusts the Taxonomy suggestion unconditionally', has('if(fErr){ console.log(\'[CATEGORY] GetCategoryFeatures failed for Taxonomy-suggested category \' + cat.category_id + \' (\' + cat.category_name + \') — using it anyway: \' + fErr.message); }'));
+test('no more per-candidate leaf-rejection loop', !has('function tryNext(') && !has('trying next suggestion'));
 test('No hardcoded category chain',    !has('categoryFallbacks') && !has('9394') && !has('58058') && !has('175672'));
 test('Listings page shows category',   has('eBay Category:'));
 test('Prompt asks for leaf category',  has('most specific eBay LEAF category') && has('177 (PC Laptops)'));
@@ -453,7 +460,8 @@ test('sanitizeTitleForCategoryQuery exists',  has('function sanitizeTitleForCate
 test('strips w/ and with noise',              has("'w/', 'with', 'bundle', 'tested', 'working', 'for parts', 'as is', 'as-is',"));
 test('strips grade a/b/c/d noise',            has("'grade a', 'grade b', 'grade c', 'grade d'"));
 test('strips long serial/part tokens > 8 chars', has('return !(clean.length > 8 && /[0-9]/.test(clean) && /[a-z]/i.test(clean));'));
-test('trySuggestedLeaf does the actual GetSuggestedCategories call', has('function trySuggestedLeaf(query, token, callback){') && has("getSuggestedCategory(query, token, function(scErr, cats){"));
+test('trySuggestedLeaf does the actual Taxonomy call', has('function trySuggestedLeaf(query, token, callback){') && has("getSuggestedCategory(query, token, function(scErr, cat){"));
+test('trySuggestedLeaf fetches conditions for the resolved category', has("getCategoryFeatures(cat.category_id, token, function(fErr, feat){"));
 test('Attempt 1 is Clean Core (brand+model+type)', has("addQuery([brand, model, productType].filter(Boolean).join(' '));   // Attempt 1: Clean Core"));
 test('Attempt 2 is Sanitized Title',          has('addQuery(sanitizeTitleForCategoryQuery(item.title));                // Attempt 2: Sanitized Title'));
 test('Attempt 3 is Brand + Type',             has("addQuery([brand, productType].filter(Boolean).join(' '));           // Attempt 3: Brand + Type"));
@@ -1163,11 +1171,12 @@ section('CLEAN QUERY functional behavior (no network)');
     console.log = _log2;
     var R = box2.resolve;
 
-    // Stub getSuggestedCategory/getCategoryFeatures so ONLY the "Zebra P4T Label Printer" query
-    // (the Clean Core attempt) resolves to a leaf — proves attempt 1 wins when it works, and that
-    // resolveLeafCategoryFromTitle never even tries the noisy attempts after a hit.
+    // Stub getSuggestedCategory (now the Taxonomy REST call, returning a single {category_id,
+    // category_name} object per the migrated contract) / getCategoryFeatures so ONLY the "Zebra
+    // P4T Label Printer" query (the Clean Core attempt) resolves — proves attempt 1 wins when it
+    // works, and that resolveLeafCategoryFromTitle never even tries the noisy attempts after a hit.
     var queriesTried = [];
-    global.getSuggestedCategory = function(q, tok, cb){ queriesTried.push(q); if(q === 'Zebra P4T Label Printer'){ cb(null, [{id:'175677', name:'Label/Thermal Printers', pct:92}]); } else { cb(null, []); } };
+    global.getSuggestedCategory = function(q, tok, cb){ queriesTried.push(q); if(q === 'Zebra P4T Label Printer'){ cb(null, {category_id:'175677', category_name:'Label/Thermal Printers'}); } else { cb(new Error('get_category_suggestions returned 0 suggestions for "' + q + '"')); } };
     global.getCategoryFeatures = function(id, tok, cb){ cb(null, {leaf: id === '175677', conditions: ['1000','3000']}); };
     R({ brand:'Zebra', model:'P4T', product_type:'Label Printer', title: 'Zebra P4T Direct Thermal Label Printer w/ Power Adapter P4D-0UJ10000-00 Grade B Tested' }, 'tok', function(err, cat){
       test('(priority) Clean Core query used first',   queriesTried[0] === 'Zebra P4T Label Printer');
@@ -1175,9 +1184,9 @@ section('CLEAN QUERY functional behavior (no network)');
       test('(priority) resolves the expected leaf',    !err && cat && cat.id === 175677);
     });
 
-    // Now make Clean Core fail (no candidates) so it must fall through to Sanitized Title.
+    // Now make Clean Core fail (0 suggestions) so it must fall through to Sanitized Title.
     var queriesTried2 = [];
-    global.getSuggestedCategory = function(q, tok, cb){ queriesTried2.push(q); if(q.indexOf('Zebra') === 0 && q.indexOf('Printer') > 0 && queriesTried2.length > 1){ cb(null, [{id:'175677', name:'Label/Thermal Printers', pct:80}]); } else { cb(null, []); } };
+    global.getSuggestedCategory = function(q, tok, cb){ queriesTried2.push(q); if(q.indexOf('Zebra') === 0 && q.indexOf('Printer') > 0 && queriesTried2.length > 1){ cb(null, {category_id:'175677', category_name:'Label/Thermal Printers'}); } else { cb(new Error('get_category_suggestions returned 0 suggestions for "' + q + '"')); } };
     global.getCategoryFeatures = function(id, tok, cb){ cb(null, {leaf: id === '175677', conditions: []}); };
     R({ brand:'Zebra', model:'P4T', product_type:'Label Printer', title: 'Zebra P4T Direct Thermal Label Printer w/ Power Adapter P4D-0UJ10000-00 Grade B Tested' }, 'tok', function(err, cat){
       test('(priority) falls through to a later attempt when Clean Core finds nothing', queriesTried2.length > 1);
@@ -1186,6 +1195,68 @@ section('CLEAN QUERY functional behavior (no network)');
   } catch(e){
     test('resolveLeafCategoryFromTitle priority functional eval', false);
     console.log('    ERROR:', e.message);
+  }
+})();
+
+// ── functional: getSuggestedCategory's OWN HTTP-response parsing, against realistic Taxonomy
+// JSON — stubs https.request (not getSuggestedCategory itself), so this exercises the actual
+// migrated parsing code, proving it reads categorySuggestions[0].category.{categoryId,
+// categoryName} the way eBay's real Taxonomy API responds.
+section('TAXONOMY RESPONSE PARSING (real parser, stubbed HTTP)');
+(function(){
+  function ex(n){
+    var s2 = content.indexOf('function ' + n + '(');
+    if (s2 < 0) return '';
+    var d = 0, seen = false, e = -1;
+    for (var i = s2; i < content.length; i++) { var c = content[i]; if (c === '{') { d++; seen = true; } else if (c === '}') { d--; if (seen && d === 0) { e = i + 1; break; } } }
+    return content.slice(s2, e);
+  }
+  var https = require('https');
+  var realRequest = https.request;
+  function mockHttps(statusCode, bodyObj){
+    https.request = function(options, cb){
+      var body = JSON.stringify(bodyObj);
+      var res = { statusCode: statusCode, on: function(evt, handler){ if(evt === 'data') handler(body); else if(evt === 'end') handler(); } };
+      cb(res);
+      return { on: function(){}, end: function(){} };
+    };
+  }
+  try {
+    var box = {};
+    var code = "var EBAY_BASE = 'https://api.ebay.com';\n" + ex('getSuggestedCategory') + '\nbox.get = getSuggestedCategory;';
+    var _log = console.log; console.log = function(){};
+    eval(code);
+    console.log = _log;
+    var G = box.get;
+
+    mockHttps(200, { categorySuggestions: [
+      { category: { categoryId: '175677', categoryName: 'Label/Thermal Printers' }, categoryTreeNodeLevel: 5 },
+      { category: { categoryId: '183446', categoryName: 'Other Consumer Electronics' }, categoryTreeNodeLevel: 3 }
+    ]});
+    G('Zebra P4T Label Printer', 'tok', function(err, cat){
+      test('(taxonomy parse) uses categorySuggestions[0], not a later entry', !err && cat.category_id === '175677');
+      test('(taxonomy parse) reads category_name from category.categoryName', !err && cat.category_name === 'Label/Thermal Printers');
+    });
+
+    mockHttps(200, { categorySuggestions: [] });
+    G('totally unmatched gibberish query', 'tok', function(err, cat){
+      test('(taxonomy parse) 0 suggestions -> error, not a crash', !!err && !cat);
+    });
+
+    mockHttps(410, { errors: [{ message: 'Resource not found' }] });
+    G('Zebra P4T Label Printer', 'tok', function(err, cat){
+      test('(taxonomy parse) non-2xx HTTP surfaces as an error', !!err && /410/.test(err.message));
+    });
+
+    mockHttps(200, { categorySuggestions: [ { categoryTreeNodeLevel: 5 } ] }); // malformed: no .category
+    G('Zebra P4T Label Printer', 'tok', function(err, cat){
+      test('(taxonomy parse) missing category.categoryId -> error, not a crash', !!err && !cat);
+    });
+  } catch(e){
+    test('getSuggestedCategory Taxonomy parsing functional eval', false);
+    console.log('    ERROR:', e.message);
+  } finally {
+    https.request = realRequest;
   }
 })();
 

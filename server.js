@@ -5514,26 +5514,51 @@ function uploadAllPhotos(record, sku, token, callback){
   next();
 }
 
-// Ask eBay for the best LEAF category for an item title (GetSuggestedCategories).
-// Returns the highest PercentItemFound match -> {id, name, percent}. Guarantees a leaf.
-function getSuggestedCategory(title, token, callback){
-  var xml = '<?xml version="1.0" encoding="utf-8"?>'
-    + '<GetSuggestedCategoriesRequest xmlns="urn:ebay:apis:eBLBaseComponents">'
-    + '<Query>' + xmlEscape(String(title || '').slice(0, 350)) + '</Query>'
-    + '</GetSuggestedCategoriesRequest>';
-  ebayTradingCall('GetSuggestedCategories', xml, token, function(err, sc, body){
-    if(err){ callback(err); return; }
-    var ack = parseXmlTag(body, 'Ack') || '';
-    var cats = parseXmlAll(body, 'SuggestedCategory').map(function(s){
-      return { id: parseXmlTag(s, 'CategoryID'), name: parseXmlTag(s, 'CategoryName'), pct: parseFloat(parseXmlTag(s, 'PercentItemFound')) || 0 };
-    }).filter(function(c){ return c.id; });
-    cats.sort(function(a, b){ return b.pct - a.pct; }); // highest percentage match first
-    if((ack === 'Success' || ack === 'Warning') && cats.length){
-      callback(null, cats); // full ranked list — caller validates each is a leaf
-      return;
+// Ask eBay's Taxonomy API for the top suggested category for a query. MIGRATED off the Trading
+// API's GetSuggestedCategories, which started returning HTTP 410 Gone — eBay retired it (that 410
+// was the real root cause behind items landing on the 183446 fallback, not query quality; see
+// commit a020589 where surfacing the underlying error revealed it). get_category_suggestions only
+// ever returns LEAF categories, ranked by relevance, so — unlike the old flow — no separate
+// per-candidate GetCategoryFeatures leaf-check loop is needed on the result.
+// callback(null, {category_id, category_name}) for the top suggestion, or callback(err) if the
+// query returns zero suggestions or the request itself fails. Never throws.
+function getSuggestedCategory(query, token, callback){
+  query = String(query || '').trim();
+  if(!query){ callback(new Error('empty category query')); return; }
+  if(!token){ callback(new Error('no eBay token')); return; }
+  var options = {
+    hostname: EBAY_BASE.replace('https://', ''),
+    path: '/commerce/taxonomy/v1/category_tree/0/get_category_suggestions?q=' + encodeURIComponent(query),
+    method: 'GET',
+    headers: {
+      'Authorization': 'Bearer ' + token,
+      'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US',
+      'Accept': 'application/json'
     }
-    callback(new Error('GetSuggestedCategories Ack=' + (ack || '?') + ': ' + (parseEbayErrors(body).join('; ') || ('HTTP ' + sc))));
+  };
+  var req = https.request(options, function(resp){
+    var d = ''; resp.on('data', function(c){ d += c; });
+    resp.on('end', function(){
+      // PRESERVE FALLBACK RESILIENCE: log the exact Taxonomy response body every time (success or
+      // failure) so a future regression is diagnosable from logs alone, the way the 410 was.
+      console.log('[CATEGORY] Taxonomy get_category_suggestions "' + query + '" -> HTTP ' + resp.statusCode + ': ' + (d ? d.slice(0, 500) : '(empty body)'));
+      var body; try { body = d ? JSON.parse(d) : {}; } catch(e){ body = null; }
+      if(resp.statusCode < 200 || resp.statusCode >= 300 || !body){
+        var msg = 'get_category_suggestions HTTP ' + resp.statusCode;
+        if(body && Array.isArray(body.errors) && body.errors[0]){ msg += ': ' + (body.errors[0].message || body.errors[0].longMessage || ''); }
+        callback(new Error(msg));
+        return;
+      }
+      var suggestions = Array.isArray(body.categorySuggestions) ? body.categorySuggestions : [];
+      if(!suggestions.length){ callback(new Error('get_category_suggestions returned 0 suggestions for "' + query + '"')); return; }
+      var top = suggestions[0];
+      var cat = top && top.category;
+      if(!cat || !cat.categoryId){ callback(new Error('get_category_suggestions response missing category.categoryId')); return; }
+      callback(null, { category_id: cat.categoryId, category_name: cat.categoryName || '' });
+    });
   });
+  req.on('error', function(e){ callback(e); });
+  req.end();
 }
 
 // GetCategoryFeatures -> { leaf: bool, conditions: ['1000','3000',...] } for a category
@@ -5571,12 +5596,12 @@ function getCategoryFeatures(categoryId, token, callback){
     callback(new Error('GetCategoryFeatures Ack=' + (ack || '?')));
   });
 }
-// Resolve a numeric LEAF eBay category ID from an item title via GetSuggestedCategories,
-// confirming leaf status with GetCategoryFeatures for each candidate (ranked by match %,
-// max 5 tried). Shared pre-flight category resolver — used by the voice-intake background
-// generator (Error [87] prevention: resolve BEFORE listing.json is written), by
-// createEbayListing (pre-flight + not-a-leaf/generic-fallback recovery, right before AddItem),
-// and by the operator-triggered re-resolve action on /api/listings.
+// Resolve a numeric LEAF eBay category ID from an item title via the Taxonomy API's
+// get_category_suggestions (each suggestion is already leaf-guaranteed — see getSuggestedCategory
+// above). Shared pre-flight category resolver — used by the voice-intake background generator
+// (Error [87] prevention: resolve BEFORE listing.json is written), by createEbayListing
+// (pre-flight + not-a-leaf/generic-fallback recovery, right before AddItem), and by the
+// operator-triggered re-resolve action on /api/listings.
 //
 // ROOT CAUSE FIX: sending the full 80-char Cassini title as the GetSuggestedCategories query
 // routinely returns nothing specific — long part numbers ("P4D-0UJ10000-00"), bundle/condition
@@ -5600,28 +5625,19 @@ function sanitizeTitleForCategoryQuery(title){
   }).join(' ');
   return s.replace(/\s+/g, ' ').trim();
 }
-// Try ONE query against GetSuggestedCategories, confirming leaf status for up to 5 ranked
-// candidates via GetCategoryFeatures. callback(null, {id,name,conditions}) on the first leaf
-// found, callback(err) if this query returns nothing usable.
+// Try ONE query: ask the Taxonomy API for its top suggested (guaranteed-leaf) category, then
+// fetch that category's valid ConditionValues via GetCategoryFeatures (Trading API — unaffected
+// by the GetSuggestedCategories retirement; used here only to harvest conditions, never to
+// re-reject the suggestion — Taxonomy is trusted as the leaf authority now). callback(null,
+// {id,name,conditions}) on success, callback(err) if this query found nothing.
 function trySuggestedLeaf(query, token, callback){
-  query = String(query || '').trim();
-  if(!query){ callback(new Error('empty category query')); return; }
-  getSuggestedCategory(query, token, function(scErr, cats){
-    if(scErr || !cats || !cats.length){ callback(scErr || new Error('no suggested categories for "' + query + '"')); return; }
-    var i = 0, max = Math.min(5, cats.length); // max 5 attempts to find a leaf
-    (function tryNext(){
-      if(i >= max){ callback(new Error('no leaf category found in top ' + max + ' suggestions for "' + query + '"')); return; }
-      var c = cats[i]; i++;
-      getCategoryFeatures(c.id, token, function(fErr, feat){
-        if(!fErr && feat && feat.leaf === true){
-          console.log('[CATEGORY] suggested category', c.id, '(' + c.name + ', ' + c.pct + '%) confirmed LEAF for query "' + query + '"');
-          callback(null, { id: parseInt(c.id, 10) || c.id, name: c.name, conditions: feat.conditions || [] });
-        } else {
-          console.log('[CATEGORY] suggested category', c.id, '(' + c.name + ')', fErr ? ('error ' + fErr.message) : 'NOT a leaf', '— trying next suggestion');
-          tryNext();
-        }
-      });
-    })();
+  getSuggestedCategory(query, token, function(scErr, cat){
+    if(scErr || !cat){ callback(scErr || new Error('no suggestion for "' + query + '"')); return; }
+    getCategoryFeatures(cat.category_id, token, function(fErr, feat){
+      if(fErr){ console.log('[CATEGORY] GetCategoryFeatures failed for Taxonomy-suggested category ' + cat.category_id + ' (' + cat.category_name + ') — using it anyway: ' + fErr.message); }
+      console.log('[CATEGORY] Taxonomy suggested category', cat.category_id, '(' + cat.category_name + ') for query "' + query + '"');
+      callback(null, { id: parseInt(cat.category_id, 10) || cat.category_id, name: cat.category_name, conditions: (feat && feat.conditions) || [] });
+    });
   });
 }
 // item = {brand, model, product_type, title}. A bare string is still accepted (back-compat) and
@@ -6038,9 +6054,9 @@ function createEbayListing(sku, callback){
       }
 
       // ── Resolve a LEAF category with valid conditions ──
-      // GetSuggestedCategories returns a ranked list. For each (max 5), call
-      // GetCategoryFeatures to confirm it's a LEAF (LeafCategory=true) and read its
-      // valid ConditionIDs. Use the first leaf found; if none in 5, fall back to 183446.
+      // getSuggestedCategory (Taxonomy API) returns a single leaf-guaranteed suggestion; a
+      // GetCategoryFeatures call reads its valid ConditionIDs. If no suggestion is found at all,
+      // fall back to 183446.
       // Re-resolve everything that is PER-CATEGORY after the category changes mid-flight: leaf status,
       // valid condition IDs, and required item specifics. Without this, a category fallback keeps the
       // previous category's condition (invalid here) and its required specifics (wrong here), so the
@@ -6074,21 +6090,15 @@ function createEbayListing(sku, callback){
             return;
           }
           // 183446 (or whatever fallback) is not usable — find a genuine leaf instead of looping.
+          // getSuggestedCategory now returns the Taxonomy API's single top (guaranteed-leaf)
+          // suggestion, so recheckCategory's own leaf/conditions/specifics re-derivation on the
+          // recursive call below is all the confirmation needed — no separate candidate loop.
           console.log('[EBAY] SKU', sku, 'fallback category', newCatId, 'is NOT a usable leaf' +
             (fErr ? (' (' + fErr.message + ')') : '') + ' — searching for a real leaf category');
-          getSuggestedCategory(record.listing.title, token, function(scErr, cats){
-            if(scErr || !cats || !cats.length){ console.log('[EBAY] SKU', sku, 'no suggested categories available — retrying as-is'); done(); return; }
-            var i = 0, max = Math.min(5, cats.length);
-            (function tryNext(){
-              if(i >= max){ console.log('[EBAY] SKU', sku, 'no leaf found in top ' + max + ' suggestions — retrying as-is'); done(); return; }
-              var c = cats[i]; i++;
-              getCategoryFeatures(c.id, token, function(e2, f2){
-                if(!e2 && f2 && f2.leaf === true){
-                  console.log('[EBAY] SKU', sku, 'recovered leaf category', c.id, '(' + c.name + ')');
-                  recheckCategory(c.id, done, _depth + 1);
-                } else { tryNext(); }
-              });
-            })();
+          getSuggestedCategory(record.listing.title, token, function(scErr, cat){
+            if(scErr || !cat){ console.log('[EBAY] SKU', sku, 'no suggested category available (' + (scErr ? scErr.message : 'none') + ') — retrying as-is'); done(); return; }
+            console.log('[EBAY] SKU', sku, 'recovered leaf category', cat.category_id, '(' + cat.category_name + ') via Taxonomy suggestion');
+            recheckCategory(cat.category_id, done, _depth + 1);
           });
         });
       }
@@ -6148,7 +6158,7 @@ function createEbayListing(sku, callback){
       }
       // Pre-flight category resolution (Error [87] prevention): prefer a confirmed/known category
       // (prior attempt -> identifier -> AI), but treat missing/0/"(set)" as unusable up front — those
-      // fall straight through to auto-resolution via GetSuggestedCategories instead of ever reaching
+      // fall straight through to auto-resolution via the Taxonomy API instead of ever reaching
       // eBay. A known category that turns out NOT to be a leaf also auto-resolves now (previously this
       // BLOCKED the listing with needs_category_review) — resolveLeafCategoryFromTitle guarantees a
       // real leaf or falls back to 183446, so AddItem is never sent with a non-leaf or missing category.
@@ -6161,7 +6171,7 @@ function createEbayListing(sku, callback){
         || (meta.identified_item && meta.identified_item.category_source)
         || null;
       if(!knownCat && rawKnownCat){
-        console.log('[EBAY] SKU', sku, 'category', JSON.stringify(rawKnownCat), 'is not usable (missing/0/"(set)") — auto-resolving via GetSuggestedCategories');
+        console.log('[EBAY] SKU', sku, 'category', JSON.stringify(rawKnownCat), 'is not usable (missing/0/"(set)") — auto-resolving via the Taxonomy API');
       }
       if(knownCat && catSource === 'ebay_browse'){
         // eBay's Browse API leafCategoryIds are leaf categories by definition — trust, skip validation.
