@@ -5641,13 +5641,18 @@ function resolveLeafCategoryFromTitle(item, token, callback){
   addQuery(sanitizeTitleForCategoryQuery(item.title));                // Attempt 2: Sanitized Title
   addQuery([brand, productType].filter(Boolean).join(' '));           // Attempt 3: Brand + Type
   if(!queries.length){ callback(new Error('no usable category query — brand/model/product_type/title all empty')); return; }
-  var qi = 0;
+  var qi = 0, lastErr = null;
   (function tryQuery(){
-    if(qi >= queries.length){ callback(new Error('no leaf category found for any query variant')); return; }
+    if(qi >= queries.length){
+      callback(new Error('no leaf category found for any query variant (' + queries.length + ' tried: ' +
+        queries.map(function(q){ return '"' + q + '"'; }).join(', ') + ')' + (lastErr ? (' — last error: ' + lastErr.message) : '')));
+      return;
+    }
     var q = queries[qi]; qi++;
     trySuggestedLeaf(q, token, function(err, cat){
       if(cat){ callback(null, cat); return; }
-      console.log('[CATEGORY] query "' + q + '" found no leaf — trying next query variant');
+      lastErr = err || lastErr;
+      console.log('[CATEGORY] query "' + q + '" found no leaf' + (err ? (' (' + err.message + ')') : '') + ' — trying next query variant');
       tryQuery();
     });
   })();
