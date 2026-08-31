@@ -200,6 +200,65 @@ function shippingPolicyName(id){
   return 'GA 6lbs or less';
 }
 
+// ── VOICE INTAKE — DIMENSION-AWARE BOX SELECTION (stock box catalog + height cut-down) ──
+// Separate from STANDARD_GA_BOXES/STANDARD_FEDEX_BOXES above, which are untouched and still drive
+// calcShipping()'s tier-based fallback everywhere else. This catalog is specific to voice intake:
+// when the seller SPEAKS the item's dimensions (Step 1 vision call — see voiceIdentifyFromPhotos),
+// selectBestBox() below picks the smallest real stock box that fits and cuts its height down.
+var POLY_MAILER_SPEC = { box_name: 'Poly Mailer', length: 12, width: 8, height: 4, added_weight_oz: 3 };
+var STOCK_BOXES = [
+  { l: 12, w: 8,  h: 6  },
+  { l: 12, w: 10, h: 8  },
+  { l: 15, w: 12, h: 10 },
+  { l: 16, w: 12, h: 12 },
+  { l: 17, w: 11, h: 12 },
+  { l: 18, w: 18, h: 16 },
+  { l: 20, w: 16, h: 15 },
+  { l: 22, w: 13, h: 15 },
+  { l: 24, w: 18, h: 18 },
+  { l: 24, w: 20, h: 20 },
+  { l: 26, w: 16, h: 15 }
+];
+// rawWeightOz: raw scale reading in ounces. itemDims: {item_length, item_width, item_height} in
+// inches as spoken by the seller, or null/incomplete if nothing was spoken.
+// Returns { box_name, length, width, height, added_weight_oz }, or null when there isn't enough
+// information to pick a box (no dims spoken) or nothing in the catalog fits — the caller falls
+// back to calculateShippingTier's generic per-tier box either way; this never blocks the listing.
+function selectBestBox(rawWeightOz, itemDims){
+  rawWeightOz = parseFloat(rawWeightOz) || 0;
+  if(rawWeightOz > 0 && rawWeightOz < 12) return POLY_MAILER_SPEC;
+
+  var iL = itemDims && parseFloat(itemDims.item_length);
+  var iW = itemDims && parseFloat(itemDims.item_width);
+  var iH = itemDims && parseFloat(itemDims.item_height);
+  if(!(iL > 0) || !(iW > 0) || !(iH > 0)) return null; // nothing spoken — caller falls back
+
+  // Padding Buffer: 2in on every side up to 15lb (240oz), 3in above that.
+  var bufferIn = rawWeightOz <= 240 ? 2 : 3;
+  var padded = { l: iL + bufferIn, w: iW + bufferIn, h: iH + bufferIn };
+  if(padded.w > padded.l){ var t = padded.l; padded.l = padded.w; padded.w = t; } // sort so L >= W
+
+  function fits(box){
+    if(box.h < padded.h) return false;
+    return (box.l >= padded.l && box.w >= padded.w) || (box.w >= padded.l && box.l >= padded.w); // both orientations
+  }
+  var fitting = STOCK_BOXES.filter(fits);
+  if(!fitting.length) return null; // too large for the stock catalog — caller falls back
+
+  fitting.sort(function(a, b){ return (a.l * a.w * a.h) - (b.l * b.w * b.h); }); // smallest by volume
+  var chosen = fitting[0];
+  var cutH = Math.ceil(padded.h);
+  var wasCut = chosen.h > cutH;
+  var finalH = wasCut ? cutH : chosen.h;
+  var boxName = chosen.l + 'x' + chosen.w + 'x' + chosen.h + (wasCut ? (' (cut to ' + chosen.l + 'x' + chosen.w + 'x' + finalH + ')') : '');
+
+  // Calculated Shipping Weight: small/medium/>15lb tare tiers, matching the GA (<=6lb) / FedEx
+  // (6-15lb) / Heavy (>15lb) weight boundaries calculateShippingTier already uses elsewhere.
+  var addedOz = rawWeightOz <= 96 ? 8 : (rawWeightOz <= 240 ? 16 : 32);
+
+  return { box_name: boxName, length: chosen.l, width: chosen.w, height: finalH, added_weight_oz: addedOz };
+}
+
 
 // ══════════════════════════════════════════════════════════════════════════════
 // VOICE INTAKE (ADDITIVE) — deterministic transcript -> eBay listing data.
@@ -498,6 +557,11 @@ function voiceIdentifyFromPhotos(transcript, photoB64Array, callback){
       '',
       'Also note what accessories/items are visible (What is Included) and any visible cosmetic condition.',
       '',
+      'DIMENSIONS: If the seller spoke the item\'s physical size (e.g. "item is 14x10x6", "dimensions 8 by 5 by 2",',
+      '"roughly 10 inches by 6 by 4"), extract them in INCHES as item_length (the longer of the two horizontal',
+      'dimensions), item_width (the shorter horizontal dimension), and item_height. If no dimensions were spoken,',
+      'return all three as 0 — do not guess dimensions from the photos.',
+      '',
       'Return ONLY this JSON, no markdown:',
       '{',
       '  "item_name": "full descriptive name with brand and model",',
@@ -505,7 +569,10 @@ function voiceIdentifyFromPhotos(transcript, photoB64Array, callback){
       '  "model": "exact model number as printed on the label, or empty string if none is visible",',
       '  "category": "eBay category path or item type",',
       '  "includes": "comma-separated list of accessories/items visible in the photos",',
-      '  "condition_notes": "honest description of visible cosmetic condition"',
+      '  "condition_notes": "honest description of visible cosmetic condition",',
+      '  "item_length": 0,',
+      '  "item_width": 0,',
+      '  "item_height": 0',
       '}'
     ].join('\n') });
     callGeminiVisionParts(parts, 700, function(err, resp){
@@ -580,15 +647,29 @@ function assembleVoiceRecordFromAI(sku, shelf, saved, transcript, pvHints, winfo
   var quantity = (parseInt(aiData.lot_quantity, 10) > 1) ? parseInt(aiData.lot_quantity, 10) : ((pvHints.quantity && pvHints.quantity > 1) ? pvHints.quantity : 1);
   var condId = voiceGradeConditionId(grade, partsRepair);
 
-  var shipInfo;
+  var v = visionInfo || {};
+
+  // Dimension-aware box selection (Error [87]-style shipping-cost prevention): when the seller
+  // SPOKE the item's dimensions in Step 1, pick a real stock box and cut its height down instead
+  // of using calculateShippingTier's generic per-tier box. boxPick is null (no override) whenever
+  // no dimensions were spoken or nothing in the catalog fits — the tier's own box/weight stand as-is.
+  var shipInfo, boxPick = null;
   if(tier){
+    var rawTotalOz = (tier.rawLbs * 16) + tier.rawOz;
+    boxPick = selectBestBox(rawTotalOz, v);
+    if(boxPick){
+      var finalOzTotal = rawTotalOz + boxPick.added_weight_oz;
+      tier.finalLbs = Math.floor(finalOzTotal / 16);
+      tier.finalOz = finalOzTotal % 16;
+      tier.boxSize = boxPick.length + 'x' + boxPick.width + 'x' + boxPick.height; // clean — buildAddItemXml splits this on 'x'
+    }
     shipInfo = { shipping_policy: shippingPolicyName(tier.shippingPolicyId), shipping_profile_id: String(tier.shippingPolicyId),
-                 listed_weight: tier.finalLbs, listed_weight_unit: 'lbs', box_dimensions: tier.boxSize, polymailer: false };
+                 listed_weight: tier.finalLbs, listed_weight_unit: 'lbs', box_dimensions: tier.boxSize,
+                 polymailer: !!(boxPick && boxPick.box_name === 'Poly Mailer') };
   } else {
     shipInfo = calcShipping(null, null, {});
   }
 
-  var v = visionInfo || {};
   var specifics = (aiData.item_specifics && typeof aiData.item_specifics === 'object' && !Array.isArray(aiData.item_specifics)) ? aiData.item_specifics : {};
   if(!specifics.Brand && (v.brand || pvHints.brand)) specifics.Brand = v.brand || pvHints.brand;
   if(!specifics.Model && (v.model || pvHints.model)){ specifics.Model = v.model || pvHints.model; if(!specifics.MPN) specifics.MPN = specifics.Model; }
@@ -623,6 +704,15 @@ function assembleVoiceRecordFromAI(sku, shelf, saved, transcript, pvHints, winfo
     shipping_policy: shipInfo.shipping_policy, shipping_profile_id: shipInfo.shipping_profile_id,
     listed_weight: shipInfo.listed_weight, listed_weight_unit: shipInfo.listed_weight_unit,
     box_dimensions: shipInfo.box_dimensions, polymailer: !!shipInfo.polymailer,
+    // Dimension-aware box pick (only set when the seller spoke dimensions in Step 1 — see
+    // selectBestBox). package_length/width/height are the FINAL (post-cut-down) numbers; selected_box
+    // is the human label, e.g. "22x13x15 (cut to 22x13x12)", shown in the /api/listings Box: badge.
+    package_length: boxPick ? boxPick.length : null,
+    package_width: boxPick ? boxPick.width : null,
+    package_height: boxPick ? boxPick.height : null,
+    selected_box: boxPick ? boxPick.box_name : null,
+    shipping_weight: boxPick ? ((tier.rawLbs * 16) + tier.rawOz + boxPick.added_weight_oz) : null,
+    package_dimensions: boxPick ? (boxPick.length + 'x' + boxPick.width + 'x' + boxPick.height) : null,
     // category_id/primary_category_id are resolved to a real eBay LEAF category by the
     // orchestrator (resolveLeafCategoryFromTitle) right after this record is built — 0 here
     // is a placeholder only, never what gets written to listing.json on the success path.
@@ -637,7 +727,11 @@ function assembleVoiceRecordFromAI(sku, shelf, saved, transcript, pvHints, winfo
     shipping_tier: tier, noWeightFlag: !tier, scale_warning: !!(winfo && winfo.scale_warning),
     weightPhotoIndex: weightPhotoIndex, no_scale_detected: !!noScaleDetected,
     photoCount: saved || 0, timestamp: new Date().toISOString(), processed: true,
-    category_name: null
+    category_name: null,
+    package_length: boxPick ? boxPick.length : null,
+    package_width: boxPick ? boxPick.width : null,
+    package_height: boxPick ? boxPick.height : null,
+    selected_box: boxPick ? boxPick.box_name : null
   };
 
   // Scale photo excluded from eBay listing downloads (established rules 26/27).
@@ -6349,7 +6443,7 @@ function buildDualCardHtml(r, i, colors, ebayStat){
     + '<span><b>Custom SKU:</b> ' + (listing.custom_sku || (skuStr + (meta.shelf ? '-' + meta.shelf : ''))) + '</span>'
     + '<span><b>eBay Category:</b> <span id="cat_' + skuStr + '" data-sku="' + skuStr + '" data-catid="' + (r.ebay_category_id || listing.category_id || '') + '" onclick="editCategory(this)" title="Click to edit category ID" style="cursor:pointer;color:#1565c0;border-bottom:1px dashed #1565c0;">' + ((r.ebay_category_id || listing.category_id) ? ((r.ebay_category_name ? r.ebay_category_name + ' ' : '') + '(' + (r.ebay_category_id || listing.category_id) + ')') : '(set)') + '</span> <span id="catmsg_' + skuStr + '" style="font-weight:bold;"></span></span>'
     + (listing.shipping_policy ? '<span><b>Ship:</b> ' + listing.shipping_policy + '</span>' : '')
-    + '<span><b>Box:</b> <span id="dim_' + skuStr + '" data-sku="' + skuStr + '" onclick="editDims(this)" title="Click to edit dimensions (LxWxH inches)" style="cursor:pointer;color:#1565c0;border-bottom:1px dashed #1565c0;">' + (((wtier && wtier.boxSize) ? wtier.boxSize : (listing.box_dimensions || '')) || '(set)') + '</span> <span id="dimmsg_' + skuStr + '" style="font-weight:bold;"></span></span>'
+    + '<span><b>Box:</b> <span id="dim_' + skuStr + '" data-sku="' + skuStr + '" onclick="editDims(this)" title="Click to edit dimensions (LxWxH inches)" style="cursor:pointer;color:#1565c0;border-bottom:1px dashed #1565c0;">' + (listing.selected_box || ((wtier && wtier.boxSize) ? wtier.boxSize : (listing.box_dimensions || '')) || '(set)') + '</span> <span id="dimmsg_' + skuStr + '" style="font-weight:bold;"></span></span>'
     + '<span style="display:inline-flex;align-items:center;gap:6px;"><label for="qty_' + skuStr + '"><b>Qty:</b></label><input id="qty_' + skuStr + '" type="number" min="1" max="99" value="' + quantity + '" style="width:56px;padding:4px 6px;border:1px solid #bbb;border-radius:4px;font-size:12.5px;"><button onclick="saveQty(\'' + skuStr + '\')" style="padding:4px 10px;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;background:#455a64;color:#fff;">Save</button><span id="qtymsg_' + skuStr + '" style="font-size:12px;"></span></span>'
     + '</div>';
   var weightEntry = !hasWeight ?
@@ -6685,7 +6779,7 @@ function generateListingsPage(listings, ebayStat){
       +'<span><b>eBay Category:</b> <span id="cat_'+skuStr+'" data-sku="'+skuStr+'" data-catid="'+(r.ebay_category_id||listing.category_id||'')+'" onclick="editCategory(this)" title="Click to edit category ID" style="cursor:pointer;color:#1565c0;border-bottom:1px dashed #1565c0;">'+((r.ebay_category_id||listing.category_id)?((r.ebay_category_name?r.ebay_category_name+' ':'')+'('+(r.ebay_category_id||listing.category_id)+')'):'(set)')+'</span> <span id="catmsg_'+skuStr+'" style="font-weight:bold;"></span></span>'
       +(listing.shipping_policy?'<span><b>Ship:</b> '+listing.shipping_policy+'</span>':'')
       +(!wtier&&listing.listed_weight!=null?'<span><b>Listed Wt:</b> '+listing.listed_weight+' '+(listing.listed_weight_unit||'oz')+'</span>':'')
-      +'<span><b>Box:</b> <span id="dim_'+skuStr+'" data-sku="'+skuStr+'" onclick="editDims(this)" title="Click to edit dimensions (LxWxH inches)" style="cursor:pointer;color:#1565c0;border-bottom:1px dashed #1565c0;">'+(((wtier&&wtier.boxSize)?wtier.boxSize:(listing.box_dimensions||''))||'(set)')+'</span> <span id="dimmsg_'+skuStr+'" style="font-weight:bold;"></span></span>'
+      +'<span><b>Box:</b> <span id="dim_'+skuStr+'" data-sku="'+skuStr+'" onclick="editDims(this)" title="Click to edit dimensions (LxWxH inches)" style="cursor:pointer;color:#1565c0;border-bottom:1px dashed #1565c0;">'+(listing.selected_box||((wtier&&wtier.boxSize)?wtier.boxSize:(listing.box_dimensions||''))||'(set)')+'</span> <span id="dimmsg_'+skuStr+'" style="font-weight:bold;"></span></span>'
       +perUnitTotal
       +(photoCount>0?'<span><b>Photos:</b> '+photoCount+'</span>':'')
       +'</div>'

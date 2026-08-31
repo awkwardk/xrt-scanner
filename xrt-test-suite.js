@@ -1041,6 +1041,85 @@ test('button re-enabled on both failure paths', (function(){
   }
 })();
 
+section('VOICE DIMENSIONS — stock box catalog & selectBestBox (presence)');
+test('POLY_MAILER_SPEC matches spec',   has("var POLY_MAILER_SPEC = { box_name: 'Poly Mailer', length: 12, width: 8, height: 4, added_weight_oz: 3 };"));
+test('STOCK_BOXES catalog matches spec', has('{ l: 12, w: 8,  h: 6  },') && has('{ l: 12, w: 10, h: 8  },') && has('{ l: 15, w: 12, h: 10 },') && has('{ l: 16, w: 12, h: 12 },') && has('{ l: 17, w: 11, h: 12 },') && has('{ l: 18, w: 18, h: 16 },') && has('{ l: 20, w: 16, h: 15 },') && has('{ l: 22, w: 13, h: 15 },') && has('{ l: 24, w: 18, h: 18 },') && has('{ l: 24, w: 20, h: 20 },') && has('{ l: 26, w: 16, h: 15 }'));
+test('selectBestBox exists',            has('function selectBestBox(rawWeightOz, itemDims){'));
+test('under-12oz returns Poly Mailer',  has('if(rawWeightOz > 0 && rawWeightOz < 12) return POLY_MAILER_SPEC;'));
+test('2in buffer <= 15lb, 3in above',   has("var bufferIn = rawWeightOz <= 240 ? 2 : 3;"));
+test('padded dims sorted so L >= W',    has('if(padded.w > padded.l){ var t = padded.l; padded.l = padded.w; padded.w = t; }'));
+test('fit check tests both orientations', has('return (box.l >= padded.l && box.w >= padded.w) || (box.w >= padded.l && box.l >= padded.w);'));
+test('smallest fitting box chosen by volume', has('fitting.sort(function(a, b){ return (a.l * a.w * a.h) - (b.l * b.w * b.h); });'));
+test('height cut down to Math.ceil(padded.h)', has('var cutH = Math.ceil(padded.h);') && has('var wasCut = chosen.h > cutH;'));
+test('tare weight tiers +8/+16/+32oz',  has('var addedOz = rawWeightOz <= 96 ? 8 : (rawWeightOz <= 240 ? 16 : 32);'));
+
+section('VOICE DIMENSIONS — Step 1 prompt parses spoken dimensions');
+test('Step 1 prompt asks for spoken dims', has('DIMENSIONS: If the seller spoke the item') && has('function voiceIdentifyFromPhotos'));
+test('Step 1 JSON contract includes item_length/width/height', has("'  \"item_length\": 0,'") && has("'  \"item_width\": 0,'") && has("'  \"item_height\": 0'"));
+test('unspoken dims default to 0, never guessed from photos', has('return all three as 0 — do not guess dimensions from the photos.'));
+
+section('VOICE DIMENSIONS — wired into assembleVoiceRecordFromAI + Box: badge');
+test('boxPick computed from tier + visionInfo',     has('boxPick = selectBestBox(rawTotalOz, v);'));
+test('box selection overrides tier weight and box',  has('tier.finalLbs = Math.floor(finalOzTotal / 16);') && has('tier.finalOz = finalOzTotal % 16;') && has("tier.boxSize = boxPick.length + 'x' + boxPick.width + 'x' + boxPick.height;"));
+test('package_length/width/height/selected_box saved to listing.json', has('package_length: boxPick ? boxPick.length : null,') && has('package_width: boxPick ? boxPick.width : null,') && has('package_height: boxPick ? boxPick.height : null,') && has('selected_box: boxPick ? boxPick.box_name : null,'));
+test('package_length/width/height/selected_box saved to meta.json',    (content.match(/package_length: boxPick \? boxPick\.length : null,/g) || []).length === 2 && (content.match(/selected_box: boxPick \? boxPick\.box_name : null/g) || []).length === 2);
+test('shipping_weight and package_dimensions saved to listing.json',   has('shipping_weight: boxPick ? ((tier.rawLbs * 16) + tier.rawOz + boxPick.added_weight_oz) : null,') && has("package_dimensions: boxPick ? (boxPick.length + 'x' + boxPick.width + 'x' + boxPick.height) : null,"));
+test('Box: badge prefers selected_box (dual card view)',    has("(listing.selected_box || ((wtier && wtier.boxSize) ? wtier.boxSize : (listing.box_dimensions || '')) || '(set)')"));
+test('Box: badge prefers selected_box (/api/listings page)', has("(listing.selected_box||((wtier&&wtier.boxSize)?wtier.boxSize:(listing.box_dimensions||''))||'(set)')"));
+
+// ── functional: selectBestBox itself, pure — no network, no eBay dependency ──
+(function(){
+  function ex(n){
+    var s2 = content.indexOf('function ' + n + '(');
+    if (s2 < 0) return '';
+    var d = 0, seen = false, e = -1;
+    for (var i = s2; i < content.length; i++) { var c = content[i]; if (c === '{') { d++; seen = true; } else if (c === '}') { d--; if (seen && d === 0) { e = i + 1; break; } } }
+    return content.slice(s2, e);
+  }
+  try {
+    var box = {};
+    var code = (content.match(/var POLY_MAILER_SPEC = \{[\s\S]*?\};/) || [''])[0] + '\n'
+      + (content.match(/var STOCK_BOXES = \[[\s\S]*?\];/) || [''])[0] + '\n'
+      + ex('selectBestBox') + '\nbox.pick = selectBestBox;';
+    var _log = console.log; console.log = function(){};
+    eval(code);
+    console.log = _log;
+    var B = box.pick;
+
+    test('(box) under 12oz -> Poly Mailer regardless of dims', JSON.stringify(B(8, { item_length: 20, item_width: 20, item_height: 20 })) === JSON.stringify({ box_name: 'Poly Mailer', length: 12, width: 8, height: 4, added_weight_oz: 3 }));
+    test('(box) exactly 12oz is NOT poly mailer (boundary is exclusive)', B(12, null) === null);
+    test('(box) no dims spoken -> null (caller falls back)', B(50, null) === null && B(50, { item_length: 0, item_width: 0, item_height: 0 }) === null);
+
+    // Exact fit, smallest box, no cut-down: item 10x6x4 + 2in buffer (weight 50oz, <=96 -> tare +8) = padded 12x8x6, matches STOCK_BOXES[0] exactly.
+    var exact = B(50, { item_length: 10, item_width: 6, item_height: 4 });
+    test('(box) exact-fit small box chosen with no cut-down', exact && exact.box_name === '12x8x6' && exact.length === 12 && exact.width === 8 && exact.height === 6);
+    test('(box) small-box tare is +8oz',                      exact && exact.added_weight_oz === 8);
+
+    // Worked example from spec: 22x13x15 resized to 22x13x12. Weight 150oz (96<150<=240 -> tare +16, buffer 2in).
+    // item 20 x 9 x 9.5 -> padded 22 x 11 x 11.5 -> smallest fitting stock box is 22x13x15 -> cut to 22x13x12.
+    var cut = B(150, { item_length: 20, item_width: 9, item_height: 9.5 });
+    test('(box) height cut-down matches the spec worked example', cut && cut.box_name === '22x13x15 (cut to 22x13x12)' && cut.length === 22 && cut.width === 13 && cut.height === 12);
+    test('(box) medium-box tare is +16oz',                        cut && cut.added_weight_oz === 16);
+
+    // Heavy item (> 240oz -> 3in buffer, +32oz tare). item 22x16x11 -> padded 25x19x14 -> fits 26x16x15? no
+    // (19 > 16 and 19 > 15 too even swapped) -> use a box guaranteed to fit: 24x20x20.
+    var heavy = B(300, { item_length: 21, item_width: 17, item_height: 11 });
+    test('(box) >15lb uses 3in buffer',   heavy && heavy.length >= 21 + 3);
+    test('(box) heavy tare is +32oz',     heavy && heavy.added_weight_oz === 32);
+
+    // Seller spoke length as the SHORTER side (item_length 9 < item_width 13) — selectBestBox must
+    // still sort padded L>=W before matching, not just take the spoken order at face value.
+    var swapped = B(50, { item_length: 9, item_width: 13, item_height: 4 });
+    test('(box) spoken L/W order does not matter — still resolves correctly', swapped && swapped.box_name === '15x12x10 (cut to 15x12x6)' && swapped.length === 15 && swapped.width === 12);
+
+    // Too large for every stock box -> null, caller falls back to calculateShippingTier's box.
+    test('(box) nothing fits -> null, never throws', B(500, { item_length: 40, item_width: 30, item_height: 30 }) === null);
+  } catch(e){
+    test('selectBestBox functional eval', false);
+    console.log('    ERROR:', e.message);
+  }
+})();
+
 // ── functional: full voice-submitted payload -> AddItem XML builder (pre-flight simulation) ──
 // Simulates what createEbayListing actually sends after leaf-category resolution: build a
 // voice-intake record with assembleVoiceRecordFromAI (same function the fast-submit background
@@ -1058,12 +1137,15 @@ section('VOICE INTAKE -> ADDITEM BUILDER (pre-flight simulation)');
   try {
     var box = {};
     var code = 'var MIN_THRESHOLD = 30;\n'
+      + (content.match(/var POLY_MAILER_SPEC = \{[\s\S]*?\};/) || [''])[0] + '\n'
+      + (content.match(/var STOCK_BOXES = \[[\s\S]*?\];/) || [''])[0] + '\n'
       + ex('splitToLimit') + '\n' + ex('trimAspects') + '\n'
       + ex('calculateShippingTier') + '\n' + ex('shippingPolicyName') + '\n' + ex('calcShipping') + '\n'
+      + ex('selectBestBox') + '\n'
       + ex('voiceGradeConditionId') + '\n' + ex('buildCassiniTitle') + '\n' + ex('assembleVoiceRecordFromAI') + '\n'
       + ex('xmlEscape') + '\n' + ex('cdataSafe') + '\n' + ex('conditionIdForCategory') + '\n'
       + ex('estimateShipCost') + '\n' + ex('buildItemSpecificsXml') + '\n' + ex('buildAddItemXml') + '\n'
-      + 'box.assemble = assembleVoiceRecordFromAI; box.buildXml = buildAddItemXml; box.tier = calculateShippingTier;';
+      + 'box.assemble = assembleVoiceRecordFromAI; box.buildXml = buildAddItemXml; box.tier = calculateShippingTier; box.selectBestBox = selectBestBox;';
     var _log = console.log; console.log = function(){};
     eval(code);
     console.log = _log;
