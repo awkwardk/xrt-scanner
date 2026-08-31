@@ -1793,7 +1793,13 @@ const server = http.createServer(function(req, res) {
                                 writeVoiceRecord();
                                 return;
                               }
-                              resolveLeafCategoryFromTitle(record.listing.title, catToken, function(catErr, cat){
+                              var catItem = {
+                                brand: (record.listing.item_specifics && record.listing.item_specifics.Brand) || '',
+                                model: (record.listing.item_specifics && record.listing.item_specifics.Model) || '',
+                                product_type: (record.listing.item_specifics && record.listing.item_specifics.Type) || '',
+                                title: record.listing.title
+                              };
+                              resolveLeafCategoryFromTitle(catItem, catToken, function(catErr, cat){
                                 if(catErr || !cat){
                                   console.log('[VOICE] SKU ' + sku + ' leaf category resolution failed: ' + (catErr ? catErr.message : 'no leaf found') + ' — will resolve at publish time');
                                 } else {
@@ -2072,6 +2078,35 @@ const server = http.createServer(function(req, res) {
         var resp = {success:true, quantity: pRec.quantity, suggested_price: (pRec.listing && pRec.listing.suggested_price), photo_order: pRec.outputPhotos, item_specifics: (pRec.listing && pRec.listing.item_specifics), missing_specifics: pRec.missing_specifics, needs_specifics_review: pRec.needs_specifics_review, title: (pRec.listing && pRec.listing.title), ebay_category_id: pRec.ebay_category_id, ebay_category_name: pRec.ebay_category_name, category_confirmed: pRec.category_confirmed, box_dimensions: (pRec.listing && pRec.listing.box_dimensions)};
         if(extra){ Object.keys(extra).forEach(function(k){ resp[k] = extra[k]; }); }
         sendJSON(res, 200, resp);
+      }
+      // Operator-triggered re-resolve: clicking a "(set)"/183446 category on /api/listings runs
+      // the same progressive clean-query resolver (Error [87] prevention) used at publish time —
+      // no manual guessing required. Reuses resolveLeafCategoryFromTitle's Clean Core / Sanitized
+      // Title / Brand+Type priority order.
+      if(parsed.auto_resolve_category === true){
+        getEbayToken(function(rtErr, rtTok){
+          if(rtErr || !rtTok){ sendJSON(res,200,{success:false, error:'eBay token unavailable — cannot resolve category'}); return; }
+          var pSpecifics = (pRec.listing && pRec.listing.item_specifics) || {};
+          var rItem = {
+            brand: pSpecifics.Brand || '',
+            model: pSpecifics.Model || '',
+            product_type: pSpecifics.Type || '',
+            title: (pRec.listing && pRec.listing.title) || ''
+          };
+          resolveLeafCategoryFromTitle(rItem, rtTok, function(rErr, cat){
+            if(rErr || !cat){
+              console.log('[LISTING] SKU ' + pSku + ' category re-resolve failed: ' + (rErr ? rErr.message : 'no leaf found'));
+              sendJSON(res,200,{success:false, error: rErr ? rErr.message : 'No leaf category found for this item'});
+              return;
+            }
+            pRec.ebay_category_id = cat.id; pRec.ebay_category_name = cat.name; pRec.category_confirmed = true;
+            pRec.listing = pRec.listing || {}; pRec.listing.category_id = cat.id; pRec.listing.primary_category_id = cat.id;
+            pRec.meta = pRec.meta || {}; pRec.meta.category_name = cat.name;
+            console.log('[LISTING] SKU ' + pSku + ' category re-resolved: ' + cat.id + ' (' + cat.name + ')');
+            finishPatch({category_resolved: true});
+          });
+        });
+        return;
       }
       // CHANGE 1: editable category with LEAF validation before save. Never blocks on failure —
       // if the token is missing or the lookup errors, save anyway and warn; only a confirmed
@@ -5539,18 +5574,47 @@ function getCategoryFeatures(categoryId, token, callback){
 // Resolve a numeric LEAF eBay category ID from an item title via GetSuggestedCategories,
 // confirming leaf status with GetCategoryFeatures for each candidate (ranked by match %,
 // max 5 tried). Shared pre-flight category resolver — used by the voice-intake background
-// generator (Error [87] prevention: resolve BEFORE listing.json is written) and by
-// createEbayListing (pre-flight + not-a-leaf recovery, right before AddItem).
-function resolveLeafCategoryFromTitle(title, token, callback){
-  getSuggestedCategory(title, token, function(scErr, cats){
-    if(scErr || !cats || !cats.length){ callback(scErr || new Error('no suggested categories for "' + title + '"')); return; }
+// generator (Error [87] prevention: resolve BEFORE listing.json is written), by
+// createEbayListing (pre-flight + not-a-leaf/generic-fallback recovery, right before AddItem),
+// and by the operator-triggered re-resolve action on /api/listings.
+//
+// ROOT CAUSE FIX: sending the full 80-char Cassini title as the GetSuggestedCategories query
+// routinely returns nothing specific — long part numbers ("P4D-0UJ10000-00"), bundle/condition
+// noise ("w/ Power Adapter", "Tested", "Grade B") dilute the match and eBay falls back to the
+// broad 183446 catch-all. Try progressively cleaner queries instead, in priority order, and use
+// the first one that resolves to a real leaf:
+function sanitizeTitleForCategoryQuery(title){
+  var s = String(title || '');
+  var noise = ['w/', 'with', 'bundle', 'tested', 'working', 'for parts', 'as is', 'as-is',
+    'grade a', 'grade b', 'grade c', 'grade d'];
+  noise.forEach(function(p){
+    var esc = p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // (^|\s)...(?=\s|$) rather than \b...\b — \b needs a word char on one side, which "w/" (ends
+    // in a symbol) never has when followed by whitespace, so \b\/\b silently fails to match it.
+    s = s.replace(new RegExp('(^|\\s)' + esc + '(?=\\s|$)', 'gi'), ' ');
+  });
+  // Drop long alphanumeric tokens that look like a serial/part number (>8 chars, mixes letters+digits)
+  s = s.split(/\s+/).filter(function(tok){
+    var clean = tok.replace(/[^a-z0-9]/gi, '');
+    return !(clean.length > 8 && /[0-9]/.test(clean) && /[a-z]/i.test(clean));
+  }).join(' ');
+  return s.replace(/\s+/g, ' ').trim();
+}
+// Try ONE query against GetSuggestedCategories, confirming leaf status for up to 5 ranked
+// candidates via GetCategoryFeatures. callback(null, {id,name,conditions}) on the first leaf
+// found, callback(err) if this query returns nothing usable.
+function trySuggestedLeaf(query, token, callback){
+  query = String(query || '').trim();
+  if(!query){ callback(new Error('empty category query')); return; }
+  getSuggestedCategory(query, token, function(scErr, cats){
+    if(scErr || !cats || !cats.length){ callback(scErr || new Error('no suggested categories for "' + query + '"')); return; }
     var i = 0, max = Math.min(5, cats.length); // max 5 attempts to find a leaf
     (function tryNext(){
-      if(i >= max){ callback(new Error('no leaf category found in top ' + max + ' suggestions for "' + title + '"')); return; }
+      if(i >= max){ callback(new Error('no leaf category found in top ' + max + ' suggestions for "' + query + '"')); return; }
       var c = cats[i]; i++;
       getCategoryFeatures(c.id, token, function(fErr, feat){
         if(!fErr && feat && feat.leaf === true){
-          console.log('[CATEGORY] suggested category', c.id, '(' + c.name + ', ' + c.pct + '%) confirmed LEAF');
+          console.log('[CATEGORY] suggested category', c.id, '(' + c.name + ', ' + c.pct + '%) confirmed LEAF for query "' + query + '"');
           callback(null, { id: parseInt(c.id, 10) || c.id, name: c.name, conditions: feat.conditions || [] });
         } else {
           console.log('[CATEGORY] suggested category', c.id, '(' + c.name + ')', fErr ? ('error ' + fErr.message) : 'NOT a leaf', '— trying next suggestion');
@@ -5559,6 +5623,34 @@ function resolveLeafCategoryFromTitle(title, token, callback){
       });
     })();
   });
+}
+// item = {brand, model, product_type, title}. A bare string is still accepted (back-compat) and
+// treated as {title: string}.
+//   Attempt 1 (Clean Core):      "<brand> <model> <product_type>"
+//   Attempt 2 (Sanitized Title): the stored title with noise/part-number tokens stripped
+//   Attempt 3 (Brand + Type):    "<brand> <product_type>"
+function resolveLeafCategoryFromTitle(item, token, callback){
+  if(typeof item === 'string') item = { title: item };
+  item = item || {};
+  var brand = String(item.brand || '').trim();
+  var model = String(item.model || '').trim();
+  var productType = String(item.product_type || '').trim();
+  var queries = [];
+  function addQuery(q){ q = String(q || '').replace(/\s+/g, ' ').trim(); if(q && queries.indexOf(q) < 0) queries.push(q); }
+  addQuery([brand, model, productType].filter(Boolean).join(' '));   // Attempt 1: Clean Core
+  addQuery(sanitizeTitleForCategoryQuery(item.title));                // Attempt 2: Sanitized Title
+  addQuery([brand, productType].filter(Boolean).join(' '));           // Attempt 3: Brand + Type
+  if(!queries.length){ callback(new Error('no usable category query — brand/model/product_type/title all empty')); return; }
+  var qi = 0;
+  (function tryQuery(){
+    if(qi >= queries.length){ callback(new Error('no leaf category found for any query variant')); return; }
+    var q = queries[qi]; qi++;
+    trySuggestedLeaf(q, token, function(err, cat){
+      if(cat){ callback(null, cat); return; }
+      console.log('[CATEGORY] query "' + q + '" found no leaf — trying next query variant');
+      tryQuery();
+    });
+  })();
 }
 // True when a category id looks like a real, resolvable eBay category — false for missing,
 // zero, "(set)"/"set" placeholder text, or anything else that isn't a usable identifier.
@@ -6076,11 +6168,26 @@ function createEbayListing(sku, callback){
         return;
       }
       function autoResolveCategory(reason){
-        resolveLeafCategoryFromTitle(record.listing.title, token, function(rErr, cat){
+        var catItem = {
+          brand: (listing.item_specifics && listing.item_specifics.Brand) || '',
+          model: (listing.item_specifics && listing.item_specifics.Model) || '',
+          product_type: (listing.item_specifics && listing.item_specifics.Type) || '',
+          title: listing.title
+        };
+        resolveLeafCategoryFromTitle(catItem, token, function(rErr, cat){
           if(rErr || !cat){ fallbackCategory(reason + (rErr ? (': ' + rErr.message) : ': no leaf found')); return; }
           console.log('[EBAY] SKU', sku, '— ' + reason + ' — auto-resolved leaf category', cat.id, '(' + cat.name + ')');
           finalizeCategory(cat.id, cat.name, cat.conditions || []);
         });
+      }
+      // A category already sitting at 183446 (the generic "Other Consumer Electronics" fallback)
+      // is always worth one attempt at a more specific leaf before we accept it — this is exactly
+      // how a card gets stuck at 183446 forever otherwise: it's a valid leaf, so the leaf-check
+      // below would just trust it and never try again. Re-resolve using the clean-query priority
+      // order; fallbackCategory (183446 again) is still the safety net if nothing better is found.
+      if(knownCat && String(knownCat) === '183446'){
+        autoResolveCategory('category is the generic 183446 fallback — attempting a more specific leaf');
+        return;
       }
       if(knownCat){
         validateLeafCategory(knownCat, function(_kErr, isLeaf){
@@ -6629,7 +6736,7 @@ function generateListingsPage(listings, ebayStat){
     +'function editSpec(cell){if(cell.dataset.editing)return;cell.dataset.editing="1";var sku=cell.getAttribute("data-sku");var field=cell.getAttribute("data-field");var cur=cell.textContent.replace(/\\s*[\\u2713\\u2717]\\s*$/,"").trim();if(cur==="Required \\u2014 tap to add"||cur==="(tap to add)"||cur==="(empty)")cur="";var inp=document.createElement("input");inp.type="text";inp.value=cur;inp.style.cssText="width:100%;box-sizing:border-box;padding:3px 5px;border:1px solid #1565c0;border-radius:3px;font-size:12.5px;";cell.textContent="";cell.appendChild(inp);inp.focus();inp.select();var done=false;function save(){if(done)return;done=true;var nv=inp.value;var body={item_specifics:{}};body.item_specifics[field]=nv;fetch("/api/listings/"+sku,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(function(r){return r.json();}).then(function(d){cell.removeAttribute("data-editing");if(d&&d.success){cell.textContent=(nv.trim()?nv:"(empty)");cell.style.borderLeft="1px solid #e0e0e0";var row=cell.parentNode;if(row){var nm=row.querySelector("td");if(nm){nm.style.color="";nm.style.borderLeft="1px solid #e0e0e0";}}cell.style.background="#e8f5e9";setTimeout(function(){cell.style.background="";},1200);flashTick(cell,true);}else{cell.textContent=(cur||"(empty)");flashTick(cell,false);}}).catch(function(){cell.removeAttribute("data-editing");cell.textContent=(cur||"(empty)");flashTick(cell,false);});}inp.addEventListener("blur",save);inp.addEventListener("keydown",function(e){if(e.key==="Enter"){e.preventDefault();inp.blur();}else if(e.key==="Escape"){done=true;cell.removeAttribute("data-editing");cell.textContent=(cur||"(empty)");}});}'
     +'function addSpec(sku){var nameI=document.getElementById("nf_name_"+sku);var valI=document.getElementById("nf_val_"+sku);var msg=document.getElementById("specmsg_"+sku);var name=nameI?nameI.value.trim():"";var val=valI?valI.value:"";if(!name){if(msg){msg.style.color="#c62828";msg.textContent="Enter a field name";}return;}var body={item_specifics:{}};body.item_specifics[name]=val;if(msg){msg.style.color="#8d6e00";msg.textContent="Saving...";}fetch("/api/listings/"+sku,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(function(r){return r.json();}).then(function(d){if(d&&d.success){if(msg){msg.style.color="#2e7d32";msg.textContent="Added \\u2713";}setTimeout(function(){location.reload();},600);}else{if(msg){msg.style.color="#c62828";msg.textContent=(d&&d.error)||"Add failed";}}}).catch(function(){if(msg){msg.style.color="#c62828";msg.textContent="Network error";}});}'
     +'function editTitle(span){if(span.dataset.editing)return;span.dataset.editing="1";var sku=span.getAttribute("data-sku");var cur=span.getAttribute("data-raw")||span.textContent.replace(/^LOT OF \\d+:\\s*/,"");var inp=document.createElement("input");inp.type="text";inp.value=cur;inp.style.cssText="flex:1;min-width:150px;padding:4px 6px;border:1px solid #1565c0;border-radius:3px;font-size:14px;color:#222;";var cnt=document.createElement("span");cnt.style.cssText="font-size:11px;font-weight:bold;margin-left:6px;";function upd(){var n=inp.value.length;cnt.textContent=n+"/80";cnt.style.color=n>80?"#ff5252":"#cfd8dc";}upd();inp.addEventListener("input",upd);span.textContent="";span.style.borderBottom="none";span.appendChild(inp);span.appendChild(cnt);inp.focus();inp.select();var done=false;function save(){if(done)return;done=true;var nv=inp.value;fetch("/api/listings/"+sku,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({title:nv})}).then(function(r){return r.json();}).then(function(d){span.removeAttribute("data-editing");span.style.borderBottom="1px dashed rgba(255,255,255,0.55)";if(d&&d.success){span.setAttribute("data-raw",nv);span.textContent=nv;flashTick(span,true);}else{span.textContent=cur;flashTick(span,false);}}).catch(function(){span.removeAttribute("data-editing");span.style.borderBottom="1px dashed rgba(255,255,255,0.55)";span.textContent=cur;flashTick(span,false);});}inp.addEventListener("blur",save);inp.addEventListener("keydown",function(e){if(e.key==="Enter"){e.preventDefault();inp.blur();}else if(e.key==="Escape"){done=true;span.removeAttribute("data-editing");span.style.borderBottom="1px dashed rgba(255,255,255,0.55)";span.textContent=cur;}});}'
-    +'function editCategory(span){if(span.dataset.editing)return;span.dataset.editing="1";var sku=span.getAttribute("data-sku");var cur=span.getAttribute("data-catid")||((span.textContent.match(/\\d+/)||[""])[0]);var msg=document.getElementById("catmsg_"+sku);var prev=span.innerHTML;var inp=document.createElement("input");inp.type="text";inp.inputMode="numeric";inp.value=cur;inp.style.cssText="width:90px;padding:2px 4px;border:1px solid #1565c0;border-radius:3px;font-size:12.5px;";span.textContent="";span.appendChild(inp);inp.focus();inp.select();var done=false;function save(){if(done)return;done=true;var nv=inp.value.trim();span.removeAttribute("data-editing");if(!/^\\d+$/.test(nv)){span.innerHTML=prev;if(msg){msg.style.color="#c62828";msg.textContent="numbers only";}return;}if(msg){msg.style.color="#8d6e00";msg.textContent="Validating...";}fetch("/api/listings/"+sku,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({ebay_category_id:nv})}).then(function(r){return r.json();}).then(function(d){if(d&&d.success){var id=d.ebay_category_id||nv;var nm=d.ebay_category_name?d.ebay_category_name+" ":"";span.setAttribute("data-catid",id);span.textContent=nm+"("+id+")";if(msg){msg.style.color="#2e7d32";msg.textContent="\\u2713";setTimeout(function(){msg.textContent="";},2000);}}else{span.innerHTML=prev;if(msg){msg.style.color="#c62828";msg.textContent=(d&&d.error)?d.error:"failed";}}}).catch(function(){span.innerHTML=prev;if(msg){msg.style.color="#c62828";msg.textContent="error";}});}inp.addEventListener("blur",save);inp.addEventListener("keydown",function(e){if(e.key==="Enter"){e.preventDefault();inp.blur();}else if(e.key==="Escape"){done=true;span.removeAttribute("data-editing");span.innerHTML=prev;}});}'
+    +'function editCategory(span){if(span.dataset.editing)return;var sku=span.getAttribute("data-sku");var cur=span.getAttribute("data-catid")||((span.textContent.match(/\\d+/)||[""])[0]);var msg=document.getElementById("catmsg_"+sku);var prev=span.innerHTML;if(!cur||cur==="0"||cur==="183446"){span.dataset.editing="1";if(msg){msg.style.color="#8d6e00";msg.textContent="Resolving...";}fetch("/api/listings/"+sku,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({auto_resolve_category:true})}).then(function(r){return r.json();}).then(function(d){span.removeAttribute("data-editing");if(d&&d.success&&d.ebay_category_id){var id=d.ebay_category_id;var nm=d.ebay_category_name?d.ebay_category_name+" ":"";span.setAttribute("data-catid",id);span.textContent=nm+"("+id+")";if(msg){msg.style.color="#2e7d32";msg.textContent="\\u2713";setTimeout(function(){msg.textContent="";},2000);}}else{span.innerHTML=prev;if(msg){msg.style.color="#c62828";msg.textContent=(d&&d.error)?d.error:"could not resolve";}}}).catch(function(){span.removeAttribute("data-editing");span.innerHTML=prev;if(msg){msg.style.color="#c62828";msg.textContent="error";}});return;}span.dataset.editing="1";var inp=document.createElement("input");inp.type="text";inp.inputMode="numeric";inp.value=cur;inp.style.cssText="width:90px;padding:2px 4px;border:1px solid #1565c0;border-radius:3px;font-size:12.5px;";span.textContent="";span.appendChild(inp);inp.focus();inp.select();var done=false;function save(){if(done)return;done=true;var nv=inp.value.trim();span.removeAttribute("data-editing");if(!/^\\d+$/.test(nv)){span.innerHTML=prev;if(msg){msg.style.color="#c62828";msg.textContent="numbers only";}return;}if(msg){msg.style.color="#8d6e00";msg.textContent="Validating...";}fetch("/api/listings/"+sku,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({ebay_category_id:nv})}).then(function(r){return r.json();}).then(function(d){if(d&&d.success){var id=d.ebay_category_id||nv;var nm=d.ebay_category_name?d.ebay_category_name+" ":"";span.setAttribute("data-catid",id);span.textContent=nm+"("+id+")";if(msg){msg.style.color="#2e7d32";msg.textContent="\\u2713";setTimeout(function(){msg.textContent="";},2000);}}else{span.innerHTML=prev;if(msg){msg.style.color="#c62828";msg.textContent=(d&&d.error)?d.error:"failed";}}}).catch(function(){span.innerHTML=prev;if(msg){msg.style.color="#c62828";msg.textContent="error";}});}inp.addEventListener("blur",save);inp.addEventListener("keydown",function(e){if(e.key==="Enter"){e.preventDefault();inp.blur();}else if(e.key==="Escape"){done=true;span.removeAttribute("data-editing");span.innerHTML=prev;}});}'
     +'function editDims(span){if(span.dataset.editing)return;span.dataset.editing="1";var sku=span.getAttribute("data-sku");var msg=document.getElementById("dimmsg_"+sku);var prev=span.textContent;var cur=prev.trim();if(cur==="(set)")cur="";var inp=document.createElement("input");inp.type="text";inp.value=cur;inp.placeholder="LxWxH";inp.style.cssText="width:90px;padding:2px 4px;border:1px solid #1565c0;border-radius:3px;font-size:12.5px;";span.textContent="";span.appendChild(inp);inp.focus();inp.select();var done=false;function save(){if(done)return;done=true;var nv=inp.value.trim();span.removeAttribute("data-editing");fetch("/api/listings/"+sku,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({box_dimensions:nv})}).then(function(r){return r.json();}).then(function(d){if(d&&d.success){span.textContent=(nv||"(set)");if(msg){msg.style.color="#2e7d32";msg.textContent="\\u2713";setTimeout(function(){msg.textContent="";},1500);}}else{span.textContent=prev;if(msg){msg.style.color="#c62828";msg.textContent=(d&&d.error)||"failed";}}}).catch(function(){span.textContent=prev;if(msg){msg.style.color="#c62828";msg.textContent="error";}});}inp.addEventListener("blur",save);inp.addEventListener("keydown",function(e){if(e.key==="Enter"){e.preventDefault();inp.blur();}else if(e.key==="Escape"){done=true;span.removeAttribute("data-editing");span.textContent=prev;}});}'
     +'function toggleRegen(sku){var pa=document.getElementById("regpanel_"+sku);if(!pa)return;var show=(pa.style.display==="none"||!pa.style.display);pa.style.display=show?"block":"none";if(show){var t=document.getElementById("regnotes_"+sku);if(t)t.focus();}}'
     +'function cancelRegen(sku){var pa=document.getElementById("regpanel_"+sku);if(pa)pa.style.display="none";var m=document.getElementById("regmsg_"+sku);if(m)m.textContent="";}'

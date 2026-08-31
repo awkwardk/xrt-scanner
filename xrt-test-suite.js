@@ -438,14 +438,44 @@ test('Route returns needs_category_review', has('info.blocked') && has('needs_ca
 // instead of blocking the listing (previous behavior encoded in "Non-leaf structured error",
 // removed above — replaced by the tests in this section).
 section('LEAF CATEGORY PRE-FLIGHT (auto-resolve, never block)');
-test('resolveLeafCategoryFromTitle exists', has('function resolveLeafCategoryFromTitle(title, token, callback){'));
+test('resolveLeafCategoryFromTitle exists', has('function resolveLeafCategoryFromTitle(item, token, callback){'));
 test('isUsableCategoryId helper exists',    has('function isUsableCategoryId(v){'));
 test('isUsableCategoryId rejects (set)',    has('/^\\(?\\s*set\\s*\\)?$/i.test(s)'));
 test('missing/0/"(set)" auto-resolves',     has('var knownCat = isUsableCategoryId(rawKnownCat) ? rawKnownCat : null;'));
 test('non-leaf known category auto-resolves not blocked', has("autoResolveCategory('known category ' + knownCat + ' is not a leaf');") && !has('needs_category_review: true'));
 test('no known category auto-resolves',    has("autoResolveCategory('no known category');"));
 test('auto-resolve falls back to 183446 if none found', has('function autoResolveCategory(reason){') && has("fallbackCategory(reason + (rErr ? (': ' + rErr.message) : ': no leaf found'));"));
-test('createEbayListing pre-flight reuses shared resolver', has('resolveLeafCategoryFromTitle(record.listing.title, token, function(rErr, cat){'));
+test('createEbayListing pre-flight reuses shared resolver', has('resolveLeafCategoryFromTitle(catItem, token, function(rErr, cat){'));
+
+// ── CLEAN CATEGORY QUERY (root-cause fix: raw 80-char title -> 183446 fallback) ──
+section('CLEAN CATEGORY QUERY (progressive Clean Core / Sanitized Title / Brand+Type)');
+test('sanitizeTitleForCategoryQuery exists',  has('function sanitizeTitleForCategoryQuery(title){'));
+test('strips w/ and with noise',              has("'w/', 'with', 'bundle', 'tested', 'working', 'for parts', 'as is', 'as-is',"));
+test('strips grade a/b/c/d noise',            has("'grade a', 'grade b', 'grade c', 'grade d'"));
+test('strips long serial/part tokens > 8 chars', has('return !(clean.length > 8 && /[0-9]/.test(clean) && /[a-z]/i.test(clean));'));
+test('trySuggestedLeaf does the actual GetSuggestedCategories call', has('function trySuggestedLeaf(query, token, callback){') && has("getSuggestedCategory(query, token, function(scErr, cats){"));
+test('Attempt 1 is Clean Core (brand+model+type)', has("addQuery([brand, model, productType].filter(Boolean).join(' '));   // Attempt 1: Clean Core"));
+test('Attempt 2 is Sanitized Title',          has('addQuery(sanitizeTitleForCategoryQuery(item.title));                // Attempt 2: Sanitized Title'));
+test('Attempt 3 is Brand + Type',             has("addQuery([brand, productType].filter(Boolean).join(' '));           // Attempt 3: Brand + Type"));
+test('never sends raw title as the first query', (function(){
+  var s = content.indexOf('function resolveLeafCategoryFromTitle(item, token, callback){');
+  var e = content.indexOf('function isUsableCategoryId(v){', s);
+  var body = content.slice(s, e);
+  var i1 = body.indexOf('Attempt 1'); var i2 = body.indexOf('item.title');
+  return s >= 0 && e > s && i1 >= 0 && i2 >= 0 && i1 < i2; // Clean Core (no title) is built before item.title is ever touched
+})());
+test('bare string still accepted (back-compat)', has("if(typeof item === 'string') item = { title: item };"));
+test('voice worker builds clean item from item_specifics', has("model: (record.listing.item_specifics && record.listing.item_specifics.Model) || '',"));
+test('createEbayListing pre-flight builds clean item too', has("model: (listing.item_specifics && listing.item_specifics.Model) || '',"));
+
+// ── RE-RESOLVE ON CLICK / GENERIC 183446 (SKU 2644/2645 style stuck cards) ──
+section('RE-RESOLVE FOR EXISTING CARDS (click category, or List on eBay)');
+test('183446 always attempts a better leaf before trusting it', has("if(knownCat && String(knownCat) === '183446'){") && has("autoResolveCategory('category is the generic 183446 fallback — attempting a more specific leaf');"));
+test('PATCH auto_resolve_category endpoint exists', has('if(parsed.auto_resolve_category === true){'));
+test('re-resolve endpoint uses the shared clean resolver', has('resolveLeafCategoryFromTitle(rItem, rtTok, function(rErr, cat){'));
+test('re-resolve endpoint updates category_id + primary_category_id + category_name', has('pRec.listing.category_id = cat.id; pRec.listing.primary_category_id = cat.id;') && has('pRec.meta.category_name = cat.name;'));
+test('click on "(set)" or 183446 auto-resolves instead of manual entry', has('if(!cur||cur==="0"||cur==="183446"){span.dataset.editing="1";') && has('body:JSON.stringify({auto_resolve_category:true})'));
+test('click on a real category still allows manual override', has('span.dataset.editing="1";var inp=document.createElement("input");inp.type="text";inp.inputMode="numeric";inp.value=cur;'));
 
 section('HUMAN GROUND TRUTH — presence');
 test('human_facts captured on record',      has('human_facts: buildHumanFacts(meta, visionData)'));
@@ -1078,6 +1108,83 @@ section('VOICE INTAKE -> ADDITEM BUILDER (pre-flight simulation)');
     test('(nintendo) five non-scale photos uploaded',        (nXml.match(/<PictureURL>/g) || []).length === 5);
   } catch(e){
     test('voice -> AddItem builder functional eval', false);
+    console.log('    ERROR:', e.message);
+  }
+})();
+
+// ── functional: sanitizeTitleForCategoryQuery + resolveLeafCategoryFromTitle query priority ──
+// Proves the sanitizer really strips the exact noise the spec calls out (grade words, "w/",
+// "Tested", a long part number) and proves resolveLeafCategoryFromTitle tries Clean Core first,
+// then Sanitized Title, then Brand+Type — stubbing getSuggestedCategory/getCategoryFeatures so
+// this runs with no network, deterministically choosing which attempt "wins".
+section('CLEAN QUERY functional behavior (no network)');
+(function(){
+  function ex(n){
+    var s2 = content.indexOf('function ' + n + '(');
+    if (s2 < 0) return '';
+    var d = 0, seen = false, e = -1;
+    for (var i = s2; i < content.length; i++) { var c = content[i]; if (c === '{') { d++; seen = true; } else if (c === '}') { d--; if (seen && d === 0) { e = i + 1; break; } } }
+    return content.slice(s2, e);
+  }
+  try {
+    var box = {};
+    var code = ex('sanitizeTitleForCategoryQuery') + '\n'
+      + 'box.sanitize = sanitizeTitleForCategoryQuery;';
+    var _log = console.log; console.log = function(){};
+    eval(code);
+    console.log = _log;
+    var S = box.sanitize;
+
+    var zebraTitle = 'Zebra P4T Direct Thermal Label Printer w/ Power Adapter P4D-0UJ10000-00 Grade B Tested';
+    var zClean = S(zebraTitle);
+    test('(sanitize) strips "w/ Power Adapter" phrase marker', zClean.toLowerCase().indexOf('w/') < 0);
+    test('(sanitize) strips long part number P4D-0UJ10000-00', zClean.indexOf('0UJ10000') < 0);
+    test('(sanitize) strips "Grade B"',                        !/grade b/i.test(zClean));
+    test('(sanitize) strips "Tested"',                         !/\btested\b/i.test(zClean));
+    test('(sanitize) keeps short model number P4T',            /\bP4T\b/.test(zClean));
+    test('(sanitize) keeps brand and product words',           /Zebra/.test(zClean) && /Label/i.test(zClean) && /Printer/i.test(zClean));
+
+    var nintendoTitle = 'Nintendo Switch OLED Console UTL-001 with Dock - For Parts Missing Joy-Con';
+    var nClean = S(nintendoTitle);
+    test('(sanitize) strips "with" and "for parts" noise',     !/\bwith\b/i.test(nClean) && !/for parts/i.test(nClean));
+    test('(sanitize) keeps short model number UTL-001',        /UTL-001/.test(nClean));
+  } catch(e){
+    test('sanitizeTitleForCategoryQuery functional eval', false);
+    console.log('    ERROR:', e.message);
+  }
+
+  // ── query priority order, stubbed network ──
+  try {
+    var box2 = {};
+    var code2 = ex('sanitizeTitleForCategoryQuery') + '\n' + ex('trySuggestedLeaf') + '\n' + ex('resolveLeafCategoryFromTitle') + '\n'
+      + 'box2.resolve = resolveLeafCategoryFromTitle;';
+    var _log2 = console.log; console.log = function(){};
+    eval(code2);
+    console.log = _log2;
+    var R = box2.resolve;
+
+    // Stub getSuggestedCategory/getCategoryFeatures so ONLY the "Zebra P4T Label Printer" query
+    // (the Clean Core attempt) resolves to a leaf — proves attempt 1 wins when it works, and that
+    // resolveLeafCategoryFromTitle never even tries the noisy attempts after a hit.
+    var queriesTried = [];
+    global.getSuggestedCategory = function(q, tok, cb){ queriesTried.push(q); if(q === 'Zebra P4T Label Printer'){ cb(null, [{id:'175677', name:'Label/Thermal Printers', pct:92}]); } else { cb(null, []); } };
+    global.getCategoryFeatures = function(id, tok, cb){ cb(null, {leaf: id === '175677', conditions: ['1000','3000']}); };
+    R({ brand:'Zebra', model:'P4T', product_type:'Label Printer', title: 'Zebra P4T Direct Thermal Label Printer w/ Power Adapter P4D-0UJ10000-00 Grade B Tested' }, 'tok', function(err, cat){
+      test('(priority) Clean Core query used first',   queriesTried[0] === 'Zebra P4T Label Printer');
+      test('(priority) stops after first successful attempt', queriesTried.length === 1);
+      test('(priority) resolves the expected leaf',    !err && cat && cat.id === 175677);
+    });
+
+    // Now make Clean Core fail (no candidates) so it must fall through to Sanitized Title.
+    var queriesTried2 = [];
+    global.getSuggestedCategory = function(q, tok, cb){ queriesTried2.push(q); if(q.indexOf('Zebra') === 0 && q.indexOf('Printer') > 0 && queriesTried2.length > 1){ cb(null, [{id:'175677', name:'Label/Thermal Printers', pct:80}]); } else { cb(null, []); } };
+    global.getCategoryFeatures = function(id, tok, cb){ cb(null, {leaf: id === '175677', conditions: []}); };
+    R({ brand:'Zebra', model:'P4T', product_type:'Label Printer', title: 'Zebra P4T Direct Thermal Label Printer w/ Power Adapter P4D-0UJ10000-00 Grade B Tested' }, 'tok', function(err, cat){
+      test('(priority) falls through to a later attempt when Clean Core finds nothing', queriesTried2.length > 1);
+    });
+    delete global.getSuggestedCategory; delete global.getCategoryFeatures;
+  } catch(e){
+    test('resolveLeafCategoryFromTitle priority functional eval', false);
     console.log('    ERROR:', e.message);
   }
 })();
