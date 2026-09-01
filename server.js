@@ -5423,17 +5423,20 @@ function sanitizeSpecificValue(name, value){
 function stripIllegalXmlChars(s){
   return String(s == null ? '' : s).replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '');
 }
-// eBay's Links Policy prohibits any hyperlink/citation/source-reference in a listing — this is a
-// confirmed, real Error 240 trigger: a Google-Search-grounded AI response (generateVoiceListingAI's
-// :online call, or the main pipeline's) can cite its sources as markdown links directly inside the
-// generated HTML (e.g. "[officedepot.com](https://...)"), which eBay's policy filter rejects outright.
-// Strips markdown-style links down to their anchor text, unwraps real <a> tags to their inner text,
-// and removes any remaining bare URL — never drops the surrounding sentence, just the link itself.
+// eBay's Links Policy prohibits any hyperlink/citation/source-reference in a listing — a confirmed,
+// real Error 240 trigger. A Google-Search-grounded AI response (generateVoiceListingAI's :online
+// call, or the main pipeline's) can cite its sources as markdown links directly inside the generated
+// HTML, e.g. "[officedepot.com](https://...)". VERIFIED LIVE against SKU 2647: de-linking these and
+// keeping just the anchor text ("officedepot.com" as plain text) still triggered Error 240 — eBay's
+// filter also flags plain-text mentions of other retail/competitor site names, not only clickable
+// links. So the whole citation (anchor text AND url) is dropped entirely, including its leading
+// separator, rather than de-linked — never drops the surrounding sentence, just the citation itself.
 function stripExternalLinks(s){
   var v = String(s == null ? '' : s);
-  v = v.replace(/\[([^\]\[]*)\]\(https?:\/\/[^\s)]+\)/gi, '$1');
-  v = v.replace(/<a\b[^>]*>([\s\S]*?)<\/a>/gi, '$1');
+  v = v.replace(/\s*,?\s*\[[^\]\[]*\]\(https?:\/\/[^\s)]+\)/gi, '');
+  v = v.replace(/<a\b[^>]*>([\s\S]*?)<\/a>/gi, '');
   v = v.replace(/https?:\/\/\S+/gi, '');
+  v = v.replace(/[ \t]{2,}/g, ' '); // collapse whitespace left behind by a removed citation
   return v;
 }
 // Cleans a listing record's title/condition/description/item_specifics in place: strips illegal XML

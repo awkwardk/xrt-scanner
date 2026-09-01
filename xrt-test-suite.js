@@ -1462,19 +1462,24 @@ section('CATEGORY 177 ITEM SPECIFICS AUTO-FILL + ERROR 240 SANITIZER');
     // Google-Search-grounded response cited its sources as markdown links directly in the HTML) ──
     var realCf31Snippet = '<li><strong>Construction:</strong> Rugged, MIL-STD-810G, MIL-STD-461F & IP65 certified [officedepot.com](https://www.officedepot.com/a/products/419619/Panasonic-Toughbook-31-CF-31WALEHLM-131/), [newegg.com](https://www.newegg.com/panasonic-toughbook-13-1-xga-touch-screen-2-40ghz-4gb-memory-160gb-hdd-black/p/1TS-000H-00EZ7), [barcodediscount.com](https://www.barcodediscount.com/catalog/panasonic/part-cf-31sbleb1m.htm)</li>';
     var cleanedSnippet = box.stripLinks(realCf31Snippet);
+    // VERIFIED LIVE against the real SKU 2647: keeping the anchor text ("officedepot.com" as plain
+    // text) still triggered Error 240 — eBay's filter also flags plain-text competitor-site mentions,
+    // not only clickable links. So the whole citation is dropped, domain name included, not de-linked.
     test('(links) real SKU 2647 citation snippet has no URLs left', !/https?:\/\//.test(cleanedSnippet));
-    test('(links) markdown link anchor text is kept, not dropped',  /officedepot\.com/.test(cleanedSnippet) && /newegg\.com/.test(cleanedSnippet) && /barcodediscount\.com/.test(cleanedSnippet));
+    test('(links) citation domain names are dropped entirely, not just de-linked', !/officedepot\.com/.test(cleanedSnippet) && !/newegg\.com/.test(cleanedSnippet) && !/barcodediscount\.com/.test(cleanedSnippet));
     test('(links) surrounding sentence survives intact',            /MIL-STD-810G, MIL-STD-461F & IP65 certified/.test(cleanedSnippet));
-    test('(links) real HTML <a> tags unwrapped to inner text',      box.stripLinks('See <a href="https://example.com/x">the spec sheet</a> for details.') === 'See the spec sheet for details.');
-    test('(links) bare URL with no markdown/anchor also removed',   box.stripLinks('Source: https://example.com/foo?bar=1 confirmed.') === 'Source:  confirmed.');
+    test('(links) citation cluster leaves no double-comma/space debris', cleanedSnippet === '<li><strong>Construction:</strong> Rugged, MIL-STD-810G, MIL-STD-461F & IP65 certified</li>');
+    test('(links) real HTML <a> tags dropped entirely, not just unwrapped', box.stripLinks('See <a href="https://example.com/x">the spec sheet</a> for details.') === 'See for details.');
+    test('(links) bare URL with no markdown/anchor also removed',   box.stripLinks('Source: https://example.com/foo?bar=1 confirmed.') === 'Source: confirmed.');
     test('(links) plain text with no links passes through unchanged', box.stripLinks('Powers on and boots to BIOS.') === 'Powers on and boots to BIOS.');
 
-    // ── end-to-end: buildAddItemXml never contains a link, using the real SKU 2647 description ──
+    // ── end-to-end: buildAddItemXml never contains a link OR a citation domain name, using the
+    // real SKU 2647 description ──
     var linkyRecord = { sku: '2647', listing: { title: 'Panasonic Toughbook CF-31 w/ Charger', category_id: 177, suggested_price: 240, custom_sku: '2647-G2',
       description_html: '<h3>Overview</h3><p>Rugged laptop.</p><h3>Specifications</h3><ul>' + realCf31Snippet + '</ul>', item_specifics: {} }, meta: { grade: 'B' } };
     var linkyXml = box.buildXml(linkyRecord, { categoryId: 177, pictureUrls: [], conditionId: null, policies: null });
     test('(links) buildAddItemXml output contains no http(s) URLs at all', !/https?:\/\//.test(linkyXml));
-    test('(links) buildAddItemXml keeps the citation anchor text',   /officedepot\.com/.test(linkyXml));
+    test('(links) buildAddItemXml output contains no citation domain names', !/officedepot\.com/.test(linkyXml) && !/newegg\.com/.test(linkyXml) && !/barcodediscount\.com/.test(linkyXml));
   } catch(e){
     test('category 177 auto-fill + sanitizer functional eval', false);
     console.log('    ERROR:', e.message);
