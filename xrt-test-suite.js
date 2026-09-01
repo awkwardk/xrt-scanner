@@ -282,7 +282,7 @@ test('eBay debug full fields',        has('env_user_token_present') && has('ebay
 
 section('eBay AddItem PRODUCTION HARDENING');
 test('CDATA-safe helper',             has('function cdataSafe(') && has(']]]]><![CDATA[>'));
-test('Description uses cdataSafe',     has('cdataSafe(listing.description_html'));
+test('Description uses cdataSafe',     has('cdataSafe(stripExternalLinks(listing.description_html'));
 test('Title truncated to 80',         has(".slice(0, 80); // truncate title to 80"));
 test('Duplicate SKU -> Revise',       has('ReviseFixedPriceItem') && has('reviseItemId') && has('switching to ReviseFixedPriceItem'));
 test('Revise XML root + ItemID',      has('ReviseFixedPriceItemRequest') && has("'<ItemID>' + xmlEscape(opts.reviseItemId)"));
@@ -330,7 +330,7 @@ section('eBay AddItem 10-SCENARIO BUILDER (functional)');
   }
   try {
     var code = '';
-    ['xmlEscape','cdataSafe','splitToLimit','trimAspects','conditionIdForCategory','estimateShipCost','sanitizeSpecificValue','buildItemSpecificsXml','buildAddItemXml'].forEach(function(n){ code += extractFn(n) + '\n'; });
+    ['xmlEscape','cdataSafe','splitToLimit','trimAspects','conditionIdForCategory','estimateShipCost','sanitizeSpecificValue','stripExternalLinks','buildItemSpecificsXml','buildAddItemXml'].forEach(function(n){ code += extractFn(n) + '\n'; });
     // strict-mode eval keeps declarations local — capture the entry point (it closes over the rest)
     var fns = {};
     eval(code + '\nfns.buildAddItemXml = buildAddItemXml;');
@@ -1275,7 +1275,7 @@ section('VOICE INTAKE -> ADDITEM BUILDER (pre-flight simulation)');
       + ex('calculateShippingTier') + '\n' + ex('shippingPolicyName') + '\n' + ex('calcShipping') + '\n'
       + ex('selectBestBox') + '\n'
       + ex('lookupKnownModelSpecs') + '\n' + ex('autoFillRequiredSpecifics') + '\n'
-      + ex('sanitizeSpecificValue') + '\n' + ex('stripIllegalXmlChars') + '\n' + ex('sanitizeListingData') + '\n'
+      + ex('sanitizeSpecificValue') + '\n' + ex('stripIllegalXmlChars') + '\n' + ex('stripExternalLinks') + '\n' + ex('sanitizeListingData') + '\n'
       + ex('voiceGradeConditionId') + '\n' + ex('buildCassiniTitle') + '\n' + ex('assembleVoiceRecordFromAI') + '\n'
       + ex('xmlEscape') + '\n' + ex('cdataSafe') + '\n' + ex('conditionIdForCategory') + '\n'
       + ex('estimateShipCost') + '\n' + ex('buildItemSpecificsXml') + '\n' + ex('buildAddItemXml') + '\n'
@@ -1372,11 +1372,11 @@ section('CATEGORY 177 ITEM SPECIFICS AUTO-FILL + ERROR 240 SANITIZER');
       + ex('splitToLimit') + '\n' + ex('trimAspects') + '\n'
       + ex('calculateShippingTier') + '\n' + ex('shippingPolicyName') + '\n' + ex('calcShipping') + '\n' + ex('selectBestBox') + '\n'
       + ex('lookupKnownModelSpecs') + '\n' + ex('autoFillRequiredSpecifics') + '\n'
-      + ex('sanitizeSpecificValue') + '\n' + ex('stripIllegalXmlChars') + '\n' + ex('sanitizeListingData') + '\n'
+      + ex('sanitizeSpecificValue') + '\n' + ex('stripIllegalXmlChars') + '\n' + ex('stripExternalLinks') + '\n' + ex('sanitizeListingData') + '\n'
       + ex('voiceGradeConditionId') + '\n' + ex('buildCassiniTitle') + '\n' + ex('assembleVoiceRecordFromAI') + '\n'
       + ex('xmlEscape') + '\n' + ex('cdataSafe') + '\n' + ex('conditionIdForCategory') + '\n'
       + ex('estimateShipCost') + '\n' + ex('buildItemSpecificsXml') + '\n' + ex('buildAddItemXml') + '\n'
-      + 'box.assemble = assembleVoiceRecordFromAI; box.buildXml = buildAddItemXml; box.tier = calculateShippingTier; box.sanitizeValue = sanitizeSpecificValue; box.stripControl = stripIllegalXmlChars;';
+      + 'box.assemble = assembleVoiceRecordFromAI; box.buildXml = buildAddItemXml; box.tier = calculateShippingTier; box.sanitizeValue = sanitizeSpecificValue; box.stripControl = stripIllegalXmlChars; box.stripLinks = stripExternalLinks;';
     var _log = console.log; console.log = function(){};
     eval(code);
     console.log = _log;
@@ -1457,6 +1457,24 @@ section('CATEGORY 177 ITEM SPECIFICS AUTO-FILL + ERROR 240 SANITIZER');
     var dirty = 'Silver\x07Case';
     test('(sanitize) illegal control characters stripped',        box.stripControl(dirty) === 'SilverCase');
     test('(sanitize) tab/newline/CR are NOT stripped (legal XML whitespace)', box.stripControl('Line1\tLine2\nLine3\r') === 'Line1\tLine2\nLine3\r');
+
+    // ── external links / citations (the ACTUAL confirmed live Error 240 trigger for SKU 2647 — a
+    // Google-Search-grounded response cited its sources as markdown links directly in the HTML) ──
+    var realCf31Snippet = '<li><strong>Construction:</strong> Rugged, MIL-STD-810G, MIL-STD-461F & IP65 certified [officedepot.com](https://www.officedepot.com/a/products/419619/Panasonic-Toughbook-31-CF-31WALEHLM-131/), [newegg.com](https://www.newegg.com/panasonic-toughbook-13-1-xga-touch-screen-2-40ghz-4gb-memory-160gb-hdd-black/p/1TS-000H-00EZ7), [barcodediscount.com](https://www.barcodediscount.com/catalog/panasonic/part-cf-31sbleb1m.htm)</li>';
+    var cleanedSnippet = box.stripLinks(realCf31Snippet);
+    test('(links) real SKU 2647 citation snippet has no URLs left', !/https?:\/\//.test(cleanedSnippet));
+    test('(links) markdown link anchor text is kept, not dropped',  /officedepot\.com/.test(cleanedSnippet) && /newegg\.com/.test(cleanedSnippet) && /barcodediscount\.com/.test(cleanedSnippet));
+    test('(links) surrounding sentence survives intact',            /MIL-STD-810G, MIL-STD-461F & IP65 certified/.test(cleanedSnippet));
+    test('(links) real HTML <a> tags unwrapped to inner text',      box.stripLinks('See <a href="https://example.com/x">the spec sheet</a> for details.') === 'See the spec sheet for details.');
+    test('(links) bare URL with no markdown/anchor also removed',   box.stripLinks('Source: https://example.com/foo?bar=1 confirmed.') === 'Source:  confirmed.');
+    test('(links) plain text with no links passes through unchanged', box.stripLinks('Powers on and boots to BIOS.') === 'Powers on and boots to BIOS.');
+
+    // ── end-to-end: buildAddItemXml never contains a link, using the real SKU 2647 description ──
+    var linkyRecord = { sku: '2647', listing: { title: 'Panasonic Toughbook CF-31 w/ Charger', category_id: 177, suggested_price: 240, custom_sku: '2647-G2',
+      description_html: '<h3>Overview</h3><p>Rugged laptop.</p><h3>Specifications</h3><ul>' + realCf31Snippet + '</ul>', item_specifics: {} }, meta: { grade: 'B' } };
+    var linkyXml = box.buildXml(linkyRecord, { categoryId: 177, pictureUrls: [], conditionId: null, policies: null });
+    test('(links) buildAddItemXml output contains no http(s) URLs at all', !/https?:\/\//.test(linkyXml));
+    test('(links) buildAddItemXml keeps the citation anchor text',   /officedepot\.com/.test(linkyXml));
   } catch(e){
     test('category 177 auto-fill + sanitizer functional eval', false);
     console.log('    ERROR:', e.message);

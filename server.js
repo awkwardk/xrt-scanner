@@ -4090,6 +4090,7 @@ function buildListingSystemPrompt(){
     '- Price: slightly below mid-range of recent sold comps for this exact item with these exact specs',
     '- Do NOT use emoji anywhere',
     '- Do NOT use: "like new", "mint", "vintage", "copy", "reproduction", "insurance", "money order", "check"',
+    '- NO EXTERNAL LINKS, EVER: eBay\'s Links Policy prohibits any hyperlink, citation, or source reference in a listing (this triggers Error 240 and blocks the whole listing). When you research pricing/specs online, use what you learn to write the listing in plain text — never embed a markdown link like "[officedepot.com](https://...)", a raw URL, or an HTML <a> tag anywhere in the title, condition_box, or description_html. State the fact itself, with no citation attached.',
     '',
     'REQUIRED DESCRIPTION TEMPLATE — MANDATORY, EVERY ITEM, EVERY TIME:',
     '',
@@ -5422,21 +5423,35 @@ function sanitizeSpecificValue(name, value){
 function stripIllegalXmlChars(s){
   return String(s == null ? '' : s).replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '');
 }
+// eBay's Links Policy prohibits any hyperlink/citation/source-reference in a listing — this is a
+// confirmed, real Error 240 trigger: a Google-Search-grounded AI response (generateVoiceListingAI's
+// :online call, or the main pipeline's) can cite its sources as markdown links directly inside the
+// generated HTML (e.g. "[officedepot.com](https://...)"), which eBay's policy filter rejects outright.
+// Strips markdown-style links down to their anchor text, unwraps real <a> tags to their inner text,
+// and removes any remaining bare URL — never drops the surrounding sentence, just the link itself.
+function stripExternalLinks(s){
+  var v = String(s == null ? '' : s);
+  v = v.replace(/\[([^\]\[]*)\]\(https?:\/\/[^\s)]+\)/gi, '$1');
+  v = v.replace(/<a\b[^>]*>([\s\S]*?)<\/a>/gi, '$1');
+  v = v.replace(/https?:\/\/\S+/gi, '');
+  return v;
+}
 // Cleans a listing record's title/condition/description/item_specifics in place: strips illegal XML
-// control characters and normalizes item_specifics values via sanitizeSpecificValue. Called once the
-// record is assembled (voice intake) and again right before publish (createEbayListing), so what's
-// STORED and shown on /api/listings is already clean, not just what's sent to eBay at the last second.
+// control characters, removes external links/citations, and normalizes item_specifics values via
+// sanitizeSpecificValue. Called once the record is assembled (voice intake) and again right before
+// publish (createEbayListing), so what's STORED and shown on /api/listings is already clean, not
+// just what's sent to eBay at the last second.
 function sanitizeListingData(record){
   if(!record || !record.listing) return record;
   var listing = record.listing;
-  if(listing.title) listing.title = stripIllegalXmlChars(listing.title).trim();
-  if(listing.condition_box) listing.condition_box = stripIllegalXmlChars(listing.condition_box);
-  if(listing.description_html) listing.description_html = stripIllegalXmlChars(listing.description_html);
+  if(listing.title) listing.title = stripIllegalXmlChars(stripExternalLinks(listing.title)).trim();
+  if(listing.condition_box) listing.condition_box = stripIllegalXmlChars(stripExternalLinks(listing.condition_box));
+  if(listing.description_html) listing.description_html = stripIllegalXmlChars(stripExternalLinks(listing.description_html));
   if(listing.item_specifics && typeof listing.item_specifics === 'object'){
     Object.keys(listing.item_specifics).forEach(function(k){
       var v = listing.item_specifics[k];
-      if(Array.isArray(v)) listing.item_specifics[k] = v.map(function(x){ return stripIllegalXmlChars(sanitizeSpecificValue(k, x)); });
-      else listing.item_specifics[k] = stripIllegalXmlChars(sanitizeSpecificValue(k, v));
+      if(Array.isArray(v)) listing.item_specifics[k] = v.map(function(x){ return stripIllegalXmlChars(stripExternalLinks(sanitizeSpecificValue(k, x))); });
+      else listing.item_specifics[k] = stripIllegalXmlChars(stripExternalLinks(sanitizeSpecificValue(k, v)));
     });
   }
   return record;
@@ -5526,8 +5541,8 @@ function buildItemSpecificsXml(spec){
     var kt = String(k).trim();
     if(/^serial(\s|_)?(number|no\.?|#)?$/i.test(kt) || /^s\/?n$/i.test(kt)) return;
     // Universal Value Sanitizer (Error 240 prevention): strip "(Not Included)"-style compound
-    // phrases down to a clean controlled-vocabulary value before this ever reaches eBay's XML.
-    aspects[k] = Array.isArray(v) ? v.map(function(x){ return sanitizeSpecificValue(k, x); }) : [sanitizeSpecificValue(k, v)];
+    // phrases and any external link/citation down to a clean value before this reaches eBay's XML.
+    aspects[k] = Array.isArray(v) ? v.map(function(x){ return stripExternalLinks(sanitizeSpecificValue(k, x)); }) : [stripExternalLinks(sanitizeSpecificValue(k, v))];
   });
   aspects = trimAspects(aspects); // splits on commas + spaces, 65-char cap, dedupes
   var keys = Object.keys(aspects);
@@ -5547,14 +5562,17 @@ function buildAddItemXml(record, opts){
   var listing = record.listing || {};
   var meta = record.meta || {};
   var sku = record.sku;
-  var title = String(listing.title || ('SKU ' + sku)).slice(0, 80); // truncate title to 80
-  var desc = cdataSafe(listing.description_html || listing.condition_box || ('<p>' + xmlEscape(title) + '</p>'));
+  // Universal Error 240 safety net: strip external links/citations here too, regardless of whether
+  // sanitizeListingData already ran upstream for this record's pipeline — every AddItem/Revise call
+  // goes through this one function, so this guarantees no pipeline can slip a link past it.
+  var title = String(stripExternalLinks(listing.title || ('SKU ' + sku))).slice(0, 80); // truncate title to 80
+  var desc = cdataSafe(stripExternalLinks(listing.description_html || listing.condition_box || ('<p>' + xmlEscape(title) + '</p>')));
   var categoryId = opts.categoryId || listing.category_id || 293;
   var price = listing.suggested_price || listing.avg_sold_price || 0;
   // opts.validConditions = this category's ConditionValues (authoritative). Without it we fall back to
   // the safe cross-category default rather than a fixed grade map that can be invalid here.
   var condId = opts.conditionId || conditionIdForCategory(meta.grade, categoryId, listing.parts_repair, opts.validConditions || record.ebay_valid_conditions);
-  var condDesc = (listing.condition_box && listing.condition_box.trim()) ? listing.condition_box : ('Grade ' + (meta.grade || 'B') + ' - used, tested. See photos.');
+  var condDesc = stripExternalLinks((listing.condition_box && listing.condition_box.trim()) ? listing.condition_box : ('Grade ' + (meta.grade || 'B') + ' - used, tested. See photos.'));
   // FIX 4: quantity may be set on the listing record (PATCH /api/listings/:sku) or meta
   var qty = parseInt(listing.quantity || record.quantity || meta.quantity || 1, 10) || 1;
   if(qty < 1) qty = 1;
