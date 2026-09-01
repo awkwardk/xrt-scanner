@@ -1480,6 +1480,18 @@ section('CATEGORY 177 ITEM SPECIFICS AUTO-FILL + ERROR 240 SANITIZER');
     var linkyXml = box.buildXml(linkyRecord, { categoryId: 177, pictureUrls: [], conditionId: null, policies: null });
     test('(links) buildAddItemXml output contains no http(s) URLs at all', !/https?:\/\//.test(linkyXml));
     test('(links) buildAddItemXml output contains no citation domain names', !/officedepot\.com/.test(linkyXml) && !/newegg\.com/.test(linkyXml) && !/barcodediscount\.com/.test(linkyXml));
+
+    // ── SECOND root cause, also confirmed live on SKU 2647: a record already partially cleaned by
+    // an OLDER deploy of this sanitizer (markdown syntax stripped, bare domain name left behind and
+    // persisted to disk) has no "[text](url)" pattern left to match — must also catch bare citation
+    // debris with no link syntax at all, or a previously-mangled record can never actually clean up.
+    var alreadyMangled = '<li><strong>Construction:</strong> Rugged, MIL-STD-810G, MIL-STD-461F & IP65 certified officedepot.com, newegg.com, barcodediscount.com</li>'
+      + '<li><strong>Ports:</strong> Ethernet (RJ-45), HDMI, USB 2.0 (specific quantities not visible but generally present on this model) officedepot.com, barcodediscount.com</li>'
+      + '<li><strong>Wireless LAN:</strong> IEEE 802.11a/b/g/n officedepot.com</li>';
+    var cleanedMangled = box.stripLinks(alreadyMangled);
+    test('(links) bare leftover domain-name citations (no brackets/URL) also removed', !/officedepot\.com/.test(cleanedMangled) && !/newegg\.com/.test(cleanedMangled) && !/barcodediscount\.com/.test(cleanedMangled));
+    test('(links) surrounding facts survive the bare-domain cleanup intact', cleanedMangled === '<li><strong>Construction:</strong> Rugged, MIL-STD-810G, MIL-STD-461F & IP65 certified</li><li><strong>Ports:</strong> Ethernet (RJ-45), HDMI, USB 2.0 (specific quantities not visible but generally present on this model)</li><li><strong>Wireless LAN:</strong> IEEE 802.11a/b/g/n</li>');
+    test('(links) a legitimate mid-sentence word is not mistaken for a domain', box.stripLinks('The laptop.com screen displays clearly and the specs continue after this point.') === 'The laptop.com screen displays clearly and the specs continue after this point.');
   } catch(e){
     test('category 177 auto-fill + sanitizer functional eval', false);
     console.log('    ERROR:', e.message);

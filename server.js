@@ -5431,11 +5431,21 @@ function stripIllegalXmlChars(s){
 // filter also flags plain-text mentions of other retail/competitor site names, not only clickable
 // links. So the whole citation (anchor text AND url) is dropped entirely, including its leading
 // separator, rather than de-linked — never drops the surrounding sentence, just the citation itself.
+// SECOND ROOT CAUSE, also confirmed live on SKU 2647: a record already partially cleaned by an
+// earlier version of this function (markdown brackets/URL stripped, bare domain name kept as anchor
+// text) has NO markdown-link syntax left to match — the first regex alone can never touch it. A
+// second pass below catches a trailing run of bare "word.tld"-shaped citation tokens even with no
+// brackets/URL at all, so an already-mangled stored record gets fully cleaned too, not just fresh
+// AI output.
 function stripExternalLinks(s){
   var v = String(s == null ? '' : s);
   v = v.replace(/\s*,?\s*\[[^\]\[]*\]\(https?:\/\/[^\s)]+\)/gi, '');
   v = v.replace(/<a\b[^>]*>([\s\S]*?)<\/a>/gi, '');
   v = v.replace(/https?:\/\/\S+/gi, '');
+  // Bare leftover domain-name citation debris (no link syntax at all) — e.g. "officedepot.com,
+  // newegg.com, barcodediscount.com" trailing a sentence right before a tag or end of string.
+  var domainToken = '\\b[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.(?:com|net|org|io|co|us|biz|info)\\b';
+  v = v.replace(new RegExp('\\s*,?\\s*' + domainToken + '(?:\\s*,\\s*' + domainToken + ')*\\s*(?=<|$)', 'gi'), '');
   v = v.replace(/[ \t]{2,}/g, ' '); // collapse whitespace left behind by a removed citation
   return v;
 }
