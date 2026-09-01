@@ -330,7 +330,7 @@ section('eBay AddItem 10-SCENARIO BUILDER (functional)');
   }
   try {
     var code = '';
-    ['xmlEscape','cdataSafe','splitToLimit','trimAspects','conditionIdForCategory','estimateShipCost','buildItemSpecificsXml','buildAddItemXml'].forEach(function(n){ code += extractFn(n) + '\n'; });
+    ['xmlEscape','cdataSafe','splitToLimit','trimAspects','conditionIdForCategory','estimateShipCost','sanitizeSpecificValue','buildItemSpecificsXml','buildAddItemXml'].forEach(function(n){ code += extractFn(n) + '\n'; });
     // strict-mode eval keeps declarations local — capture the entry point (it closes over the rest)
     var fns = {};
     eval(code + '\nfns.buildAddItemXml = buildAddItemXml;');
@@ -1268,13 +1268,18 @@ section('VOICE INTAKE -> ADDITEM BUILDER (pre-flight simulation)');
     var code = 'var MIN_THRESHOLD = 30;\n'
       + (content.match(/var POLY_MAILER_SPEC = \{[\s\S]*?\};/) || [''])[0] + '\n'
       + (content.match(/var STOCK_BOXES = \[[\s\S]*?\];/) || [''])[0] + '\n'
+      + (content.match(/var CATEGORY_REQUIRED_ASPECTS = \{[\s\S]*?\};/) || [''])[0] + '\n'
+      + (content.match(/var KNOWN_MODEL_SPECS = \{[\s\S]*?\};/) || [''])[0] + '\n'
+      + (content.match(/var GENERIC_SPEC_FALLBACKS = \{[\s\S]*?\};/) || [''])[0] + '\n'
       + ex('splitToLimit') + '\n' + ex('trimAspects') + '\n'
       + ex('calculateShippingTier') + '\n' + ex('shippingPolicyName') + '\n' + ex('calcShipping') + '\n'
       + ex('selectBestBox') + '\n'
+      + ex('lookupKnownModelSpecs') + '\n' + ex('autoFillRequiredSpecifics') + '\n'
+      + ex('sanitizeSpecificValue') + '\n' + ex('stripIllegalXmlChars') + '\n' + ex('sanitizeListingData') + '\n'
       + ex('voiceGradeConditionId') + '\n' + ex('buildCassiniTitle') + '\n' + ex('assembleVoiceRecordFromAI') + '\n'
       + ex('xmlEscape') + '\n' + ex('cdataSafe') + '\n' + ex('conditionIdForCategory') + '\n'
       + ex('estimateShipCost') + '\n' + ex('buildItemSpecificsXml') + '\n' + ex('buildAddItemXml') + '\n'
-      + 'box.assemble = assembleVoiceRecordFromAI; box.buildXml = buildAddItemXml; box.tier = calculateShippingTier; box.selectBestBox = selectBestBox;';
+      + 'box.assemble = assembleVoiceRecordFromAI; box.buildXml = buildAddItemXml; box.tier = calculateShippingTier; box.selectBestBox = selectBestBox; box.autoFill = autoFillRequiredSpecifics; box.sanitizeValue = sanitizeSpecificValue;';
     var _log = console.log; console.log = function(){};
     eval(code);
     console.log = _log;
@@ -1343,6 +1348,117 @@ section('VOICE INTAKE -> ADDITEM BUILDER (pre-flight simulation)');
     test('(nintendo) five non-scale photos uploaded',        (nXml.match(/<PictureURL>/g) || []).length === 5);
   } catch(e){
     test('voice -> AddItem builder functional eval', false);
+    console.log('    ERROR:', e.message);
+  }
+})();
+
+// ── functional: Category 177 (PC Laptops & Netbooks) required-specifics auto-fill + Error 240
+// sanitizer, real SKU 2649 (Panasonic Toughbook CF-52, single unit) and a synthetic parts lot ──
+section('CATEGORY 177 ITEM SPECIFICS AUTO-FILL + ERROR 240 SANITIZER');
+(function(){
+  function ex(n){
+    var s2 = content.indexOf('function ' + n + '(');
+    if (s2 < 0) return '';
+    var d = 0, seen = false, e = -1;
+    for (var i = s2; i < content.length; i++) { var c = content[i]; if (c === '{') { d++; seen = true; } else if (c === '}') { d--; if (seen && d === 0) { e = i + 1; break; } } }
+    return content.slice(s2, e);
+  }
+  try {
+    var box = {};
+    var code = 'var MIN_THRESHOLD = 30;\n'
+      + (content.match(/var CATEGORY_REQUIRED_ASPECTS = \{[\s\S]*?\};/) || [''])[0] + '\n'
+      + (content.match(/var KNOWN_MODEL_SPECS = \{[\s\S]*?\};/) || [''])[0] + '\n'
+      + (content.match(/var GENERIC_SPEC_FALLBACKS = \{[\s\S]*?\};/) || [''])[0] + '\n'
+      + ex('splitToLimit') + '\n' + ex('trimAspects') + '\n'
+      + ex('calculateShippingTier') + '\n' + ex('shippingPolicyName') + '\n' + ex('calcShipping') + '\n' + ex('selectBestBox') + '\n'
+      + ex('lookupKnownModelSpecs') + '\n' + ex('autoFillRequiredSpecifics') + '\n'
+      + ex('sanitizeSpecificValue') + '\n' + ex('stripIllegalXmlChars') + '\n' + ex('sanitizeListingData') + '\n'
+      + ex('voiceGradeConditionId') + '\n' + ex('buildCassiniTitle') + '\n' + ex('assembleVoiceRecordFromAI') + '\n'
+      + ex('xmlEscape') + '\n' + ex('cdataSafe') + '\n' + ex('conditionIdForCategory') + '\n'
+      + ex('estimateShipCost') + '\n' + ex('buildItemSpecificsXml') + '\n' + ex('buildAddItemXml') + '\n'
+      + 'box.assemble = assembleVoiceRecordFromAI; box.buildXml = buildAddItemXml; box.tier = calculateShippingTier; box.sanitizeValue = sanitizeSpecificValue; box.stripControl = stripIllegalXmlChars;';
+    var _log = console.log; console.log = function(){};
+    eval(code);
+    console.log = _log;
+
+    function simulatePictureUrls(record){ return (record.outputPhotos || []).map(function(stem){ return 'https://i.ebayimg.com/00/s/' + stem + '.jpg'; }); }
+
+    // ── SKU 2649 — single-unit Panasonic Toughbook CF-52, "FOR PARTS", Screen Size/Processor
+    // never extracted by the AI (mirrors the real failure) ──
+    var cfTier = box.tier(21, 4.6, 2649);
+    var cfVision = { item_name: 'Panasonic Toughbook CF-52 Laptop', brand: 'Panasonic', model: 'CF-52', category: 'Notebook/Laptop', includes: 'AC adapter', condition_notes: 'heavy wear, does not power on' };
+    var cfPvHints = { grade: 'D', power_test: 'Fail', brand: 'Panasonic', model: 'CF-52', product_type: 'Laptop', includes: [], features: [], quantity: 1 };
+    var cfAiData = { title: 'Panasonic Toughbook CF-52 Laptop Intel Core 2 Duo 2.26GHz 2GB RAM FOR PARTS', grade: 'D', parts_repair: true,
+      condition_box: 'Heavy cosmetic wear. Does not power on. Sold for parts or repair only.',
+      description_html: '<h3>Overview</h3><p>Panasonic Toughbook CF-52, for parts.</p>',
+      avg_sold_price: 60, price_low: 40, price_high: 80, suggested_price: 60, accept_price: 55, decline_price: 35,
+      item_specifics: { Brand: 'Panasonic', Model: 'CF-52', Type: 'Notebook/Laptop' }, is_lot: false, lot_quantity: 1 }; // no Screen Size / Processor — the real bug
+    var cfRecord = box.assemble('2649', 'E3', 25, 'panasonic toughbook cf fifty two for parts does not power on', cfPvHints, { lbs: 21, oz: 4.6 }, 25, false, cfTier, cfVision, cfAiData);
+    cfRecord.listing.category_id = 177; cfRecord.listing.primary_category_id = 177; cfRecord.meta.category_name = 'PC Laptops & Netbooks';
+    var cfXml = box.buildXml(cfRecord, { categoryId: cfRecord.listing.category_id, pictureUrls: simulatePictureUrls(cfRecord), conditionId: null, policies: null });
+
+    test('(SKU 2649) Screen Size auto-filled from known-model knowledge', cfRecord.listing.item_specifics['Screen Size'] === '15.4 in');
+    test('(SKU 2649) Processor auto-filled from known-model knowledge',   cfRecord.listing.item_specifics['Processor'] === 'Intel Core 2 Duo');
+    test('(SKU 2649) RAM Size still auto-filled even with no model match', !!cfRecord.listing.item_specifics['RAM Size']);
+    test('(SKU 2649) Storage Type OR-group satisfied (no false-missing)', !!cfRecord.listing.item_specifics['Storage Type'] || !!cfRecord.listing.item_specifics['SSD Capacity'] || !!cfRecord.listing.item_specifics['Hard Drive Capacity']);
+    test('(SKU 2649) AddItem XML actually carries Screen Size 15.4 in', cfXml.indexOf('<Value>15.4 in</Value>') >= 0);
+    test('(SKU 2649) AddItem XML actually carries Processor value',     cfXml.indexOf('<Value>Intel Core 2 Duo</Value>') >= 0);
+    test('(SKU 2649) leaf category 177 in AddItem XML',                 cfXml.indexOf('<PrimaryCategory><CategoryID>177</CategoryID></PrimaryCategory>') >= 0);
+
+    // ── synthetic multi-unit PARTS LOT — same model, but a lot must NOT get a single per-unit
+    // known-model guess (units may differ); "See Description" is used instead ──
+    var lotTier = box.tier(60, 0, 2650);
+    var lotVision = { item_name: 'Panasonic Toughbook CF-52 Laptops', brand: 'Panasonic', model: 'CF-52', category: 'Notebook/Laptop', includes: '', condition_notes: 'mixed cosmetic wear across units' };
+    var lotPvHints = { grade: 'D', power_test: 'Fail', brand: 'Panasonic', model: 'CF-52', product_type: 'Laptop', includes: [], features: [], quantity: 3 };
+    var lotAiData = { title: 'LOT OF 3: Lot of 3 Panasonic Toughbook CF-52 Laptops For Parts or Repair', grade: 'D', parts_repair: true,
+      condition_box: 'Lot of 3 units, mixed cosmetic wear, sold for parts or repair only, untested individually.',
+      description_html: '<h3>Overview</h3><p>Lot of 3 Panasonic Toughbook CF-52 laptops.</p>',
+      avg_sold_price: 90, price_low: 70, price_high: 120, suggested_price: 90, accept_price: 80, decline_price: 55,
+      item_specifics: { Brand: 'Panasonic', Model: 'CF-52', Type: 'Notebook/Laptop' }, is_lot: true, lot_quantity: 3 };
+    var lotRecord = box.assemble('2651', 'E3', 10, 'lot of three panasonic toughbook cf fifty two for parts', lotPvHints, { lbs: 60, oz: 0 }, 10, false, lotTier, lotVision, lotAiData);
+    lotRecord.listing.category_id = 177; lotRecord.listing.primary_category_id = 177;
+    var lotXml = box.buildXml(lotRecord, { categoryId: lotRecord.listing.category_id, pictureUrls: simulatePictureUrls(lotRecord), conditionId: null, policies: null });
+
+    test('(parts lot) quantity 3 recognized as a lot', lotRecord.quantity === 3 && lotRecord.listing.is_lot === true);
+    test('(parts lot) Screen Size falls back to "See Description", not a single guessed size', lotRecord.listing.item_specifics['Screen Size'] === 'See Description');
+    test('(parts lot) Processor falls back to "See Description" for the same reason',          lotRecord.listing.item_specifics['Processor'] === 'See Description');
+    test('(parts lot) AddItem XML Quantity reflects the lot size',      lotXml.indexOf('<Quantity>3</Quantity>') >= 0);
+    test('(parts lot) AddItem XML never left Screen Size/Processor blank', lotXml.indexOf('<Value>See Description</Value>') >= 0);
+
+    // ── Universal Value Sanitizer — SKU 2647-style "HDD (Not Included)" / "Not Included" values ──
+    var errTier = box.tier(8, 10.5, 2647);
+    var errVision = { item_name: 'Panasonic Toughbook CF-31 Laptop', brand: 'Panasonic', model: 'CF-31WLEHLM', category: 'Notebook/Laptop', includes: 'AC adapter', condition_notes: 'light scuffing' };
+    var errPvHints = { grade: 'B', power_test: 'Pass', brand: 'Panasonic', model: 'CF-31WLEHLM', product_type: 'Laptop', includes: ['AC adapter'], features: [], quantity: 1 };
+    var errAiData = { title: 'Panasonic Toughbook CF-31 CF-31WLEHLM i5-3340M 4GB RAM Rugged Laptop w/ Charger', grade: 'B', parts_repair: false,
+      condition_box: 'Light scuffing on case. Powers on and boots. AC adapter included; no hard drive installed.',
+      description_html: '<h3>Overview</h3><p>Panasonic Toughbook CF-31, rugged laptop.</p>',
+      avg_sold_price: 240, price_low: 180, price_high: 300, suggested_price: 240, accept_price: 200, decline_price: 150,
+      item_specifics: { Brand: 'Panasonic', Model: 'CF-31WLEHLM', Type: 'Notebook/Laptop', Processor: 'Intel Core i5 3rd Gen', 'RAM Size': '4 GB',
+        'Screen Size': '13.1 in', 'Operating System': 'Not Included', 'Storage Type': 'HDD (Not Included)', Color: 'Silver' },
+      is_lot: false, lot_quantity: 1 };
+    var errRecord = box.assemble('2647', 'G2', 8, 'panasonic toughbook cf thirty one rugged laptop with charger', errPvHints, { lbs: 8, oz: 10.5 }, 8, false, errTier, errVision, errAiData);
+    errRecord.listing.category_id = 177; errRecord.listing.primary_category_id = 177;
+    var errXml = box.buildXml(errRecord, { categoryId: errRecord.listing.category_id, pictureUrls: simulatePictureUrls(errRecord), conditionId: null, policies: null });
+
+    test('(SKU 2647) "HDD (Not Included)" sanitized to clean "HDD"', errRecord.listing.item_specifics['Storage Type'] === 'HDD');
+    test('(SKU 2647) Operating System "Not Included" left as the correct eBay value', errRecord.listing.item_specifics['Operating System'] === 'Not Included');
+    test('(SKU 2647) AddItem XML never contains the raw "(Not Included)" phrase', errXml.indexOf('(Not Included)') < 0);
+    test('(SKU 2647) AddItem XML carries the clean Storage Type value', errXml.indexOf('<Value>HDD</Value>') >= 0);
+    test('(SKU 2647) AddItem XML carries Operating System correctly',  errXml.indexOf('<Value>Not Included</Value>') >= 0);
+    test('(SKU 2647) title w/ shorthand survives XML-safe and unmangled', errXml.indexOf('w/ Charger') >= 0);
+    test('(SKU 2647) leaf category 177 in AddItem XML', errXml.indexOf('<PrimaryCategory><CategoryID>177</CategoryID></PrimaryCategory>') >= 0);
+
+    // ── sanitizeSpecificValue direct unit checks (a few more patterns than the end-to-end cases above) ──
+    test('(sanitize) "SSD (Not Installed)"-style pattern also cleaned', box.sanitizeValue('Storage Type', 'SSD (Not Installed)') === 'SSD');
+    test('(sanitize) bare "Not Included" on a non-OS field becomes "None"', box.sanitizeValue('Battery', 'Not Included') === 'None');
+    test('(sanitize) ordinary values pass through unchanged', box.sanitizeValue('Color', 'Silver') === 'Silver');
+
+    // ── control-character stripping (illegal XML bytes from a garbled transcript/OCR pass) ──
+    var dirty = 'Silver\x07Case';
+    test('(sanitize) illegal control characters stripped',        box.stripControl(dirty) === 'SilverCase');
+    test('(sanitize) tab/newline/CR are NOT stripped (legal XML whitespace)', box.stripControl('Line1\tLine2\nLine3\r') === 'Line1\tLine2\nLine3\r');
+  } catch(e){
+    test('category 177 auto-fill + sanitizer functional eval', false);
     console.log('    ERROR:', e.message);
   }
 })();

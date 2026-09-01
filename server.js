@@ -605,7 +605,9 @@ function generateVoiceListingAI(sku, transcript, shelf, pvHints, weightLine, vis
       'RULE OF STRICT FACTUALITY: Only state what is explicitly mentioned in the voice transcript or indisputably visible in the photos.\n' +
       'NO UNVERIFIED POSITIVE ASSUMPTIONS: Do NOT guess or assume functional/mechanical integrity. Never say "hinge is sturdy", "buttons are responsive", "ports are clean", or "battery cover is present" unless specifically confirmed in the voice notes or clearly shown attached in photos.\n' +
       'MISSING PARTS ACCURACY: If a compartment is open, empty, or missing in photos and the transcript notes something like "no battery" or "no charger", state only what is missing or visible (e.g. "Battery and battery cover not included"). Never hallucinate that missing covers or accessories are present.\n' +
-      'Keep the condition box strictly factual and concise (2-3 sentences max covering observed cosmetic flaws, testing result, and what is/isn\'t included).';
+      'Keep the condition box strictly factual and concise (2-3 sentences max covering observed cosmetic flaws, testing result, and what is/isn\'t included).\n\n' +
+      'LAPTOPS/COMPUTERS — REQUIRED ITEM SPECIFICS: If this item is a laptop, notebook, or netbook, item_specifics MUST include Screen Size, Processor, RAM Size, and Storage Type whenever that information is stated in the transcript or legible in the photos (a BIOS/system-info screen, a spec label on the bottom of the unit, a Windows System page). Only state what you can actually read or was actually spoken — never invent a screen size or processor model that was not confirmed.\n' +
+      'ITEM SPECIFIC VALUES MUST BE CLEAN: an aspect value is a short controlled-vocabulary term, not a sentence. Never write a value like "HDD (Not Included)" or "SSD (Not Installed)" — if a component described by an aspect (storage, battery, etc.) is missing, put that fact in condition_box/description_html instead and give the aspect just the plain type (e.g. Storage Type: "HDD") or, if no type is known at all, omit the aspect rather than writing a compound phrase.';
     var userMessage = [
       'Seller\'s spoken description (verbatim): ' + (transcript || '(none)'),
       '',
@@ -718,6 +720,16 @@ function assembleVoiceRecordFromAI(sku, shelf, saved, transcript, pvHints, winfo
   // Established rule: serial numbers are never surfaced in item_specifics.
   Object.keys(specifics).forEach(function(k){ if(/^serial(\s|_)?(number|no\.?|#)?$/i.test(String(k).trim()) || /^s\/?n$/i.test(String(k).trim())) delete specifics[k]; });
 
+  // Pre-flight required-specifics resolution (best-effort head start — the real eBay category isn't
+  // resolved yet at this point in the pipeline; createEbayListing's Taxonomy-API pre-flight is the
+  // authoritative re-check right before AddItem). Heuristically detect a laptop-shaped item from
+  // whatever text is available so far and auto-fill category 177's required aspects immediately,
+  // so a voice-intake laptop never sits with "Screen Size"/"Processor" missing in the meantime.
+  var laptopHint = String(specifics.Type || v.category || pvHints.product_type || aiData.title || '').toLowerCase();
+  if(/laptop|notebook|netbook/.test(laptopHint)){
+    autoFillRequiredSpecifics(specifics, CATEGORY_REQUIRED_ASPECTS['177'], { model: v.model || pvHints.model, isLot: quantity > 1 });
+  }
+
   var title = String(aiData.title || '').trim().slice(0, 80) ||
     buildCassiniTitle({ brand: v.brand || pvHints.brand, model: v.model || pvHints.model, product_type: v.category || pvHints.product_type,
                          features: pvHints.features, includes: pvHints.includes, grade: grade, parts_repair: partsRepair, quantity: quantity });
@@ -780,7 +792,7 @@ function assembleVoiceRecordFromAI(sku, shelf, saved, transcript, pvHints, winfo
   var outputPhotos = [];
   for(var i = 1; i <= (saved || 0); i++){ if(i !== weightPhotoIndex) outputPhotos.push('photo_' + i); }
 
-  return {
+  var record = {
     sku: sku, meta: meta, listing: listing, source: 'voice_intake',
     visionData: { item_name: v.item_name || title, brand: v.brand || pvHints.brand || '', model: v.model || pvHints.model || '' },
     quantity: quantity, photoCount: saved || 0, outputPhotos: outputPhotos,
@@ -790,6 +802,8 @@ function assembleVoiceRecordFromAI(sku, shelf, saved, transcript, pvHints, winfo
     noWeightFlag: !tier, threshold: MIN_THRESHOLD, belowThreshold: (suggested > 0 && suggested < MIN_THRESHOLD),
     generatedAt: meta.timestamp
   };
+  // Universal Value Sanitizer (Error 240 prevention) — clean before this ever hits disk.
+  return sanitizeListingData(record);
 }
 
 // ── eBay TOKEN HELPERS (Feature 9) ──
@@ -5326,9 +5340,112 @@ function processItem(item, callback) {
   });
 }
 
+// ── ITEM SPECIFICS PRE-FLIGHT RESOLUTION + UNIVERSAL VALUE SANITIZER (Error 240 / missing-aspects prevention) ──
+// Static fallback required-aspect map for well-known categories, keyed by eBay category ID (string).
+// This is a BEST-EFFORT head start applied before the real eBay category is even known (voice intake,
+// pre-resolution) — createEbayListing's pre-flight gate re-checks the TRUE required list from the
+// Taxonomy API (getItemAspectsForCategory) right before AddItem, which is the authoritative source.
+// A plain string is a single required aspect name; a nested array is an OR-group — any ONE of the
+// alternatives satisfies the requirement (e.g. Storage Type / SSD Capacity / Hard Drive Capacity).
+var CATEGORY_REQUIRED_ASPECTS = {
+  '177': ['Brand', 'Model', 'Type', 'Screen Size', 'Processor', 'RAM Size', ['Storage Type', 'SSD Capacity', 'Hard Drive Capacity']]
+};
+// Known-model fallback specs — used only when nothing else (AI extraction, photos) already supplied a
+// value. Keyed by a model substring matched case-insensitively against item_specifics.Model.
+var KNOWN_MODEL_SPECS = {
+  'CF-31': { 'Screen Size': '13.1 in', 'Processor': 'Intel Core i5' },
+  'CF-52': { 'Screen Size': '15.4 in', 'Processor': 'Intel Core 2 Duo' }
+};
+function lookupKnownModelSpecs(modelValue){
+  var m = String(modelValue || '').toUpperCase();
+  if(!m) return null;
+  var keys = Object.keys(KNOWN_MODEL_SPECS);
+  for(var i = 0; i < keys.length; i++){ if(m.indexOf(keys[i]) >= 0) return KNOWN_MODEL_SPECS[keys[i]]; }
+  return null;
+}
+// Generic last-resort fallback values, so a required aspect is NEVER left blank even with no
+// known-model match. "See Description" is used for spec-shaped fields (accurate specs are in the
+// condition/description text); "Not Specified"/"None" for identity/component fields.
+var GENERIC_SPEC_FALLBACKS = {
+  'screen size': 'See Description', 'processor': 'See Description', 'ram size': 'See Description',
+  'storage type': 'None', 'ssd capacity': 'Not Specified', 'hard drive capacity': 'Not Specified',
+  'type': 'Not Specified', 'model': 'Not Specified', 'brand': 'Unbranded'
+};
+// Ensures every required aspect (or, for an OR-group entry, at least one alternative) has a non-empty
+// value in specifics — auto-filling from known-model knowledge first, then a safe generic fallback —
+// so publish is NEVER blocked on a missing required field. Mutates specifics in place and returns it.
+// context: {model, isLot} — for a multi-unit lot, skip the per-unit known-model guess (a single
+// screen size/processor may not apply to every unit) and go straight to "See Description".
+function autoFillRequiredSpecifics(specifics, requiredNames, context){
+  specifics = specifics || {};
+  context = context || {};
+  var haveLower = {};
+  Object.keys(specifics).forEach(function(k){
+    var v = specifics[k];
+    var has = Array.isArray(v) ? v.join('').trim() : String(v == null ? '' : v).trim();
+    if(has) haveLower[String(k).toLowerCase()] = true;
+  });
+  var known = context.isLot ? null : lookupKnownModelSpecs(context.model || specifics.Model);
+  (requiredNames || []).forEach(function(entry){
+    var names = Array.isArray(entry) ? entry : [entry];
+    var satisfied = names.some(function(n){ return haveLower[String(n).toLowerCase()]; });
+    if(satisfied) return;
+    var primary = names[0];
+    var fillValue = (known && known[primary]) || (context.isLot ? 'See Description' : null) || GENERIC_SPEC_FALLBACKS[String(primary).toLowerCase()] || 'Not Specified';
+    specifics[primary] = fillValue;
+    haveLower[String(primary).toLowerCase()] = true;
+    console.log('[SPECIFICS] auto-filled required aspect "' + primary + '" = "' + fillValue + '"' + (known && known[primary] ? ' (known-model)' : ' (generic fallback)'));
+  });
+  return specifics;
+}
+// UNIVERSAL VALUE SANITIZER (prevents Error 240): eBay rejects an item-specific VALUE that isn't a
+// clean controlled-vocabulary string — a compound descriptive phrase like "HDD (Not Included)" fails
+// aspect validation even though "HDD" alone is a perfectly valid Storage Type. Strips a trailing
+// "(Not Included/Missing/N/A/None)" annotation and keeps the real value; the "not included" fact
+// belongs in the condition/description text, not a structured aspect. Not storage-specific — applies
+// to any field with this pattern (Battery, Charger, Operating System, etc.).
+function sanitizeSpecificValue(name, value){
+  var v = String(value == null ? '' : value).trim();
+  if(!v) return v;
+  var n = String(name || '').trim().toLowerCase();
+  var m = v.match(/^(.*?)\s*\((?:not included|not installed|missing|n\/a|none)\)\s*$/i);
+  if(m){
+    var base = m[1].trim();
+    if(base) return base; // "HDD (Not Included)" -> "HDD" (accurate type; availability lives in the description)
+    return n === 'operating system' ? 'Not Included' : 'None'; // bare "(Not Included)" with nothing before it
+  }
+  if(/^not (included|installed)$/i.test(v)) return n === 'operating system' ? 'Not Included' : 'None';
+  return v;
+}
+// Strips XML-illegal control characters (a stray byte from a garbled voice transcript or OCR pass
+// would otherwise produce genuinely invalid XML even after entity-escaping) — keeps tab/LF/CR.
+function stripIllegalXmlChars(s){
+  return String(s == null ? '' : s).replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '');
+}
+// Cleans a listing record's title/condition/description/item_specifics in place: strips illegal XML
+// control characters and normalizes item_specifics values via sanitizeSpecificValue. Called once the
+// record is assembled (voice intake) and again right before publish (createEbayListing), so what's
+// STORED and shown on /api/listings is already clean, not just what's sent to eBay at the last second.
+function sanitizeListingData(record){
+  if(!record || !record.listing) return record;
+  var listing = record.listing;
+  if(listing.title) listing.title = stripIllegalXmlChars(listing.title).trim();
+  if(listing.condition_box) listing.condition_box = stripIllegalXmlChars(listing.condition_box);
+  if(listing.description_html) listing.description_html = stripIllegalXmlChars(listing.description_html);
+  if(listing.item_specifics && typeof listing.item_specifics === 'object'){
+    Object.keys(listing.item_specifics).forEach(function(k){
+      var v = listing.item_specifics[k];
+      if(Array.isArray(v)) listing.item_specifics[k] = v.map(function(x){ return stripIllegalXmlChars(sanitizeSpecificValue(k, x)); });
+      else listing.item_specifics[k] = stripIllegalXmlChars(sanitizeSpecificValue(k, v));
+    });
+  }
+  return record;
+}
+
 // ── eBay TRADING API (AddItem) — creates a live FixedPriceItem listing ──
 function xmlEscape(s){
   return String(s == null ? '' : s)
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '')
     .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
     .replace(/"/g,'&quot;').replace(/'/g,'&apos;');
 }
@@ -5408,7 +5525,9 @@ function buildItemSpecificsXml(spec){
     // FIX 3: never send serial number as an item specific (handles older records too)
     var kt = String(k).trim();
     if(/^serial(\s|_)?(number|no\.?|#)?$/i.test(kt) || /^s\/?n$/i.test(kt)) return;
-    aspects[k] = Array.isArray(v) ? v.map(String) : [String(v)];
+    // Universal Value Sanitizer (Error 240 prevention): strip "(Not Included)"-style compound
+    // phrases down to a clean controlled-vocabulary value before this ever reaches eBay's XML.
+    aspects[k] = Array.isArray(v) ? v.map(function(x){ return sanitizeSpecificValue(k, x); }) : [sanitizeSpecificValue(k, v)];
   });
   aspects = trimAspects(aspects); // splits on commas + spaces, 65-char cap, dedupes
   var keys = Object.keys(aspects);
@@ -6045,6 +6164,9 @@ function createEbayListing(sku, callback){
   if(!fs.existsSync(listingPath)){ callback(new Error('Listing not found for SKU ' + sku)); return; }
   var record; try { record = JSON.parse(fs.readFileSync(listingPath, 'utf8')); } catch(e){ callback(new Error('Bad listing.json')); return; }
   record.sku = record.sku || Number(sku);
+  // Universal Value Sanitizer (Error 240 prevention) — clean stored title/specifics before anything
+  // else runs, so every downstream check (validateForPublish, buildAddItemXml) sees clean data.
+  sanitizeListingData(record);
 
   // Auto-truncate an over-long title to 80 chars up front (eBay hard limit) so it
   // never blocks listing — the spec calls for auto-truncate, not rejection.
@@ -6067,10 +6189,11 @@ function createEbayListing(sku, callback){
 
   getEbayToken(function(tErr, token){
     if(tErr){ callback(tErr); return; }
-    // FIX 3: enforce required item specifics BEFORE uploading photos or calling AddItem.
-    // Uses the Taxonomy API (getItemAspectsForCategory) for the known category. If any required
-    // aspect is missing/empty in item_specifics, block with a clear, actionable error. Never
-    // crashes — if the lookup fails or no category is known yet, proceed normally.
+    // Resolve required item specifics BEFORE uploading photos or calling AddItem. Uses the Taxonomy
+    // API (getItemAspectsForCategory) for the known category — the authoritative, live required-aspect
+    // list. Any aspect still missing/empty is now AUTO-FILLED (known-model knowledge, then a generic
+    // fallback — see autoFillRequiredSpecifics) instead of blocking the listing: a missing Screen Size
+    // or Processor should never be the reason SKU 2649-style items can't be published.
     var _gateCat = record.ebay_category_id
       || (record.meta && record.meta.identified_item && record.meta.identified_item.ebay_category_id)
       || (record.listing && record.listing.category_id)
@@ -6083,20 +6206,16 @@ function createEbayListing(sku, callback){
           Object.keys(isObj).forEach(function(k){ var v = isObj[k]; var has = Array.isArray(v) ? v.join('').trim() : String(v == null ? '' : v).trim(); if(has) present[String(k).toLowerCase()] = true; });
           var missing = requiredAspects.filter(function(name){ return !present[String(name).toLowerCase()]; });
           if(missing.length){
-            console.log('[EBAY] SKU ' + sku + ' blocked — missing required specifics: ' + missing.join(', '));
-            // Persist the flag so the listings page can highlight the missing fields for editing.
-            record.needs_specifics_review = true; record.missing_specifics = missing;
-            try { fs.writeFileSync(listingPath, JSON.stringify(record, null, 2)); } catch(_w){}
-            callback(null, { blocked_specifics: true, success: false, missing_specifics: missing, needs_specifics_review: true,
-              error: 'Required item specifics missing: ' + missing.join(', ') + '. Edit this listing to add these before posting.' });
-            return;
+            console.log('[EBAY] SKU ' + sku + ' auto-filling missing required specifics: ' + missing.join(', '));
+            record.listing.item_specifics = isObj;
+            autoFillRequiredSpecifics(isObj, missing, { model: isObj.Model, isLot: (record.quantity > 1) || !!(record.listing && record.listing.is_lot) });
           }
         }
-        // all required present — clear any prior review flag so the red highlight goes away
+        // clear any prior review flag now that every required aspect has a value one way or another
         if(record.needs_specifics_review || (record.missing_specifics && record.missing_specifics.length)){
           record.needs_specifics_review = false; record.missing_specifics = [];
-          try { fs.writeFileSync(listingPath, JSON.stringify(record, null, 2)); } catch(_w){}
         }
+        try { fs.writeFileSync(listingPath, JSON.stringify(record, null, 2)); } catch(_w){}
         proceedCreate(token);
       });
     } else {
@@ -6291,26 +6410,32 @@ function createEbayListing(sku, callback){
           }
         } catch(e){}
         console.log('[EBAY] category resolved for SKU', sku, '->', catId, '(' + catName + ') | leaf | conditions', (conditions||[]).join(',') || 'n/a', '| using condition', forcedCondition);
-        // Required item specifics for this category -> add any missing with "Not Specified"
+        // Required item specifics for this category -> auto-fill any missing ones (known-model
+        // knowledge first, then a generic fallback — never a blind "Not Specified" that could
+        // itself be a wrong/unhelpful value for a spec-shaped field).
+        var _lotCtx = { isLot: (record.quantity > 1) || !!(record.listing && record.listing.is_lot) };
         getCategorySpecifics(catId, token, function(spErr, specs){
           if(!spErr && specs){
             record.ebay_required_specifics = specs.required;
             var is = record.listing.item_specifics = record.listing.item_specifics || {};
-            var have = Object.keys(is).map(function(k){ return k.toLowerCase(); });
-            specs.required.forEach(function(name){
-              if(have.indexOf(String(name).toLowerCase()) < 0){ is[name] = 'Not Specified'; }
-            });
-            if(specs.required.length) console.log('[EBAY] category', catId, 'required specifics:', specs.required.join(', '));
+            if(specs.required && specs.required.length){
+              autoFillRequiredSpecifics(is, specs.required, { model: is.Model, isLot: _lotCtx.isLot });
+              console.log('[EBAY] category', catId, 'required specifics:', specs.required.join(', '));
+            }
           }
           try { fs.writeFileSync(listingPath, JSON.stringify(record, null, 2)); } catch(_e){}
-          // FIX 2: verify the category's required aspects (Taxonomy API) are present in
-          // item_specifics. Warn only — never block; eBay returns a specific error if truly required.
+          // FIX 2: cross-check the category's required aspects (Taxonomy API) too — a second,
+          // independent source may name a field GetCategorySpecifics didn't. Auto-fill those as well.
           getItemAspectsForCategory(catId, token, function(_aErr, requiredAspects){
             if(requiredAspects && requiredAspects.length){
               var isObj = record.listing.item_specifics || {};
               var haveKeys = Object.keys(isObj).map(function(k){ return String(k).toLowerCase(); });
               var missing = requiredAspects.filter(function(name){ return haveKeys.indexOf(String(name).toLowerCase()) < 0; });
-              if(missing.length){ console.log('[EBAY] SKU', sku, 'missing aspects:', missing.join(', ')); }
+              if(missing.length){
+                autoFillRequiredSpecifics(isObj, missing, { model: isObj.Model, isLot: _lotCtx.isLot });
+                console.log('[EBAY] SKU', sku, 'auto-filled aspects from Taxonomy cross-check:', missing.join(', '));
+                try { fs.writeFileSync(listingPath, JSON.stringify(record, null, 2)); } catch(_e2){}
+              }
             }
             attempt();
           });
