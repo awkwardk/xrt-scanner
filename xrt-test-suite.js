@@ -761,11 +761,11 @@ test('regen reloads card to show new verdict', has('(reloading)'));
 
 section('VOICE INTAKE (additive)');
 test('mic button on processor',        has("id='vMicBtn'") && has('toggleVoiceMic'));
-test('Web Speech API used',            has('window.SpeechRecognition||window.webkitSpeechRecognition'));
+test('MediaRecorder API used',         has('navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true}})') && has('new MediaRecorder('));
 test('voice intake screen',            has("id='voiceScreen'") && has('startVoiceIntake'));
 test('home entry point',               has('Voice Intake'));
 test('transcript + shelf + photos UI', has("id='vTranscript'") && has("id='vShelf'") && has("id='vPhotoInput'"));
-test('unsupported browser handled',    has('Voice not supported on this browser'));
+test('unsupported browser handled',    has('Recording not supported on this browser'));
 test('fast-submit endpoint',           has("req.url==='/api/fast-submit'"));
 test('fast-submit writes listing.json',has("path.join(itemDir, 'listing.json')") && has('buildVoiceListingRecord('));
 test('fast-submit saves photos',       has("'photo_' + (i+1) + '.jpg'"));
@@ -852,28 +852,42 @@ test('voice never re-implements ship', has('shippingPolicyName(tier.shippingPoli
 })();
 
 
-section('VOICE RECORDING (stutter / cutoff / mic states)');
+section('VOICE RECORDING (MediaRecorder + server-side Gemini transcription)');
 test('tracks explicit recording intent', has('var voiceIsRecording=false;'));
-test('interimResults disabled',          has('r.interimResults=false;'));
-test('continuous listening kept',        has('r.continuous=true;'));
-test('accumulates across sessions',      has("var voiceFinal='';"));
-test('onresult scans all results',       has('for(var i=0;i<event.results.length;i++)') && has('if(event.results[i].isFinal){'));
-test('no resultIndex delta tracking',    !has('ev.resultIndex') && !has('voiceCommitted'));
-test('android isFinal-inconsistency fix',has('if(!text.trim()&&event.results.length>0){') && has('text=event.results[event.results.length-1][0].transcript;'));
-test('textarea set from reconstructed text', has("textarea.value=(voiceFinal+' '+text)"));
-test('auto-restart when not stopped',    has('if(voiceIsRecording){voiceRestarts++;') && has('voiceRec=voiceCreateRecognition();voiceRec.start();'));
-test('restart preserves prior text',     has("voiceFinal=((ta&&ta.value)?ta.value:voiceFinal).replace(/\\\\s+/g,' ').trim();"));
-test('restart calls start() again',      has('voiceRec=voiceCreateRecognition();voiceRec.start();'));
-test('restart storm guarded',            has('if(voiceRestarts>60)'));
-test('explicit stop halts listening',    has('if(voiceIsRecording){voiceIsRecording=false;try{voiceRec.stop();}catch(e){}'));
+test('mic + noise-suppression requested', has('echoCancellation:true,noiseSuppression:true'));
+test('feature-detect gate before recording', has('if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia||!window.MediaRecorder){voiceStatus(\'Recording not supported on this browser'));
+test('prefers audio/webm, falls back to audio/mp4', has("if(MediaRecorder.isTypeSupported('audio/webm'))mimeType='audio/webm';else if(MediaRecorder.isTypeSupported('audio/mp4'))mimeType='audio/mp4';"));
+test('recording timer updates status text', has('function voiceSetRecordTimer(){') && has("voiceStatus('Recording... '+m+':'"));
+test('audio posted to /api/voice/transcribe', has("fetch('/api/voice/transcribe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({audio:b64,mime_type:mt})})"));
+test('transcript inserted into vTranscript textarea', has('if(d&&d.success&&d.transcript){var ta=document.getElementById(\'vTranscript\');'));
+test('transcription failure never blocks manual entry', has("voiceStatus((d&&d.error?d.error:'Transcription failed')+' - type the description instead');") && has("voiceStatus('Network error transcribing - type the description instead');"));
+test('microphone tracks always stopped', has('function voiceStopStream(){try{if(voiceMediaStream){voiceMediaStream.getTracks().forEach(function(t){t.stop();});voiceMediaStream=null;}}catch(e){}}'));
 test('mic UI has two states',            has('function voiceSetMicUI(rec)') && has("mb.className='vmic-rec'") && has("mb.className='vmic-idle'"));
 test('stop label while recording',       has("mb.innerHTML='&#9209; Stop Recording'"));
 test('pulsing red recording style',      has('.vmic-rec{') && has('@keyframes vpulse'));
-test('permission denial stops cleanly',  has("err==='not-allowed'") && has('voiceBlocked=true'));
-test('whitespace regex not mangled',     has('.replace(/\\\\s+/g,\' \')') && !has('.replace(/s+/g,'));
+test('getUserMedia permission denial handled', has("voiceStatus('Microphone blocked - allow mic access, then try again');"));
+test('submitVoiceIntake stops an in-progress recording', has('if(voiceIsRecording){voiceIsRecording=false;if(voiceRecordTimerId){clearInterval(voiceRecordTimerId);voiceRecordTimerId=null;}try{if(voiceMediaRecorder&&voiceMediaRecorder.state!==\'inactive\')voiceMediaRecorder.stop();}catch(e){}voiceStopStream();voiceSetMicUI(false);}var skuField='));
+test('no leftover webkitSpeechRecognition dictation code', !has('function voiceCreateRecognition(') && !has('window.webkitSpeechRecognition'));
 
-// ── functional: drive the real client code through a simulated SpeechRecognition lifecycle ──
+// ── functional: drive the real client code through a simulated MediaRecorder lifecycle ──
 (function(){
+  // Minimal synchronous thenable — the whole suite runs synchronously (no await), so getUserMedia()/
+  // fetch() resolve/reject immediately when .then()/.catch() is called, instead of via the real
+  // microtask queue. Correctly propagates rejection through a .then() with no onReject, same as a
+  // real Promise, so .catch() further down the chain still receives it.
+  function fakePromise(state, value){
+    return {
+      then: function(onFulfill, onReject){
+        if(state === 'fulfilled'){
+          if(onFulfill){ try { var r = onFulfill(value); return (r && typeof r.then === 'function') ? r : fakePromise('fulfilled', r); } catch(e){ return fakePromise('rejected', e); } }
+          return fakePromise('fulfilled', value);
+        }
+        if(onReject){ try { var r2 = onReject(value); return (r2 && typeof r2.then === 'function') ? r2 : fakePromise('fulfilled', r2); } catch(e2){ return fakePromise('rejected', e2); } }
+        return fakePromise('rejected', value);
+      },
+      catch: function(onReject){ return this.then(undefined, onReject); }
+    };
+  }
   try {
     var k = 'PROCESSOR_HTML = "';
     var st = content.indexOf(k) + k.length - 1;
@@ -886,68 +900,179 @@ test('whitespace regex not mangled',     has('.replace(/\\\\s+/g,\' \')') && !ha
     function stub(id){ return { id:id, value:'', textContent:'', innerHTML:'', className:'', disabled:false, style:{}, classList:{add:function(){},remove:function(){},toggle:function(){}}, appendChild:function(){}, addEventListener:function(){}, focus:function(){} }; }
     ['vTranscript','vShelf','vThumbs','vErr','vMicStatus','vMicBtn','vSubmitBtn'].forEach(function(id){ els[id] = stub(id); });
     var timers = [];
+    var stoppedTracks = 0;
+    var gumMode = 'ok'; // 'ok' | 'deny'
+    var fetchMode = 'ok'; // 'ok' | 'apifail' | 'network'
+    function fakeStream(){ return { getTracks: function(){ return [{ stop: function(){ stoppedTracks++; } }]; } }; }
+    function FakeMediaRecorder(stream, opts){ liveRecorder = this; this.state = 'inactive'; this.mimeType = (opts && opts.mimeType) || ''; this.stream = stream; }
+    FakeMediaRecorder.prototype.start = function(){ this.state = 'recording'; };
+    FakeMediaRecorder.prototype.stop = function(){ this.state = 'inactive'; if(this.onstop) this.onstop(); };
+    FakeMediaRecorder.isTypeSupported = function(t){ return t === 'audio/webm'; };
+    function FakeFileReader(){}
+    FakeFileReader.prototype.readAsDataURL = function(blob){ this.result = 'data:audio/webm;base64,ZmFrZWF1ZGlv'; if(this.onload) this.onload(); };
+    var liveRecorder = null;
+
     var sandbox = {
       document: { getElementById:function(id){ return els[id] || stub(id); }, querySelectorAll:function(){ return []; }, addEventListener:function(){}, createElement:function(){ return stub('x'); }, body:{appendChild:function(){},removeChild:function(){}} },
-      window: { addEventListener:function(){}, removeEventListener:function(){} },
+      window: { addEventListener:function(){}, removeEventListener:function(){}, MediaRecorder: FakeMediaRecorder },
       alert:function(){}, setTimeout:function(fn){ timers.push(fn); return timers.length; }, clearTimeout:function(){}, setInterval:function(){ return 0; },
-      FileReader:function(){}, localStorage:{ getItem:function(){ return null; }, setItem:function(){}, removeItem:function(){} },
-      navigator:{ mediaDevices:{ getUserMedia:function(){ return new Promise(function(){}); } } },
+      FileReader: FakeFileReader, localStorage:{ getItem:function(){ return null; }, setItem:function(){}, removeItem:function(){} },
+      navigator:{ mediaDevices:{ getUserMedia:function(){ return gumMode === 'deny' ? fakePromise('rejected', new Error('Permission denied')) : fakePromise('fulfilled', fakeStream()); } } },
       AudioContext:function(){ return { createBuffer:function(){ return {getChannelData:function(){ return []; }}; }, createBufferSource:function(){ return {connect:function(){},start:function(){}}; }, createGain:function(){ return {connect:function(){},gain:{}}; }, destination:{}, sampleRate:44100, close:function(){} }; },
-      screen:{ orientation:{angle:0} }, fetch:function(){ return new Promise(function(){}); }
+      screen:{ orientation:{angle:0} },
+      fetch:function(){
+        if(fetchMode === 'network') return fakePromise('rejected', new Error('network down'));
+        var body = fetchMode === 'apifail' ? {success:false, error:'Transcription failed'} : {success:true, transcript:'Dell Latitude E5470 grade B powers on'};
+        return fakePromise('fulfilled', { json: function(){ return fakePromise('fulfilled', body); } });
+      }
     };
-    var live = null, startCalls = 0;
-    function FakeSR(){ live = this; }
-    FakeSR.prototype.start = function(){ startCalls++; if(this.onstart) this.onstart(); };
-    FakeSR.prototype.stop = function(){ if(this.onend) this.onend(); };
-    FakeSR.prototype.abort = function(){};
-    sandbox.window.SpeechRecognition = FakeSR;
 
-    var runner = new Function('document','window','alert','setTimeout','clearTimeout','setInterval','FileReader','localStorage','navigator','AudioContext','screen','fetch',
+    var runner = new Function('document','window','alert','setTimeout','clearTimeout','setInterval','FileReader','localStorage','navigator','AudioContext','screen','fetch','MediaRecorder',
       script + '\nreturn { start:startVoiceIntake, toggle:toggleVoiceMic, rec:function(){ return voiceIsRecording; } };');
     var api = runner(sandbox.document, sandbox.window, sandbox.alert, sandbox.setTimeout, sandbox.clearTimeout, sandbox.setInterval,
-      sandbox.FileReader, sandbox.localStorage, sandbox.navigator, sandbox.AudioContext, sandbox.screen, sandbox.fetch);
+      sandbox.FileReader, sandbox.localStorage, sandbox.navigator, sandbox.AudioContext, sandbox.screen, sandbox.fetch, sandbox.window.MediaRecorder);
 
-    function res(list){ var r = list.map(function(x){ return { isFinal:x.f, 0:{ transcript:x.t } }; }); r.length = list.length; return r; }
-    function fire(idx, list){ live.onresult({ resultIndex:idx, results:res(list) }); }
-    function flush(){ timers.splice(0).forEach(function(f){ f(); }); }
     var T = function(){ return els.vTranscript.value; };
+    // Real MediaRecorder delivers actual audio Blob chunks to ondataavailable while recording;
+    // simulate that with Node's real global Blob so the >=800-byte "too short" guard is satisfied.
+    function feedFakeAudioChunk(){ if(liveRecorder && liveRecorder.ondataavailable) liveRecorder.ondataavailable({ data: new Blob(['x'.repeat(2000)]) }); }
 
+    // ── start -> getUserMedia resolves -> MediaRecorder created + started ──
     api.start(); api.toggle();
-    test('(rec) enters recording state',  api.rec() === true && els.vMicBtn.className === 'vmic-rec');
+    test('(rec) enters recording state on mic tap', api.rec() === true && els.vMicBtn.className === 'vmic-rec');
+    test('(rec) MediaRecorder actually started',     liveRecorder && liveRecorder.state === 'recording');
+    test('(rec) prefers audio/webm mimeType',         liveRecorder && liveRecorder.mimeType === 'audio/webm');
 
-    fire(0,[{t:'Dell',f:false}]);
-    fire(0,[{t:'Dell Latitude E5470',f:false}]);
-    test('(rec) interim shown live',      T() === 'Dell Latitude E5470');
-    fire(0,[{t:'Dell Latitude E5470',f:true}]);
-    fire(0,[{t:'Dell Latitude E5470',f:true}]);
-    test('(rec) no stutter on re-report', (T().match(/Latitude/g) || []).length === 1);
+    // ── stop -> onstop fires -> Blob built -> FileReader -> POST /api/voice/transcribe -> textarea filled ──
+    feedFakeAudioChunk();
+    api.toggle();
+    test('(rec) explicit stop ends recording state', api.rec() === false);
+    test('(rec) button returns to idle',             els.vMicBtn.className === 'vmic-idle');
+    test('(rec) mic tracks stopped on stop',          stoppedTracks >= 1);
+    test('(rec) transcript inserted after transcription', T() === 'Dell Latitude E5470 grade B powers on');
+    test('(rec) status shows transcribed message',    els.vMicStatus.textContent === 'Transcribed - review and edit below');
 
-    fire(1,[{t:'Dell Latitude E5470',f:true},{t:' powers on includes charger',f:true}]);
-    test('(rec) letters not eaten',       /powers on includes charger/.test(T()));
-    test('(rec) no double spacing',       !/  /.test(T()));
+    // ── second recording appends rather than overwrites ──
+    api.toggle(); feedFakeAudioChunk(); api.toggle();
+    test('(rec) second recording appends, does not overwrite', T() === 'Dell Latitude E5470 grade B powers on Dell Latitude E5470 grade B powers on');
 
-    var kept = T(), sb = startCalls;
-    live.onend(); flush();
-    test('(rec) auto-restarts on cutoff', startCalls > sb && api.rec() === true);
-    test('(rec) transcript survives',     T() === kept);
+    // ── transcription API returns success:false -> manual editing never blocked ──
+    els.vTranscript.value = 'operator typed this by hand';
+    fetchMode = 'apifail';
+    api.toggle(); feedFakeAudioChunk(); api.toggle();
+    test('(rec) API failure leaves manually-typed text untouched', T() === 'operator typed this by hand');
+    test('(rec) API failure message tells operator to type instead', /Transcription failed - type the description instead/.test(els.vMicStatus.textContent));
 
-    fire(0,[{t:'4 pounds 8 ounces',f:true}]);
-    test('(rec) appends after restart',   /E5470/.test(T()) && /4 pounds 8 ounces/.test(T()));
+    // ── network error talking to /api/voice/transcribe -> same graceful fallback ──
+    fetchMode = 'network';
+    api.toggle(); feedFakeAudioChunk(); api.toggle();
+    test('(rec) network error message tells operator to type instead', /Network error transcribing - type the description instead/.test(els.vMicStatus.textContent));
+    test('(rec) network error leaves prior text untouched', T() === 'operator typed this by hand');
+    fetchMode = 'ok';
 
-    var sb2 = startCalls;
-    api.toggle(); flush();
-    test('(rec) explicit stop ends it',   api.rec() === false && startCalls === sb2);
-    test('(rec) button returns to idle',  els.vMicBtn.className === 'vmic-idle');
+    // ── getUserMedia permission denial -> clean recovery, no crash ──
+    gumMode = 'deny';
+    api.toggle();
+    test('(rec) mic denial does not enter recording state', api.rec() === false);
+    test('(rec) mic denial message shown',                  els.vMicStatus.textContent === 'Microphone blocked - allow mic access, then try again');
+    gumMode = 'ok';
 
-    api.toggle(); live.onerror({ error:'not-allowed' }); live.onend(); flush();
-    test('(rec) mic denial no loop',      api.rec() === false && timers.length === 0);
-    test('(rec) denial message kept',     /Microphone blocked/.test(els.vMicStatus.textContent));
-
-    api.start(); els.vTranscript.value = 'typed by hand'; api.toggle(); fire(0,[{t:'and spoken',f:true}]);
-    test('(rec) typed text preserved',    T() === 'typed by hand and spoken');
+    // ── no MediaRecorder support at all -> graceful message, never throws ──
+    var noMR = new Function('document','window','alert','setTimeout','clearTimeout','setInterval','FileReader','localStorage','navigator','AudioContext','screen','fetch','MediaRecorder',
+      script + '\nreturn { start:startVoiceIntake, toggle:toggleVoiceMic, rec:function(){ return voiceIsRecording; } };')(
+      sandbox.document, { addEventListener:function(){}, removeEventListener:function(){} }, sandbox.alert, sandbox.setTimeout, sandbox.clearTimeout, sandbox.setInterval,
+      sandbox.FileReader, sandbox.localStorage, sandbox.navigator, sandbox.AudioContext, sandbox.screen, sandbox.fetch, undefined);
+    noMR.start(); noMR.toggle();
+    test('(rec) unsupported browser never throws, stays idle', noMR.rec() === false && els.vMicStatus.textContent === 'Recording not supported on this browser - type the description instead');
   } catch(e){
     test('voice recording functional eval', false);
     console.log('    ERROR:', e.message);
+  }
+})();
+
+section('VOICE AUDIO TRANSCRIPTION (/api/voice/transcribe backend)');
+test('route exists',                          has("req.url==='/api/voice/transcribe'"));
+test('route requires an audio field',          has("var audioB64 = String(parsed.audio || '').trim();") && has("if(!audioB64){ sendJSON(res,400,{success:false, error:'No audio provided'}); return; }"));
+test('route degrades gracefully with no OPENROUTER_KEY', has("if(!OPENROUTER_KEY){ sendJSON(res,200,{success:false, error:'Transcription unavailable — type the description instead'}); return; }"));
+test('route never throws — wrapped in try/catch', has("console.log('[VOICE-TRANSCRIBE] error: ' + e.message);") && has("sendJSON(res,200,{success:false, error:'Server error — type the description instead'});"));
+test('transcription failure returns 200, not an HTTP error (never blocks submission)', has("sendJSON(res,200,{success:false, error:'Transcription failed — type the description instead'});"));
+test('success response matches { success: true, transcript }', has('sendJSON(res,200,{success:true, transcript:transcript});'));
+test('transcribeVoiceAudio uses google/gemini-2.5-flash', has('function transcribeVoiceAudio(base64Audio, mimeType, callback){') && has("model: 'google/gemini-2.5-flash',"));
+test('system instruction matches spec exactly', has('You are an expert audio transcriber for an electronics and merchandise reselling warehouse. Accurately transcribe the spoken audio verbatim. Pay special attention to quiet speech, alphanumeric model numbers (e.g., P4T, DSi, UTL-001), dimensions (e.g., 14x10x6), testing notes, and cosmetic flaw descriptions. Output ONLY the clean transcribed text without markdown formatting or commentary.'));
+test('audio sent as an input_audio content block', has("{ type: 'input_audio', input_audio: { data: base64Audio, format: fmt } }"));
+
+// ── functional: transcribeVoiceAudio's real format-detection + response parsing, stubbed HTTP ──
+// Mirrors the "TAXONOMY RESPONSE PARSING" pattern above: stub https.request (not callOpenRouter or
+// transcribeVoiceAudio themselves), so this exercises the actual mime-type -> format mapping and
+// OpenRouter response parsing code with mock audio buffers.
+(function(){
+  function ex(n){
+    var s2 = content.indexOf('function ' + n + '(');
+    if (s2 < 0) return '';
+    var d = 0, seen = false, e = -1;
+    for (var i = s2; i < content.length; i++) { var c = content[i]; if (c === '{') { d++; seen = true; } else if (c === '}') { d--; if (seen && d === 0) { e = i + 1; break; } } }
+    return content.slice(s2, e);
+  }
+  var https = require('https');
+  var realRequest = https.request;
+  // The response callback must fire from end() (after write()), matching real Node — callOpenRouter
+  // does https.request(opts, cb) THEN req.write(body) THEN req.end(); firing cb synchronously inside
+  // https.request() itself would run the whole response chain before write() ever captured the body.
+  function mockHttps(statusCode, bodyObj){
+    https.request = function(options, cb){
+      var body = JSON.stringify(bodyObj);
+      return { on: function(){}, write: function(){}, end: function(){
+        var res = { statusCode: statusCode, on: function(evt, handler){ if(evt === 'data') handler(body); else if(evt === 'end') handler(); } };
+        cb(res);
+      } };
+    };
+  }
+  try {
+    var box = {};
+    var code = "var OPENROUTER_KEY = 'test-key';\n" + ex('callOpenRouter') + '\n' + ex('transcribeVoiceAudio') + '\nbox.transcribe = transcribeVoiceAudio;';
+    var _log = console.log; console.log = function(){};
+    eval(code);
+    console.log = _log;
+    var TR = box.transcribe;
+
+    var mockAudioB64 = Buffer.from('fake webm audio bytes for a mock recording').toString('base64');
+
+    // Mock captures the written request body too, so we can verify the mock audio buffer and the
+    // detected format token actually landed in the outgoing OpenRouter request.
+    var sentBody = null;
+    https.request = function(options, cb){
+      return { on: function(){}, write: function(w){ sentBody = w; }, end: function(){
+        var res = { statusCode: 200, on: function(evt, handler){ if(evt === 'data') handler(JSON.stringify({ choices: [ { message: { content: 'Dell Latitude E5470 laptop grade B powers on' } } ] })); else if(evt === 'end') handler(); } };
+        cb(res);
+      } };
+    };
+    TR(mockAudioB64, 'audio/webm;codecs=opus', function(err, transcript){
+      test('(transcribe) parses OpenRouter response into transcript text', !err && transcript === 'Dell Latitude E5470 laptop grade B powers on');
+      test('(transcribe) mock audio buffer sent as base64 in the request body', !!sentBody && sentBody.indexOf(mockAudioB64) >= 0);
+      test('(transcribe) audio/webm;codecs=opus maps to format "webm"', !!sentBody && sentBody.indexOf('"format":"webm"') >= 0);
+    });
+
+    mockHttps(200, { choices: [ { message: { content: '```\nZebra P4T label printer\n```' } } ] });
+    TR(mockAudioB64, 'audio/wav', function(err, transcript){
+      test('(transcribe) strips markdown code fences from the response', !err && transcript === 'Zebra P4T label printer');
+    });
+    https.request = function(options, cb){ return { on:function(){}, write:function(w){ sentBody = w; }, end:function(){ var res = { statusCode: 200, on: function(evt, handler){ if(evt === 'data') handler(JSON.stringify({ choices: [ { message: { content: 'x' } } ] })); else if(evt === 'end') handler(); } }; cb(res); } }; };
+    TR(mockAudioB64, 'audio/mp4', function(){ test('(transcribe) audio/mp4 maps to format "mp4"', !!sentBody && sentBody.indexOf('"format":"mp4"') >= 0); });
+
+    mockHttps(500, { error: 'server error' });
+    TR(mockAudioB64, 'audio/webm', function(err, transcript){
+      test('(transcribe) OpenRouter failure/empty response surfaces as an error, not a crash', !!err && !transcript);
+    });
+
+    mockHttps(200, { choices: [] });
+    TR(mockAudioB64, 'audio/webm', function(err, transcript){
+      test('(transcribe) empty choices array surfaces as an error, not a crash', !!err && !transcript);
+    });
+  } catch(e){
+    test('transcribeVoiceAudio functional eval', false);
+    console.log('    ERROR:', e.message);
+  } finally {
+    https.request = realRequest;
   }
 })();
 
