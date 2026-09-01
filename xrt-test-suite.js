@@ -981,6 +981,7 @@ test('reset re-peeks SKU + clears fields', has('function voiceResetFields(){voic
 
 // ── fix 2: photo order + reorder controls ──
 test('addVoicePhotos reads sequentially', has('function addVoicePhotos(input){') && has('function next(){') && !has('files.forEach(function(file)'));
+test('gallery selection auto-reversed on upload', has('for(var i=0;i<files.length;i++)arr.push(files[i]);arr.reverse();var idx=0;'));
 test('one FileReader in flight at a time', has('idx>=arr.length'));
 test('client-side compression to canvas', has('function voiceCompressImage(dataUrl,cb)') && has("canvas.toDataURL('image/jpeg',0.85)"));
 test('compression capped at 1600px',      has('voiceScaleDims(img.width,img.height,1600)'));
@@ -988,6 +989,9 @@ test('compression failure falls back',    has('}catch(e){cb(null);}};') && has('
 test('voiceScaleDims pure helper',        has('function voiceScaleDims(w,h,max){'));
 test('reverse button wired',              has("id='vReverseBtn'") && has('voiceReversePhotos()'));
 test('reverse function',                  has('function voiceReversePhotos(){voicePhotos.reverse();'));
+test('mobile reverse button is a prominent button, not a tiny link', has("id='vReverseBtn' onclick='voiceReversePhotos()' style='display:inline-block;padding:8px 16px;border:2px solid var(--accent);border-radius:8px;") && has('&#8646; REVERSE PHOTO ORDER</span>'));
+test('desktop /api/listings card has a prominent Reverse button above the photo strip', has('&#8646; REVERSE PHOTO ORDER</button>') && has('function reverseCardPhotoOrder(sku,btn){'));
+test('reverseCardPhotoOrder reverses thumbs then persists via savePhotoOrder', has('thumbs.reverse().forEach(function(t){strip.appendChild(t);});') && has('savePhotoOrder(sku,order,strip);'));
 test('per-thumb shift buttons',           has('function voiceShiftPhoto(idx,dir)') && has("lb.onclick=function(){voiceShiftPhoto(idx,-1);};") && has("rb.onclick=function(){voiceShiftPhoto(idx,1);};"));
 test('shift buttons disabled at ends',    has('lb.disabled=(idx===0);') && has('rb.disabled=(idx===voicePhotos.length-1);'));
 test('thumbnails show position number',   has('num.textContent=String(idx+1);'));
@@ -1098,7 +1102,7 @@ test('Box: badge prefers selected_box (/api/listings page)', has("(listing.selec
     // Worked example from spec: 22x13x15 resized to 22x13x12. Weight 150oz (96<150<=240 -> tare +16, buffer 2in).
     // item 20 x 9 x 9.5 -> padded 22 x 11 x 11.5 -> smallest fitting stock box is 22x13x15 -> cut to 22x13x12.
     var cut = B(150, { item_length: 20, item_width: 9, item_height: 9.5 });
-    test('(box) height cut-down matches the spec worked example', cut && cut.box_name === '22x13x15 (cut to 22x13x12)' && cut.length === 22 && cut.width === 13 && cut.height === 12);
+    test('(box) height cut-down matches the spec worked example', cut && cut.box_name === '22x13x12 (from 22x13x15)' && cut.length === 22 && cut.width === 13 && cut.height === 12);
     test('(box) medium-box tare is +16oz',                        cut && cut.added_weight_oz === 16);
 
     // Heavy item (> 240oz -> 3in buffer, +32oz tare). item 22x16x11 -> padded 25x19x14 -> fits 26x16x15? no
@@ -1110,7 +1114,7 @@ test('Box: badge prefers selected_box (/api/listings page)', has("(listing.selec
     // Seller spoke length as the SHORTER side (item_length 9 < item_width 13) — selectBestBox must
     // still sort padded L>=W before matching, not just take the spoken order at face value.
     var swapped = B(50, { item_length: 9, item_width: 13, item_height: 4 });
-    test('(box) spoken L/W order does not matter — still resolves correctly', swapped && swapped.box_name === '15x12x10 (cut to 15x12x6)' && swapped.length === 15 && swapped.width === 12);
+    test('(box) spoken L/W order does not matter — still resolves correctly', swapped && swapped.box_name === '15x12x6 (from 15x12x10)' && swapped.length === 15 && swapped.width === 12);
 
     // Too large for every stock box -> null, caller falls back to calculateShippingTier's box.
     test('(box) nothing fits -> null, never throws', B(500, { item_length: 40, item_width: 30, item_height: 30 }) === null);
@@ -1176,6 +1180,22 @@ section('VOICE INTAKE -> ADDITEM BUILDER (pre-flight simulation)');
     test('(zebra) custom SKU matches [SKU]-[SHELF]',        zXml.indexOf('<SKU>601-A3</SKU>') >= 0 && zRecord.listing.custom_sku === '601-A3');
     test('(zebra) scale photo stripped from listing images', zRecord.outputPhotos.indexOf('photo_4') < 0 && zRecord.outputPhotos.length === 3 && zXml.indexOf('photo_4') < 0);
     test('(zebra) three non-scale photos uploaded',         (zXml.match(/<PictureURL>/g) || []).length === 3);
+
+    // ── Same Zebra printer, but the seller SPOKE dimensions that trigger a height cut-down —
+    // proves package_height/box_dimensions/selected_box and the real AddItem XML all use the
+    // CUT-DOWN height (12), never the stock box height (15), end to end.
+    var zTierCut = box.tier(9, 6, 604); // 150oz total
+    var zVisionCut = { item_name: 'Zebra P4T Direct Thermal Label Printer', brand: 'Zebra', model: 'P4T', category: 'Label Printers', includes: 'AC power adapter', condition_notes: 'light scuffing on case', item_length: 20, item_width: 9, item_height: 9.5 };
+    var zRecordCut = box.assemble('604', 'A3', 4, 'zebra p forty printer 20 by 9 by 9.5 grade B powers on prints test label', zPvHints, { lbs: 9, oz: 6 }, 4, false, zTierCut, zVisionCut, zAiData);
+    zRecordCut.listing.category_id = 175677; zRecordCut.listing.primary_category_id = 175677;
+    var zXmlCut = box.buildXml(zRecordCut, { categoryId: zRecordCut.listing.category_id, pictureUrls: simulatePictureUrls(zRecordCut), conditionId: null, policies: null });
+
+    test('(zebra cut-down) package_height is the cut-down height, not stock', zRecordCut.listing.package_height === 12);
+    test('(zebra cut-down) package_length/width match the stock box footprint', zRecordCut.listing.package_length === 22 && zRecordCut.listing.package_width === 13);
+    test('(zebra cut-down) selected_box leads with cut-down dims',   zRecordCut.listing.selected_box === '22x13x12 (from 22x13x15)');
+    test('(zebra cut-down) box_dimensions is the clean cut-down triple', zRecordCut.listing.box_dimensions === '22x13x12');
+    test('(zebra cut-down) AddItem XML PackageDepth uses cut-down 12, never stock 15', zXmlCut.indexOf('<PackageDepth unit="inches">12</PackageDepth>') >= 0 && zXmlCut.indexOf('<PackageDepth unit="inches">15</PackageDepth>') < 0);
+    test('(zebra cut-down) AddItem XML PackageLength/Width match footprint', zXmlCut.indexOf('<PackageLength unit="inches">22</PackageLength>') >= 0 && zXmlCut.indexOf('<PackageWidth unit="inches">13</PackageWidth>') >= 0);
 
     // ── Nintendo Switch OLED console — saved=6 photos, photo_6 is the scale photo ──
     var nTier = box.tier(2, 4, 602);
