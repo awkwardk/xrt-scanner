@@ -233,9 +233,12 @@ function selectBestBox(rawWeightOz, itemDims){
   var iH = itemDims && parseFloat(itemDims.item_height);
   if(!(iL > 0) || !(iW > 0) || !(iH > 0)) return null; // nothing spoken — caller falls back
 
-  // Padding Buffer: 2in on every side up to 15lb (240oz), 3in above that.
-  var bufferIn = rawWeightOz <= 240 ? 2 : 3;
-  var padded = { l: iL + bufferIn, w: iW + bufferIn, h: iH + bufferIn };
+  // Padding Buffer, 6-SIDED: each dimension is bounded by TWO opposite faces (e.g. length has a
+  // front and a back), so the padding is added on both — 2in PER FACE up to 15lb (240oz), 3in per
+  // face above that, i.e. +4in total per dimension up to 15lb, +6in total per dimension above.
+  var bufferPerFace = rawWeightOz <= 240 ? 2 : 3;
+  var bufferTotal = bufferPerFace * 2;
+  var padded = { l: iL + bufferTotal, w: iW + bufferTotal, h: iH + bufferTotal };
   if(padded.w > padded.l){ var t = padded.l; padded.l = padded.w; padded.w = t; } // sort so L >= W
 
   function fits(box){
@@ -1860,20 +1863,27 @@ const server = http.createServer(function(req, res) {
         var shelf = String(parsed.shelf || '').trim();
         var photos = Array.isArray(parsed.photos) ? parsed.photos : [];
 
-        // FIX 3: honor a client-chosen Custom SKU (pre-populated from GET /api/next-sku, editable)
-        // UNLESS that number is already in use — never overwrite an existing item's listing.json.
-        // Accepting it also reserves it, so the shared counter never reissues the same number.
+        // Manual SKU override, instant lock & burn: honor a client-chosen Custom SKU (pre-populated
+        // from GET /api/next-sku, editable/pasteable — e.g. from an alternate sticker roll) UNLESS
+        // that number is already used or reserved. ROOT-CAUSE FIX: the old check only looked for
+        // listing.json specifically, so a folder that existed for any OTHER reason (photos already
+        // saved by an in-flight submission, a leftover/partial item with no listing.json yet) was
+        // invisible to it — a manual SKU matching that folder would silently write photos into
+        // someone else's item. Now checks whether the ITEM FOLDER exists at all, matching "already
+        // used or reserved in DATA_DIR/items/" literally. Accepting a SKU reserves it (bumps the
+        // shared counter past it) AND creates its folder in this same synchronous block — no async
+        // gap between the check and the lock, so no other request can claim the same number.
         var reqSku = parseInt(parsed.sku, 10);
         var sku;
-        if(reqSku && reqSku > 0 && !fs.existsSync(path.join(DATA_DIR, 'items', String(reqSku), 'listing.json'))){
+        if(reqSku && reqSku > 0 && !fs.existsSync(path.join(DATA_DIR, 'items', String(reqSku)))){
           sku = reqSku;
           reserveSkuAtLeast(sku);
         } else {
-          if(reqSku && reqSku > 0) console.log('[VOICE] requested SKU ' + reqSku + ' already in use — claiming next available instead');
+          if(reqSku && reqSku > 0) console.log('[VOICE] requested SKU ' + reqSku + ' already used or reserved — claiming next available instead');
           sku = getNextSku();
         }
 
-        var itemDir = path.join(DATA_DIR, 'items', String(sku));
+        var itemDir = path.join(DATA_DIR, 'items', String(sku)); // instant lock: create the folder now, synchronously, before any async work
         if(!fs.existsSync(itemDir)) fs.mkdirSync(itemDir, {recursive:true});
         var saved = 0;
         photos.forEach(function(b64, i){

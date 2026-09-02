@@ -1127,9 +1127,68 @@ test('prefilled from next-sku peek',      has("function voiceLoadNextSku(){fetch
 test('peek is non-claiming (GET)',        has("req.method==='GET' && req.url==='/api/next-sku'") && has('peekNextSku()'));
 test('manual override sent to server',    has('if(!isNaN(skuVal)&&skuVal>0)body.sku=skuVal;'));
 test('reserveSkuAtLeast keeps counter ahead', has('function reserveSkuAtLeast(n){') && has('if(n >= SKU_NEXT){ SKU_NEXT = n + 1; writeSkuFile(); }'));
-test('custom sku never overwrites existing item', has("!fs.existsSync(path.join(DATA_DIR, 'items', String(reqSku), 'listing.json'))"));
-test('collision falls back to auto-claim',   has("already in use — claiming next available instead"));
+test('custom sku never overwrites existing item', has("!fs.existsSync(path.join(DATA_DIR, 'items', String(reqSku)))"));
+test('collision check looks at the whole folder, not just listing.json (root-cause fix)', !has("!fs.existsSync(path.join(DATA_DIR, 'items', String(reqSku), 'listing.json'))"));
+test('collision falls back to auto-claim',   has("already used or reserved — claiming next available instead"));
+test('manual SKU folder locked in the same synchronous block (instant lock & burn)', has('// instant lock: create the folder now, synchronously, before any async work'));
 test('custom_sku combines as [SKU]-[SHELF]', has("custom_sku: String(sku) + (shelf ? '-' + shelf : '')"));
+
+// ── functional: manual SKU override registry logic — reservation, re-use prevention, custom_sku ──
+// Extracts the REAL getNextSku/peekNextSku/reserveSkuAtLeast from server.js and drives them through
+// the exact conditional /api/fast-submit uses to decide a SKU, with an in-memory set standing in for
+// fs.existsSync(DATA_DIR/items/<sku>) — proves the registry itself (not just the route's wiring).
+(function(){
+  function ex(n){
+    var s2 = content.indexOf('function ' + n + '(');
+    if (s2 < 0) return '';
+    var d = 0, seen = false, e = -1;
+    for (var i = s2; i < content.length; i++) { var c = content[i]; if (c === '{') { d++; seen = true; } else if (c === '}') { d--; if (seen && d === 0) { e = i + 1; break; } } }
+    return content.slice(s2, e);
+  }
+  try {
+    var box = {};
+    var code = 'var SKU_NEXT = 2000; var _writes = 0;\n'
+      + 'function writeSkuFile(){ _writes++; }\n' // stub — no real file I/O needed for this registry-logic test
+      + ex('getNextSku') + '\n' + ex('peekNextSku') + '\n' + ex('reserveSkuAtLeast') + '\n'
+      + 'box.getNext = getNextSku; box.peek = peekNextSku; box.reserve = reserveSkuAtLeast; box.setNext = function(n){ SKU_NEXT = n; }; box.writes = function(){ return _writes; };';
+    var _log = console.log; console.log = function(){};
+    eval(code);
+    console.log = _log;
+
+    // Mirrors /api/fast-submit's real SKU-decision conditional exactly (folder-existence check,
+    // not listing.json-specific), with usedFolders standing in for the filesystem.
+    var usedFolders = {};
+    function decideSku(reqSkuRaw){
+      var reqSku = parseInt(reqSkuRaw, 10);
+      var sku;
+      if(reqSku && reqSku > 0 && !usedFolders[reqSku]){ sku = reqSku; box.reserve(sku); }
+      else { sku = box.getNext(); }
+      usedFolders[sku] = true; // instant lock: folder created synchronously right after the decision
+      return sku;
+    }
+
+    box.setNext(2650);
+    // Manual SKU AHEAD of the current auto-counter (a new sticker roll started higher) must be
+    // honored AND must bump the shared counter past it, so auto-increment never re-reaches it later.
+    test('(sku) fresh manual SKU ahead of the counter is honored exactly as requested', decideSku(3000) === 3000);
+    test('(sku) manual SKU reserves the counter past it, never reissued by auto-increment', box.peek() === 3001);
+
+    var second = decideSku(3000); // same manual SKU submitted again
+    test('(sku) re-submitting the same manual SKU falls back to auto-claim, never re-issues it', second !== 3000 && second === 3001);
+    test('(sku) auto-claim still advances the shared counter normally', box.peek() === 3002);
+
+    var lower = decideSku(100); // a manual SKU below the current auto-counter (alternate sticker roll)
+    test('(sku) a manual SKU below the current auto-counter is still honored', lower === 100);
+    test('(sku) reserving a lower manual SKU never moves the counter backwards', box.peek() === 3002);
+
+    function customSku(sku, shelf){ return String(sku) + (shelf ? '-' + shelf : ''); }
+    test('(sku) custom_sku payload is [MANUAL_SKU]-[SHELF]', customSku(500, 'A3') === '500-A3');
+    test('(sku) custom_sku with no shelf omits the trailing dash', customSku(500, '') === '500');
+  } catch(e){
+    test('manual SKU override functional eval', false);
+    console.log('    ERROR:', e.message);
+  }
+})();
 
 // ── fix 4: error resilience ──
 test('network failure shows alert',       has("alert('Network error - your description and photos were kept. Try submitting again.');"));
@@ -1175,7 +1234,7 @@ test('POLY_MAILER_SPEC matches spec',   has("var POLY_MAILER_SPEC = { box_name: 
 test('STOCK_BOXES catalog matches spec', has('{ l: 12, w: 8,  h: 6  },') && has('{ l: 12, w: 10, h: 8  },') && has('{ l: 15, w: 12, h: 10 },') && has('{ l: 16, w: 12, h: 12 },') && has('{ l: 17, w: 11, h: 12 },') && has('{ l: 18, w: 18, h: 16 },') && has('{ l: 20, w: 16, h: 15 },') && has('{ l: 22, w: 13, h: 15 },') && has('{ l: 24, w: 18, h: 18 },') && has('{ l: 24, w: 20, h: 20 },') && has('{ l: 26, w: 16, h: 15 }'));
 test('selectBestBox exists',            has('function selectBestBox(rawWeightOz, itemDims){'));
 test('under-12oz returns Poly Mailer',  has('if(rawWeightOz > 0 && rawWeightOz < 12) return POLY_MAILER_SPEC;'));
-test('2in buffer <= 15lb, 3in above',   has("var bufferIn = rawWeightOz <= 240 ? 2 : 3;"));
+test('2in-per-face buffer <= 15lb, 3in-per-face above (6-sided: x2 total per dimension)', has("var bufferPerFace = rawWeightOz <= 240 ? 2 : 3;") && has('var bufferTotal = bufferPerFace * 2;'));
 test('padded dims sorted so L >= W',    has('if(padded.w > padded.l){ var t = padded.l; padded.l = padded.w; padded.w = t; }'));
 test('fit check tests both orientations', has('return (box.l >= padded.l && box.w >= padded.w) || (box.w >= padded.l && box.l >= padded.w);'));
 test('smallest fitting box chosen by volume', has('fitting.sort(function(a, b){ return (a.l * a.w * a.h) - (b.l * b.w * b.h); });'));
@@ -1219,27 +1278,35 @@ test('Box: badge prefers selected_box (/api/listings page)', has("(listing.selec
     test('(box) exactly 12oz is NOT poly mailer (boundary is exclusive)', B(12, null) === null);
     test('(box) no dims spoken -> null (caller falls back)', B(50, null) === null && B(50, { item_length: 0, item_width: 0, item_height: 0 }) === null);
 
-    // Exact fit, smallest box, no cut-down: item 10x6x4 + 2in buffer (weight 50oz, <=96 -> tare +8) = padded 12x8x6, matches STOCK_BOXES[0] exactly.
-    var exact = B(50, { item_length: 10, item_width: 6, item_height: 4 });
-    test('(box) exact-fit small box chosen with no cut-down', exact && exact.box_name === '12x8x6' && exact.length === 12 && exact.width === 8 && exact.height === 6);
-    test('(box) small-box tare is +8oz',                      exact && exact.added_weight_oz === 8);
+    // Spec's own worked example: an 8x6x4 item <=15lb pads to 12x10x8 (8+4, 6+4, 4+4 — 6-sided: 2in
+    // PER FACE, both faces of each dimension) and matches STOCK_BOXES[1] exactly, no cut-down.
+    // Weight 50oz (<=96 -> tare +8).
+    var exact = B(50, { item_length: 8, item_width: 6, item_height: 4 });
+    test('(box) 8x6x4 pads to 12x10x8 (6-sided: +4 per dimension)', exact && exact.length === 12 && exact.width === 10 && exact.height === 8);
+    test('(box) 12x10x8 exact-fit chosen with no cut-down',         exact && exact.box_name === '12x10x8');
+    test('(box) small-box tare is +8oz',                            exact && exact.added_weight_oz === 8);
 
-    // Worked example from spec: 22x13x15 resized to 22x13x12. Weight 150oz (96<150<=240 -> tare +16, buffer 2in).
-    // item 20 x 9 x 9.5 -> padded 22 x 11 x 11.5 -> smallest fitting stock box is 22x13x15 -> cut to 22x13x12.
-    var cut = B(150, { item_length: 20, item_width: 9, item_height: 9.5 });
+    // Cut-down worked example, recomputed for 6-sided padding. Weight 150oz (96<150<=240 -> tare
+    // +16, buffer +4 total per dimension). item 18 x 9 x 8 -> padded 22 x 13 x 12 -> smallest
+    // fitting stock box is 22x13x15 -> cut to 22x13x12 (same label as before — different input dims
+    // needed to land on it once padding doubled from single-face to 6-sided).
+    var cut = B(150, { item_length: 18, item_width: 9, item_height: 8 });
     test('(box) height cut-down matches the spec worked example', cut && cut.box_name === '22x13x12 (from 22x13x15)' && cut.length === 22 && cut.width === 13 && cut.height === 12);
     test('(box) medium-box tare is +16oz',                        cut && cut.added_weight_oz === 16);
 
-    // Heavy item (> 240oz -> 3in buffer, +32oz tare). item 22x16x11 -> padded 25x19x14 -> fits 26x16x15? no
-    // (19 > 16 and 19 > 15 too even swapped) -> use a box guaranteed to fit: 24x20x20.
-    var heavy = B(300, { item_length: 21, item_width: 17, item_height: 11 });
-    test('(box) >15lb uses 3in buffer',   heavy && heavy.length >= 21 + 3);
-    test('(box) heavy tare is +32oz',     heavy && heavy.added_weight_oz === 32);
+    // Heavy item (> 240oz -> 3in PER FACE, +6in total per dimension, +32oz tare). item 18x14x8 ->
+    // padded 24x20x14 -> only 24x20x20 fits (26x16x15 and 24x18x18 both fail the W requirement) ->
+    // cut to 24x20x14.
+    var heavy = B(300, { item_length: 18, item_width: 14, item_height: 8 });
+    test('(box) >15lb uses 3in-per-face (6in total) buffer', heavy && heavy.length === 24 && heavy.width === 20 && heavy.height === 14);
+    test('(box) heavy cut-down box name',  heavy && heavy.box_name === '24x20x14 (from 24x20x20)');
+    test('(box) heavy tare is +32oz',      heavy && heavy.added_weight_oz === 32);
 
     // Seller spoke length as the SHORTER side (item_length 9 < item_width 13) — selectBestBox must
     // still sort padded L>=W before matching, not just take the spoken order at face value.
+    // Recomputed for 6-sided padding: padded (pre-sort) 13x17x8 -> sorted 17x13x8 -> 22x13x15 cut to 22x13x8.
     var swapped = B(50, { item_length: 9, item_width: 13, item_height: 4 });
-    test('(box) spoken L/W order does not matter — still resolves correctly', swapped && swapped.box_name === '15x12x6 (from 15x12x10)' && swapped.length === 15 && swapped.width === 12);
+    test('(box) spoken L/W order does not matter — still resolves correctly', swapped && swapped.box_name === '22x13x8 (from 22x13x15)' && swapped.length === 22 && swapped.width === 13);
 
     // Too large for every stock box -> null, caller falls back to calculateShippingTier's box.
     test('(box) nothing fits -> null, never throws', B(500, { item_length: 40, item_width: 30, item_height: 30 }) === null);
@@ -1313,10 +1380,11 @@ section('VOICE INTAKE -> ADDITEM BUILDER (pre-flight simulation)');
 
     // ── Same Zebra printer, but the seller SPOKE dimensions that trigger a height cut-down —
     // proves package_height/box_dimensions/selected_box and the real AddItem XML all use the
-    // CUT-DOWN height (12), never the stock box height (15), end to end.
+    // CUT-DOWN height (12), never the stock box height (15), end to end. 6-sided padding: item
+    // 18x9x8 (+4 per dimension) pads to 22x13x12, landing on stock box 22x13x15 -> cut to 22x13x12.
     var zTierCut = box.tier(9, 6, 604); // 150oz total
-    var zVisionCut = { item_name: 'Zebra P4T Direct Thermal Label Printer', brand: 'Zebra', model: 'P4T', category: 'Label Printers', includes: 'AC power adapter', condition_notes: 'light scuffing on case', item_length: 20, item_width: 9, item_height: 9.5 };
-    var zRecordCut = box.assemble('604', 'A3', 4, 'zebra p forty printer 20 by 9 by 9.5 grade B powers on prints test label', zPvHints, { lbs: 9, oz: 6 }, 4, false, zTierCut, zVisionCut, zAiData);
+    var zVisionCut = { item_name: 'Zebra P4T Direct Thermal Label Printer', brand: 'Zebra', model: 'P4T', category: 'Label Printers', includes: 'AC power adapter', condition_notes: 'light scuffing on case', item_length: 18, item_width: 9, item_height: 8 };
+    var zRecordCut = box.assemble('604', 'A3', 4, 'zebra p forty printer 18 by 9 by 8 grade B powers on prints test label', zPvHints, { lbs: 9, oz: 6 }, 4, false, zTierCut, zVisionCut, zAiData);
     zRecordCut.listing.category_id = 175677; zRecordCut.listing.primary_category_id = 175677;
     var zXmlCut = box.buildXml(zRecordCut, { categoryId: zRecordCut.listing.category_id, pictureUrls: simulatePictureUrls(zRecordCut), conditionId: null, policies: null });
 
