@@ -1138,7 +1138,11 @@ test('addVoicePhotos reads sequentially', has('function addVoicePhotos(input){')
 test('gallery selection auto-reversed on upload', has('for(var i=0;i<files.length;i++)arr.push(files[i]);arr.reverse();var idx=0;'));
 test('one FileReader in flight at a time', has('idx>=arr.length'));
 test('client-side compression to canvas', has('function voiceCompressImage(dataUrl,cb)') && has("canvas.toDataURL('image/jpeg',0.85)"));
-test('compression capped at 1600px',      has('voiceScaleDims(img.width,img.height,1600)'));
+test('compression capped at 2048px',      has('voiceScaleDims(img.width,img.height,2048)'));
+test('native camera intent launcher exists', has('function openNativeCamera(){') && has('intent:#Intent;action=android.media.action.STILL_IMAGE_CAMERA;end'));
+test('native camera falls back off-Android', has('/android/i.test(navigator.userAgent') && has("document.getElementById('vPhotoInput');if(inp)inp.click();"));
+test('two-button Step 1 UI: camera + gallery import', has('&#128248; 1. Open Phone Camera') && has('&#128229; 2. Add Recent Photos'));
+test('gallery import button has no capture attribute', !/id=.vPhotoInput.[^>]*capture=/.test(content));
 test('compression failure falls back',    has('}catch(e){cb(null);}};') && has('if(!b64){var c=v.indexOf'));
 test('voiceScaleDims pure helper',        has('function voiceScaleDims(w,h,max){'));
 test('reverse button wired',              has("id='vReverseBtn'") && has('voiceReversePhotos()'));
