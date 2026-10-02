@@ -852,6 +852,13 @@ test('voice never re-implements ship', has('shippingPolicyName(tier.shippingPoli
     test('(voice) spoken SKU extracted',   skuSpoken.spoken_sku === 2005);
     var skuSpoken2 = P('Dell laptop grade B item number 2010 powers on 4 pounds');
     test('(voice) "item number N" extracted as SKU', skuSpoken2.spoken_sku === 2010);
+    // fast-submit's resolution order must try the spoken SKU FIRST — the Custom SKU field is always
+    // pre-filled with the next auto-increment number, so if that were checked first a spoken override
+    // ("SKU 3050") could never win. Guard against reintroducing parsed.sku-first precedence.
+    test('(fast-submit) spoken SKU resolved before the pre-filled field', (function(){
+      var i1 = content.indexOf('pvHints.spoken_sku || parseInt(parsed.sku, 10) || 0');
+      return i1 >= 0;
+    })());
 
     var dirty = P('Dell laptop grade B shelf G4 SKU 2005 powers on 4 pounds 8 ounces includes charger');
     test('(voice) condition_notes strips shelf',   !/shelf g4/i.test(dirty.condition_notes));
@@ -1139,8 +1146,8 @@ test('gallery selection auto-reversed on upload', has('for(var i=0;i<files.lengt
 test('one FileReader in flight at a time', has('idx>=arr.length'));
 test('client-side compression to canvas', has('function voiceCompressImage(dataUrl,cb)') && has("canvas.toDataURL('image/jpeg',0.85)"));
 test('compression capped at 2048px',      has('voiceScaleDims(img.width,img.height,2048)'));
-test('native camera intent launcher exists', has('function openNativeCamera(){') && has('intent:#Intent;action=android.media.action.STILL_IMAGE_CAMERA;end'));
-test('native camera falls back off-Android', has('/android/i.test(navigator.userAgent') && has("document.getElementById('vPhotoInput');if(inp)inp.click();"));
+test('camera button is a real <a href=intent:> link, not a JS redirect', has("<a href='intent:#Intent;action=android.media.action.STILL_IMAGE_CAMERA;category=android.intent.category.DEFAULT;end' onclick='return voiceCameraLinkClick(event)'"));
+test('native camera link falls back off-Android via preventDefault', has('function voiceCameraLinkClick(e){') && has('/android/i.test(navigator.userAgent') && has('e.preventDefault()') && has("document.getElementById('vPhotoInput');if(inp)inp.click();"));
 test('two-button Step 1 UI: camera + gallery import', has('&#128248; 1. Open Phone Camera') && has('&#128229; 2. Add Recent Photos'));
 test('gallery import button has no capture attribute', !/id=.vPhotoInput.[^>]*capture=/.test(content));
 test('compression failure falls back',    has('}catch(e){cb(null);}};') && has('if(!b64){var c=v.indexOf'));
