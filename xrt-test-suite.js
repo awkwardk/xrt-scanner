@@ -830,8 +830,37 @@ test('voice never re-implements ship', has('shippingPolicyName(tier.shippingPoli
     test('(voice) titles <= 80 chars',     titles.every(function(x){ return x.length <= 80 && x.length > 0; }));
 
     var lot = P('Lot of 5 Polycom VVX411 phones grade B tested working 6 lbs');
-    var lotT = T({ brand:lot.brand, model:lot.model, product_type:lot.product_type, features:lot.features, includes:lot.includes, grade:lot.grade, parts_repair:lot.parts_repair, quantity:lot.quantity });
+    test('(voice) lot sets is_lot/lot_quantity, not quantity', lot.is_lot === true && lot.lot_quantity === 5 && lot.quantity === 1);
+    var lotT = T({ brand:lot.brand, model:lot.model, product_type:lot.product_type, features:lot.features, includes:lot.includes, grade:lot.grade, parts_repair:lot.parts_repair, is_lot:lot.is_lot, lot_quantity:lot.lot_quantity });
     test('(voice) lot quantity in title',  /Lot of 5/.test(lotT));
+
+    var avail = P('Quantity 5 Polycom VVX411 phones grade B tested working 6 lbs');
+    test('(voice) "quantity N" sets real quantity, not a lot', avail.quantity === 5 && avail.is_lot === false);
+    var avail2 = P('Polycom VVX411 phones grade B tested working 6 lbs, 8 of these available');
+    test('(voice) "N of these available" sets real quantity', avail2.quantity === 8 && avail2.is_lot === false);
+    var avail3 = P('Polycom VVX411 phones grade B tested working 6 lbs, I have 3');
+    test('(voice) "I have N" sets real quantity',  avail3.quantity === 3 && avail3.is_lot === false);
+    var availT = T({ brand:avail.brand, model:avail.model, product_type:avail.product_type, features:avail.features, includes:avail.includes, grade:avail.grade, parts_repair:avail.parts_repair, is_lot:avail.is_lot, lot_quantity:avail.lot_quantity });
+    test('(voice) available quantity never says "Lot of" in title', !/Lot of/.test(availT));
+
+    var loc = P('Dell laptop grade B shelf G4 powers on 4 pounds');
+    test('(voice) shelf extracted',        loc.shelf === 'G4');
+    var binLoc = P('Dell laptop grade B bin B3 powers on 4 pounds');
+    test('(voice) bin extracted as shelf', binLoc.shelf === 'B3');
+
+    var skuSpoken = P('Dell laptop grade B SKU 2005 powers on 4 pounds');
+    test('(voice) spoken SKU extracted',   skuSpoken.spoken_sku === 2005);
+    var skuSpoken2 = P('Dell laptop grade B item number 2010 powers on 4 pounds');
+    test('(voice) "item number N" extracted as SKU', skuSpoken2.spoken_sku === 2010);
+
+    var dirty = P('Dell laptop grade B shelf G4 SKU 2005 powers on 4 pounds 8 ounces includes charger');
+    test('(voice) condition_notes strips shelf',   !/shelf g4/i.test(dirty.condition_notes));
+    test('(voice) condition_notes strips SKU',     !/sku 2005/i.test(dirty.condition_notes));
+    test('(voice) condition_notes strips weight',  !/4 pounds|8 ounces/i.test(dirty.condition_notes));
+    test('(voice) condition_notes keeps real content', /charger/i.test(dirty.condition_notes));
+
+    var lotRec = R(1, lot, 'A1', 2, {});
+    test('(voice) record description mentions lot count', /lot of 5/i.test(lotRec.listing.description_html));
 
     // shipping tiers preserved: GA <= 6lb, FedEx 6-15lb, Heavy > 15lb
     function pol(lbs){ return R(1, P('Dell server grade B ' + lbs + ' pounds'), 'A1', 0, {}).listing.shipping_policy; }
