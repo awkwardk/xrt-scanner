@@ -2824,6 +2824,18 @@ const server = http.createServer(function(req, res) {
     catch(e){ sendJSON(res,200,{success:true, generated:0, failed:0}); }
     return;
   }
+  // Pause / Resume the 60s auto-poster. Body {paused:true|false} sets it
+  // explicitly; an empty body toggles. Manual posting is unaffected.
+  if(req.method==='POST' && req.url.split('?')[0]==='/api/refresh/pause'){
+    parseBody(req, function(perr, pb){
+      var q = readRefreshQueue();
+      q.paused = (pb && typeof pb.paused === 'boolean') ? pb.paused : !q.paused;
+      writeRefreshQueue(q);
+      console.log('[REFRESH] auto-poster ' + (q.paused ? 'PAUSED' : 'RESUMED'));
+      sendJSON(res,200,{success:true, paused: q.paused});
+    });
+    return;
+  }
   if(req.method==='POST' && req.url.split('?')[0]==='/api/refresh/settings'){
     parseBody(req, function(perr, pb){
       if(perr || !pb){ sendJSON(res,400,{success:false, error:'Bad request'}); return; }
@@ -3168,13 +3180,14 @@ function renderBuyersPage(){
 // ── INACTIVE LISTING PIPELINE BACKEND (additive — never crashes, always returns JSON) ──
 var REFRESH_FILE = path.join(DATA_DIR, 'refresh-queue.json');
 function readRefreshQueue(){
-  var def = { daily_limit:10, post_interval_minutes:5, last_post_date:null, posted_today:0, last_post_time:null, queue:[] };
+  var def = { daily_limit:10, post_interval_minutes:5, paused:false, last_post_date:null, posted_today:0, last_post_time:null, queue:[] };
   try {
     if(fs.existsSync(REFRESH_FILE)){
       var o = JSON.parse(fs.readFileSync(REFRESH_FILE, 'utf8'));
       if(o && typeof o === 'object'){
         if(typeof o.daily_limit !== 'number') o.daily_limit = 10;
         if(typeof o.post_interval_minutes !== 'number') o.post_interval_minutes = 5;
+        if(typeof o.paused !== 'boolean') o.paused = false;
         if(typeof o.posted_today !== 'number') o.posted_today = 0;
         if(!Array.isArray(o.queue)) o.queue = [];
         if(o.last_post_date === undefined) o.last_post_date = null;
@@ -3210,12 +3223,57 @@ function refreshGradeLetter(condId){
 }
 function refreshDecodeXml(s){ return String(s == null ? '' : s).replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&apos;/g,"'").replace(/&#0?39;/g,"'"); }
 // Generated copy must never reference prior listing history. Warn only (never blocks posting).
+// Relist-language phrases that must never reach a buyer-facing listing.
+// NARROWED deliberately: bare "back" and bare "returned" used to be flagged,
+// which false-positives constantly on legitimate hardware copy ("ports on the
+// back", "back panel", "returned to service"). Only explicit relist phrasing
+// is matched now, so enforcement below can safely strip instead of warn.
+var REFRESH_BANNED_PHRASES = [
+  'previously listed',
+  'relisted',
+  're-listed',
+  'back again',
+  'back in stock',
+  'item returned',
+  'second chance',
+  'now available',
+  'listed again'
+];
+function refreshBannedPhraseRegex(phrase){
+  // Escape, then allow any run of whitespace (incl. across HTML newlines)
+  // between words so "back   in stock" is caught too.
+  var esc = String(phrase).replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
+  return new RegExp(esc, 'gi');
+}
 function checkRefreshBannedPhrases(text){
-  var s = ' ' + String(text == null ? '' : text).toLowerCase().replace(/<[^>]+>/g, ' ') + ' ';
+  var s = ' ' + String(text == null ? '' : text).toLowerCase().replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ') + ' ';
   var found = [];
-  ['previously listed','relisted','now available','listed again','second chance','returned'].forEach(function(p){ if(s.indexOf(p) >= 0 && found.indexOf(p) < 0) found.push(p); });
-  if(/\bback\b/.test(s) && found.indexOf('back') < 0) found.push('back');
+  REFRESH_BANNED_PHRASES.forEach(function(p){ if(s.indexOf(p) >= 0 && found.indexOf(p) < 0) found.push(p); });
   return found;
+}
+// Removes banned relist phrasing from a string and tidies the punctuation/
+// whitespace left behind. Operates on raw text or HTML; HTML tags are left
+// intact because only the phrase itself is removed.
+function stripRefreshBannedPhrases(text){
+  var s = String(text == null ? '' : text);
+  if(!s) return s;
+  REFRESH_BANNED_PHRASES.forEach(function(p){ s = s.replace(refreshBannedPhraseRegex(p), ''); });
+  // Collapse the debris: doubled spaces, orphaned punctuation, empty parens.
+  s = s.replace(/\(\s*\)/g, '')
+       .replace(/\[\s*\]/g, '')
+       .replace(/[ \t]{2,}/g, ' ')
+       .replace(/\s+([,.;:!?])/g, '$1')
+       .replace(/([,;:])\s*([,.;:])/g, '$1')
+       .replace(/(^|>)\s*[,.;:]\s*/g, '$1')
+       // Drop separators left dangling in front of terminal punctuation
+       // ("ThinkPad -!" -> "ThinkPad!") and any trailing/leading separator
+       // debris ("HP EliteDesk," -> "HP EliteDesk").
+       .replace(/[\s\-–—,;:]+(?=[!?.])/g, '')
+       .replace(/[\s\-–—,;:]+$/g, '')
+       .replace(/^[\s\-–—,;:]+/g, '')
+       .replace(/\s+</g, ' <')
+       .trim();
+  return s;
 }
 // Parse a GetItem response body into the "original" data shape.
 function parseRefreshGetItem(body, fallbackId){
@@ -3352,14 +3410,21 @@ function generateRefreshItem(item, userNotes, callback){
     }).filter(function(u){ return u.indexOf('i.ebayimg.com') >= 0; });
     if(_refreshUrls.length > 6){ _refreshUrls = _refreshUrls.slice(0, 5).concat([_refreshUrls[_refreshUrls.length - 1]]); }
     var _refreshBlocks = _refreshUrls.map(function(u){ return { type:'image_url', image_url:{ url: u } }; });
+    // PARITY FIX: the ":online" suffix is what gives the model Google Search
+    // grounding on OpenRouter. /processor's listing step has always used it
+    // (see generateVoiceListingAI). Without it this prompt still said "Search
+    // eBay sold listings" while the model had no search tool at all, so every
+    // relist price was invented rather than comped. Same model/transport/
+    // prompt/parse path as /processor now.
     callOpenRouter({
-      model: 'google/gemini-2.5-flash',
+      model: 'google/gemini-2.5-flash:online',
       max_tokens: 2500,
       messages: [ { role:'system', content: sys }, { role:'user', content: _refreshBlocks.concat([{ type:'text', text: userMsg }]) } ]
     }, function(err, gText){
-      var resp = { content: [ { type:'text', text: (gText || '') } ] };
       if(err){ callback({ success:false, error:'AI request failed' }); return; }
-      var data = extractFirstJson(extractText(resp.content));
+      // Use the same parser /processor uses — it strips ```json fences before
+      // extracting, which the old Anthropic-shaped wrapper did not.
+      var data = parseGeminiJson(gText);
       if(!data || !data.title){ callback({ success:false, error:'Could not parse generated listing' }); return; }
       var q = readRefreshQueue(); var it = null;
       for(var i = 0; i < q.queue.length; i++){ if(q.queue[i].id === item.id){ it = q.queue[i]; break; } }
@@ -3387,9 +3452,39 @@ function generateRefreshItem(item, userNotes, callback){
         dimensions_width: (prev.dimensions_width != null) ? prev.dimensions_width : (orig.dimensions_width || 0),
         dimensions_height: (prev.dimensions_height != null) ? prev.dimensions_height : (orig.dimensions_height || 0)
       };
-      it.status = 'approved'; it.approved_at = new Date().toISOString(); it.error = null;
-      var banned = checkRefreshBannedPhrases((it.improved.title || '') + ' ' + (it.improved.description_html || '') + ' ' + (it.improved.condition_box || ''));
-      if(banned.length){ console.log('[REFRESH] WARNING relist-language in generated listing for "' + orig.title + '": ' + banned.join(', ')); }
+      // REVIEW GATE: generation no longer self-approves. Newly generated items
+      // land back in the existing Pending tab with needs_review set, so the
+      // 60s auto-poster (which only picks up status==='approved') can never
+      // publish an unvetted price. A human presses Approve.
+      it.status = 'pending';
+      it.approved_at = null;
+      it.needs_review = true;
+      it.generated_at = new Date().toISOString();
+      it.error = null;
+
+      // RELIST SAFEGUARD: strip banned relist phrasing BEFORE the queue is
+      // written, rather than logging a warning and saving it anyway.
+      var bannedBefore = checkRefreshBannedPhrases(
+        (it.improved.title || '') + ' ' + (it.improved.description_html || '') + ' ' + (it.improved.condition_box || '')
+      );
+      if(bannedBefore.length){
+        it.improved.title = stripRefreshBannedPhrases(it.improved.title).slice(0, 80);
+        it.improved.description_html = stripRefreshBannedPhrases(it.improved.description_html);
+        it.improved.condition_box = stripRefreshBannedPhrases(it.improved.condition_box);
+        it.relist_language_stripped = bannedBefore;
+        console.log('[REFRESH] stripped relist-language from "' + orig.title + '": ' + bannedBefore.join(', '));
+        // Defensive re-check: if anything survived the strip, refuse to let the
+        // item look clean — surface it on the card so it cannot be approved blind.
+        var bannedAfter = checkRefreshBannedPhrases(
+          (it.improved.title || '') + ' ' + (it.improved.description_html || '') + ' ' + (it.improved.condition_box || '')
+        );
+        if(bannedAfter.length){
+          it.error = 'Relist language could not be fully removed: ' + bannedAfter.join(', ') + ' — edit before approving.';
+          console.log('[REFRESH] WARNING relist-language survived strip for "' + orig.title + '": ' + bannedAfter.join(', '));
+        }
+      } else {
+        it.relist_language_stripped = null;
+      }
       writeRefreshQueue(q);
       console.log('[REFRESH] generated fresh listing for ' + orig.title);
       callback({ success:true, item: it });
@@ -3510,7 +3605,52 @@ function postRefreshItem(item, callback){
         console.log('[REFRESH] failed to post "' + record.listing.title + '": ' + msg);
         callback({ success:false, error: String(msg).slice(0, 500) });
       }
-      attempt();
+
+      // ERROR 240 GUARD 1 — no pictures. eBay rejects AddItem without at least
+      // one picture, and buildAddItemXml emits NO <PictureDetails> block at all
+      // when pictureUrls is empty. Previously, if every re-upload failed we
+      // still built and sent that payload. Fail here with the real reason.
+      if(!eps.length){
+        finishFail('All ' + srcPhotos.length + ' photo re-upload(s) failed — cannot post a listing with no pictures. Check the source image URLs, then retry.');
+        return;
+      }
+
+      // ERROR 240 GUARD 2 — required item specifics. Validates against the live
+      // Taxonomy API (getItemAspectsForCategory), the same authoritative source
+      // the main post path uses, auto-fills what can be derived, and refuses to
+      // submit while a required aspect is still blank. Wrapped so a validation
+      // fault can never block an otherwise valid post.
+      getItemAspectsForCategory(record.listing.category_id, token, function(_aErr, requiredAspects){
+        try {
+          if(requiredAspects && requiredAspects.length){
+            var isObj = record.listing.item_specifics || {};
+            function presentMap(o){
+              var p = {};
+              Object.keys(o).forEach(function(k){
+                var v = o[k];
+                var has = Array.isArray(v) ? v.join('').trim() : String(v == null ? '' : v).trim();
+                if(has) p[String(k).toLowerCase()] = true;
+              });
+              return p;
+            }
+            var present = presentMap(isObj);
+            var missing = requiredAspects.filter(function(name){ return !present[String(name).toLowerCase()]; });
+            if(missing.length){
+              console.log('[REFRESH] auto-filling missing required specifics for "' + record.listing.title + '": ' + missing.join(', '));
+              autoFillRequiredSpecifics(isObj, missing, { model: isObj.Model, isLot: false });
+              record.listing.item_specifics = isObj;
+              var present2 = presentMap(isObj);
+              var stillMissing = requiredAspects.filter(function(name){ return !present2[String(name).toLowerCase()]; });
+              if(stillMissing.length){
+                finishFail('Missing required eBay item specifics for category ' + record.listing.category_id + ': '
+                  + stillMissing.join(', ') + ' — add them on the card, then retry. (Blocked before submit to avoid eBay Error 240.)');
+                return;
+              }
+            }
+          }
+        } catch(_v){ console.log('[REFRESH] specifics validation skipped: ' + _v.message); }
+        attempt();
+      });
     }
     nextPhoto();
   });
@@ -3525,11 +3665,12 @@ function refreshScheduleStatus(){
     var elapsed = (Date.now() - new Date(q.last_post_time).getTime()) / 60000;
     if(elapsed < (q.post_interval_minutes || 5)){ canByInterval = false; nextEligible = new Date(new Date(q.last_post_time).getTime() + (q.post_interval_minutes || 5) * 60000).toISOString(); }
   }
-  var can = canByLimit && canByInterval;
-  var reason = !canByLimit ? ('Daily limit reached (' + posted + '/' + (q.daily_limit || 10) + ')')
+  var can = canByLimit && canByInterval && !q.paused;
+  var reason = q.paused ? 'Auto-poster paused'
+    : !canByLimit ? ('Daily limit reached (' + posted + '/' + (q.daily_limit || 10) + ')')
     : !canByInterval ? ('Waiting ' + (q.post_interval_minutes || 5) + 'm between posts')
     : approved.length === 0 ? 'No approved items ready to post' : 'Ready to post';
-  return { due: can && approved.length > 0, can_post_now: can, reason: reason, posted_today: posted, daily_limit: q.daily_limit || 10, approved_count: approved.length, next_post_eligible: nextEligible, post_interval_minutes: q.post_interval_minutes || 5 };
+  return { due: can && approved.length > 0, can_post_now: can, reason: reason, posted_today: posted, daily_limit: q.daily_limit || 10, approved_count: approved.length, next_post_eligible: nextEligible, post_interval_minutes: q.post_interval_minutes || 5, paused: !!q.paused };
 }
 function refreshRunSchedule(callback){
   var st = refreshScheduleStatus();
@@ -3555,6 +3696,10 @@ function refreshRunSchedule(callback){
 try {
   setInterval(function(){
     try {
+      // PAUSE GATE: a paused queue skips the tick entirely. Manual posting via
+      // POST /api/refresh/post/:id still works while paused — this only stops
+      // the unattended auto-poster.
+      if(readRefreshQueue().paused){ return; }
       refreshRunSchedule(function(r){
         if(r && r.posted){ var q = readRefreshQueue(); console.log('[REFRESH SCHEDULE] auto-posted "' + (r.title || 'item') + '" (' + q.posted_today + '/' + q.daily_limit + ' today)'); }
       });
@@ -3627,14 +3772,20 @@ function renderRefreshPage(){
   + '<button class="b" id="clearBtn" onclick="clearQueue()" style="background:#c62828;color:#fff;">Clear Queue</button>'
   + '<button class="b green" id="genAllBtn" onclick="generateAll()">Generate All</button>'
   + '<button class="b yellow" id="runBtn" onclick="runSchedule()">Run Schedule Now</button>'
+  + '<button class="b" id="pauseBtn" onclick="togglePause()" style="background:#555;color:#fff;">Pause Auto-Poster</button>'
   + '</div><div class="setrow">Post per day: <input id="setLimit" type="number" min="1" max="100"> Minutes between posts: <input id="setIv" type="number" min="1" max="60"> <button class="b blue" onclick="saveSettings()">Save Settings</button></div>'
+  + '<div class="setrow" id="bulkRow"><label><input type="checkbox" id="selAll" onclick="selectAllVisible(this.checked)"> Select all shown</label>'
+  + ' <span id="selCount">0 selected</span>'
+  + ' <button class="b green" onclick="approveSelected()">Approve Selected</button>'
+  + ' <button class="b" onclick="rejectSelected()" style="background:#c62828;color:#fff;">Reject Selected</button>'
+  + ' <button class="b yellow" onclick="scheduleSelected()">Schedule Selected</button></div>'
   + '<div id="schedInfo">Loading schedule...</div></div>'
   + '<div class="tabs"><div class="tab active" data-tab="all" onclick="setTab(\'all\')">All</div><div class="tab" data-tab="pending" onclick="setTab(\'pending\')">Pending</div><div class="tab" data-tab="approved" onclick="setTab(\'approved\')">Approved</div><div class="tab" data-tab="posted" onclick="setTab(\'posted\')">Posted</div></div>'
   + '<div class="list" id="list"></div></div>'
   + '<div id="descModal"><div class="descbox"><div class="descbody" id="descBody"></div><div class="descfoot" id="descFoot"></div></div></div>'
   + '<div class="toast" id="toast"></div>'
   + '<script>'
-  + 'var QUEUE={queue:[]};var TAB="all";var descId=null;'
+  + 'var QUEUE={queue:[]};var TAB="all";var descId=null;var SEL={};var PAUSED=false;'
   + 'function esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/\\"/g,"&quot;");}'
   + 'function toast(t){var el=document.getElementById("toast");el.textContent=t;el.classList.add("show");setTimeout(function(){el.classList.remove("show");},1800);}'
   + 'function findItem(id){for(var i=0;i<QUEUE.queue.length;i++){if(QUEUE.queue[i].id===id)return QUEUE.queue[i];}return null;}'
@@ -3643,7 +3794,7 @@ function renderRefreshPage(){
   + 'function patchItem(id,body,cb){fetch("/api/refresh/item/"+id,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(function(r){return r.json();}).then(function(d){if(d&&d.id){if(cb)cb(true);}else{toast((d&&d.error)||"Save failed");if(cb)cb(false);}}).catch(function(){toast("Network error");if(cb)cb(false);});}'
   + 'function setSub(){var n=new Date();var WD=["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];var MO=["January","February","March","April","May","June","July","August","September","October","November","December"];document.getElementById("subDate").textContent=WD[n.getDay()]+", "+MO[n.getMonth()]+" "+n.getDate();}'
   + 'function loadQueue(){fetch("/api/refresh/queue").then(function(r){return r.json();}).then(function(d){QUEUE=(d&&Array.isArray(d.queue))?d:{queue:[]};if(document.getElementById("setLimit").value==="")document.getElementById("setLimit").value=QUEUE.daily_limit;if(document.getElementById("setIv").value==="")document.getElementById("setIv").value=QUEUE.post_interval_minutes;render();}).catch(function(){QUEUE={queue:[]};render();});}'
-  + 'function loadSched(){fetch("/api/refresh/schedule-status").then(function(r){return r.json();}).then(function(s){var nx=s.next_post_eligible?(" | Next eligible: "+new Date(s.next_post_eligible).toLocaleTimeString()):"";document.getElementById("schedInfo").textContent=s.reason+" ("+s.posted_today+"/"+s.daily_limit+" today, "+s.approved_count+" approved)"+nx;document.getElementById("stPosted").textContent=s.posted_today;}).catch(function(){});}'
+  + 'function loadSched(){fetch("/api/refresh/schedule-status").then(function(r){return r.json();}).then(function(s){var nx=s.next_post_eligible?(" | Next eligible: "+new Date(s.next_post_eligible).toLocaleTimeString()):"";document.getElementById("schedInfo").textContent=s.reason+" ("+s.posted_today+"/"+s.daily_limit+" today, "+s.approved_count+" approved)"+nx;document.getElementById("stPosted").textContent=s.posted_today;PAUSED=!!s.paused;renderPause();}).catch(function(){});}'
   + 'function setTab(t){TAB=t;var ts=document.querySelectorAll(".tab");for(var i=0;i<ts.length;i++){ts[i].classList.toggle("active",ts[i].getAttribute("data-tab")===t);}render();}'
   + 'function renderStats(){var p=0,a=0;QUEUE.queue.forEach(function(it){if(it.status==="pending")p++;else if(it.status==="approved")a++;});document.getElementById("stPend").textContent=p;document.getElementById("stApp").textContent=a;document.getElementById("stTotal").textContent=QUEUE.queue.length;}'
   + 'function startEdit(host,fields,onSave){if(host.dataset.editing)return;host.dataset.editing="1";var prev=host.innerHTML;host.innerHTML="";var wrap=document.createElement("span");wrap.style.cssText="display:inline-flex;flex-wrap:wrap;gap:4px;align-items:center;";var inputs={};fields.forEach(function(f){var el;if(f.type==="select"){el=document.createElement("select");(f.options||[]).forEach(function(o){var op=document.createElement("option");op.value=o.v;op.textContent=o.l;if(String(o.v)===String(f.value))op.selected=true;el.appendChild(op);});}else{el=document.createElement("input");el.type=f.type||"text";el.value=(f.value==null?"":f.value);if(f.placeholder)el.placeholder=f.placeholder;}el.style.cssText="padding:3px 5px;border:1px solid #1565c0;border-radius:3px;font-size:13px;"+(f.width?("width:"+f.width+";"):"");inputs[f.key]=el;wrap.appendChild(el);if(f.counter){var c=document.createElement("span");c.style.cssText="font-size:11px;font-weight:bold;";var u=function(){var n=el.value.length;c.textContent=n+"/80";c.style.color=n>80?"#c62828":"#789";};u();el.addEventListener("input",u);wrap.appendChild(c);}});var sv=document.createElement("button");sv.textContent="Save";sv.style.cssText="background:#2e7d32;color:#fff;border:none;border-radius:4px;padding:4px 8px;font-size:12px;font-weight:bold;cursor:pointer;";var cn=document.createElement("span");cn.textContent="Cancel";cn.style.cssText="color:#789;font-size:12px;cursor:pointer;";wrap.appendChild(sv);wrap.appendChild(cn);host.appendChild(wrap);var first=wrap.querySelector("input,select");if(first){first.focus();if(first.select)first.select();}function doSave(){var v={};fields.forEach(function(f){v[f.key]=inputs[f.key].value;});host.removeAttribute("data-editing");onSave(v);}sv.addEventListener("click",doSave);cn.addEventListener("click",function(){host.innerHTML=prev;host.removeAttribute("data-editing");});wrap.addEventListener("keydown",function(e){if(e.key==="Enter"&&e.target.tagName!=="SELECT"){e.preventDefault();doSave();}else if(e.key==="Escape"){host.innerHTML=prev;host.removeAttribute("data-editing");}});}'
@@ -3665,7 +3816,10 @@ function renderRefreshPage(){
   + 'function specHtml(it){var d=dispOf(it);var tags=Object.keys(d.item_specifics||{}).map(function(k){var v=d.item_specifics[k];v=Array.isArray(v)?v.join(", "):v;return "<span class=\\"spectag\\"><b>"+esc(k)+":</b> <span class=\\"v\\" onclick=\\"eSpecVal(\'"+it.id+"\',\'"+esc(k).replace(/\'/g,"")+"\',this)\\">"+esc(v)+"</span> <span class=\\"x\\" onclick=\\"rmSpec(\'"+it.id+"\',\'"+esc(k).replace(/\'/g,"")+"\')\\">&times;</span></span>";}).join("");return "<div class=\\"field\\"><b>Item Specifics:</b><div class=\\"spectags\\">"+tags+"</div><div style=\\"margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;\\"><input id=\\"nsk_"+it.id+"\\" placeholder=\\"Field\\" style=\\"padding:5px;border:1px solid #bbb;border-radius:4px;font-size:12px;width:110px;\\"><input id=\\"nsv_"+it.id+"\\" placeholder=\\"Value\\" style=\\"padding:5px;border:1px solid #bbb;border-radius:4px;font-size:12px;width:110px;\\"><button class=\\"linkbtn\\" style=\\"background:#455a64;\\" onclick=\\"addSpec(\'"+it.id+"\')\\">+ Add Specific</button></div></div>";}'
   + 'function actionBtns(it){var id=it.id;if(it.status==="pending")return "<button class=\\"b green\\" onclick=\\"approve(\'"+id+"\')\\">Approve</button>";if(it.status==="approved")return "<button class=\\"b yellow\\" onclick=\\"postNow(\'"+id+"\')\\">Post Now</button> <span style=\\"color:#789;font-size:12px;cursor:pointer;\\" onclick=\\"unapprove(\'"+id+"\')\\">Unapprove</span>";if(it.status==="posted")return "<a href=\\"https://www.ebay.com/itm/"+(it.ebay_item_id||"")+"\\" target=\\"_blank\\" class=\\"linkbtn\\" style=\\"background:#1565c0;text-decoration:none;\\">View on eBay &rarr;</a>";if(it.status==="failed")return "<button class=\\"b\\" style=\\"background:#e65100;color:#fff;\\" onclick=\\"postNow(\'"+id+"\')\\">Retry</button>";if(it.status==="posting")return "<span style=\\"color:#f9a825;font-weight:bold;\\">Posting...</span>";return "";}'
   + 'function cardHtml(it){var d=dispOf(it);var badge="<span class=\\"badge "+it.status+"\\">"+it.status.toUpperCase()+(it.status==="posted"&&it.ebay_item_id?(" #"+it.ebay_item_id):"")+"</span>";var err=(it.status==="failed"&&it.error)?("<div class=\\"errln\\">"+esc(it.error)+"</div>"):"";var dims=(d.dimensions_length>0&&d.dimensions_width>0&&d.dimensions_height>0)?(d.dimensions_length+" x "+d.dimensions_width+" x "+d.dimensions_height+" in"):"Dimensions not set";var sub=((d.accept_price!=null)||(d.decline_price!=null))?("<div class=\\"subprice\\">Accept: $"+(d.accept_price!=null?d.accept_price:"-")+" | Decline: $"+(d.decline_price!=null?d.decline_price:"-")+"</div>"):"";'
-  + 'return "<div class=\\"card\\"><div class=\\"topbar\\"><div>"+badge+err+"</div><button class=\\"rm\\" onclick=\\"removeItem(\'"+it.id+"\')\\">&times;</button></div>"'
+  + 'var nrv=it.needs_review?"<span class=\\"badge pending\\" style=\\"background:#ff9f1c;color:#000;\\">NEEDS REVIEW</span>":"";'
+  + 'var strp=(it.relist_language_stripped&&it.relist_language_stripped.length)?("<div class=\\"errln\\" style=\\"color:#ff9f1c;\\">Relist language removed: "+esc(it.relist_language_stripped.join(", "))+"</div>"):"";'
+  + 'var cbx="<label style=\\"margin-right:8px;\\"><input type=\\"checkbox\\" class=\\"selbox\\" value=\\""+it.id+"\\" onclick=\\"onSel()\\"'+'"+(SEL[it.id]?" checked":"")+"></label>";'
+  + 'return "<div class=\\"card\\"><div class=\\"topbar\\"><div>"+cbx+badge+nrv+err+strp+"</div><button class=\\"rm\\" onclick=\\"removeItem(\'"+it.id+"\')\\">&times;</button></div>"'
   + '+photoStrip(d)'
   + '+"<div class=\\"ititle\\" onclick=\\"eTitle(\'"+it.id+"\',this)\\">"+esc(d.title||"(no title)")+"</div>"'
   + '+"<div class=\\"field\\"><span class=\\"price\\" onclick=\\"ePrice(\'"+it.id+"\',this)\\">$"+d.price+"</span>"+sub+"</div>"'
@@ -3687,6 +3841,21 @@ function renderRefreshPage(){
   + 'function unapprove(id){fetch("/api/refresh/unapprove/"+id,{method:"POST"}).then(function(r){return r.json();}).then(function(){loadQueue();loadSched();}).catch(function(){toast("Network error");});}'
   + 'function postNow(id){toast("Posting...");fetch("/api/refresh/post/"+id,{method:"POST"}).then(function(r){return r.json();}).then(function(d){if(d&&d.success){toast("Posted to eBay #"+d.ebay_item_id);}else{toast((d&&d.error)||"Post failed");}loadQueue();loadSched();}).catch(function(){toast("Network error");loadQueue();});}'
   + 'function removeItem(id){var it=findItem(id);var t=it?dispOf(it).title:"this item";if(!confirm("Remove \\""+t+"\\" from the pipeline?"))return;fetch("/api/refresh/remove/"+id,{method:"POST"}).then(function(r){return r.json();}).then(function(){toast("Removed");loadQueue();loadSched();}).catch(function(){toast("Network error");});}'
+  + 'function onSel(){SEL={};var bs=document.querySelectorAll(".selbox");for(var i=0;i<bs.length;i++){if(bs[i].checked)SEL[bs[i].value]=true;}updateSelCount();}'
+  + 'function updateSelCount(){var n=Object.keys(SEL).length;var el=document.getElementById("selCount");if(el)el.textContent=n+" selected";}'
+  + 'function selectAllVisible(on){var bs=document.querySelectorAll(".selbox");for(var i=0;i<bs.length;i++){bs[i].checked=!!on;}onSel();}'
+  + 'function selIds(){return Object.keys(SEL);}'
+  // Bulk actions run sequentially so the server sees the same one-at-a-time
+  // pattern the single-item buttons produce, then refresh once at the end.
+  + 'function bulkPost(ids,urlFor,label,done){var i=0,ok=0,fail=0;function nx(){if(i>=ids.length){toast(label+": "+ok+" ok"+(fail?(", "+fail+" failed"):""));SEL={};var sa=document.getElementById("selAll");if(sa)sa.checked=false;loadQueue();loadSched();if(done)done();return;}var id=ids[i];i++;fetch(urlFor(id),{method:"POST"}).then(function(r){return r.json();}).then(function(d){if(d&&d.success===false)fail++;else ok++;nx();}).catch(function(){fail++;nx();});}nx();}'
+  + 'function approveSelected(){var ids=selIds();if(!ids.length){toast("Nothing selected");return;}bulkPost(ids,function(id){return "/api/refresh/approve/"+id;},"Approved");}'
+  + 'function rejectSelected(){var ids=selIds();if(!ids.length){toast("Nothing selected");return;}if(!confirm("Remove "+ids.length+" selected item(s) from the pipeline?"))return;bulkPost(ids,function(id){return "/api/refresh/remove/"+id;},"Rejected");}'
+  // "Schedule" = approve so the auto-poster picks it up, then make sure the
+  // auto-poster is actually running (no point queueing into a paused scheduler).
+  + 'function scheduleSelected(){var ids=selIds();if(!ids.length){toast("Nothing selected");return;}bulkPost(ids,function(id){return "/api/refresh/approve/"+id;},"Scheduled",function(){if(PAUSED){setPause(false);}});}'
+  + 'function setPause(p){fetch("/api/refresh/pause",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({paused:!!p})}).then(function(r){return r.json();}).then(function(d){PAUSED=!!(d&&d.paused);renderPause();toast(PAUSED?"Auto-poster paused":"Auto-poster resumed");loadSched();}).catch(function(){toast("Network error");});}'
+  + 'function togglePause(){setPause(!PAUSED);}'
+  + 'function renderPause(){var b=document.getElementById("pauseBtn");if(!b)return;b.textContent=PAUSED?"Resume Auto-Poster":"Pause Auto-Poster";b.style.background=PAUSED?"#00e676":"#555";b.style.color=PAUSED?"#000":"#fff";}'
   + 'loadQueue();loadSched();setInterval(loadSched,30000);'
   + '</scr'+'ipt></body></html>';
 }
