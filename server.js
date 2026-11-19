@@ -168,6 +168,21 @@ function calcShipping(itemWeightOz, dims, opts){
     box_dimensions: box1 ? _boxStr(box1) : (dims ? _boxStr([dims.l+2,dims.w+2,dims.h+2]) : '12x8x6'), polymailer:false};
 }
 
+// Single source of truth for the weight -> eBay fulfillment (shipping) business policy
+// mapping. Thresholds mirror calculateShippingTier's tier boundaries exactly:
+//   <=  96oz  (6lb)  -> GA 6lbs or less    (272423749015)
+//   <= 240oz (15lb)  -> FedEx 6lbs or more (272434338015)
+//   >  240oz         -> Heavy Calculated   (272360974015)
+// Both the automatic tier path and the manual package override call this, so an
+// operator-entered package weight lands on the same policy an identical scale
+// reading would have selected. Change a boundary here and both paths follow.
+function shippingPolicyIdForOz(totalOz){
+  totalOz = parseFloat(totalOz) || 0;
+  if(totalOz > 240) return 272360974015;
+  if(totalOz > 96)  return 272434338015;
+  return 272423749015;
+}
+
 // FIX 2B: tier-based shipping from a RAW scale reading (lbs + oz). Packing is added per tier;
 // totalOz is used ONLY internally for tier comparison and is never stored or displayed.
 // Returns native lbs/oz (raw + packed) plus box size and the eBay fulfillment policy id.
@@ -176,20 +191,20 @@ function calculateShippingTier(lbs, oz, sku){
   oz = parseFloat(oz) || 0; if(oz < 0) oz = 0;
   var totalOz = (lbs * 16) + oz; // internal tier comparison ONLY
   function packRound(combinedOz){ var cl = Math.floor(combinedOz / 16); var rem = combinedOz % 16; return rem > 0 ? { l: cl + 1, o: 0 } : { l: cl, o: 0 }; }
-  var finalLbs, finalOz, boxSize, policyId, tier;
+  var finalLbs, finalOz, boxSize, tier;
   if(totalOz <= 10){
-    tier = 1; finalLbs = 0; finalOz = 15; boxSize = '12x8x4'; policyId = 272423749015;
+    tier = 1; finalLbs = 0; finalOz = 15; boxSize = '12x8x4';
   } else if(totalOz <= 15){
-    tier = 2; finalLbs = 1; finalOz = 15; boxSize = '12x8x6'; policyId = 272423749015;
+    tier = 2; finalLbs = 1; finalOz = 15; boxSize = '12x8x6';
   } else if(totalOz <= 96){
-    tier = 3; var r3 = packRound(totalOz + 8);  finalLbs = r3.l; finalOz = r3.o; boxSize = '15x12x10'; policyId = 272423749015;
+    tier = 3; var r3 = packRound(totalOz + 8);  finalLbs = r3.l; finalOz = r3.o; boxSize = '15x12x10';
   } else if(totalOz <= 240){
-    tier = 4; var r4 = packRound(totalOz + 20); finalLbs = r4.l; finalOz = r4.o; boxSize = '22x13x15'; policyId = 272434338015;
+    tier = 4; var r4 = packRound(totalOz + 20); finalLbs = r4.l; finalOz = r4.o; boxSize = '22x13x15';
   } else {
-    tier = 5; var combinedLbs = lbs + 2; if(oz > 0){ finalLbs = combinedLbs + 1; } else { finalLbs = combinedLbs; } finalOz = 0; boxSize = '24x18x14'; policyId = 272360974015;
+    tier = 5; var combinedLbs = lbs + 2; if(oz > 0){ finalLbs = combinedLbs + 1; } else { finalLbs = combinedLbs; } finalOz = 0; boxSize = '24x18x14';
   }
-  var result = { rawLbs: lbs, rawOz: oz, finalLbs: finalLbs, finalOz: finalOz, boxSize: boxSize, shippingPolicyId: policyId, tier: tier };
-  console.log('[WEIGHT] SKU ' + (sku == null ? '?' : sku) + ' raw: ' + lbs + 'lb ' + oz + 'oz | tier ' + tier + ' | packed: ' + finalLbs + 'lb ' + finalOz + 'oz | box: ' + boxSize + ' | policy: ' + policyId);
+  var result = { rawLbs: lbs, rawOz: oz, finalLbs: finalLbs, finalOz: finalOz, boxSize: boxSize, shippingPolicyId: shippingPolicyIdForOz(totalOz), tier: tier };
+  console.log('[WEIGHT] SKU ' + (sku == null ? '?' : sku) + ' raw: ' + lbs + 'lb ' + oz + 'oz | tier ' + tier + ' | packed: ' + finalLbs + 'lb ' + finalOz + 'oz | box: ' + boxSize + ' | policy: ' + result.shippingPolicyId);
   return result;
 }
 // Map a shipping policy id back to its human label (for legacy display fields)
@@ -5955,8 +5970,15 @@ function buildAddItemXml(record, opts){
   var mpLbs = mp ? (parseFloat(mp.lbs) || 0) : 0;
   var mpOz  = mp ? (parseFloat(mp.oz) || 0) : 0;
   var mpHasWeight = (mpLbs > 0 || mpOz > 0);
+  var mpPolicyId = null; // set below when a manual weight is present
   if(mpHasWeight){
     var mpTotalOz = Math.round((mpLbs * 16) + mpOz);
+    // The manual weight also drives the eBay shipping BUSINESS POLICY, not just the
+    // package numbers: a 10lb sealed package must list under FedEx even when the
+    // stored tier was computed from a lighter bare-item scale reading. Same
+    // thresholds as the automatic path (shippingPolicyIdForOz); the weight and
+    // dimensions themselves are still passed through with no padding at all.
+    mpPolicyId = shippingPolicyIdForOz(mpTotalOz);
     wLbs = Math.floor(mpTotalOz / 16);
     wOz = mpTotalOz % 16;
     var mpL = parseFloat(mp.length) || 0, mpW = parseFloat(mp.width) || 0, mpH = parseFloat(mp.height) || 0;
@@ -6026,8 +6048,15 @@ function buildAddItemXml(record, opts){
   var policies = opts.policies;
   var shippingBlock;
   if(policies && policies.fulfillment_id && policies.payment_id && policies.return_id){
-    var shipId = (tier && tier.shippingPolicyId) ? String(tier.shippingPolicyId)
-      : ((policies.shipping_map && policies.shipping_map[listing.shipping_policy]) || policies.fulfillment_id);
+    var shipId = mpPolicyId ? String(mpPolicyId)
+      : ((tier && tier.shippingPolicyId) ? String(tier.shippingPolicyId)
+      : ((policies.shipping_map && policies.shipping_map[listing.shipping_policy]) || policies.fulfillment_id));
+    if(mpPolicyId){
+      console.log('[EBAY] SKU ' + sku + ' MANUAL package weight ' + wLbs + 'lb ' + wOz + 'oz -> shipping policy '
+        + mpPolicyId + ' (' + shippingPolicyName(mpPolicyId) + ')'
+        + ((tier && tier.shippingPolicyId && String(tier.shippingPolicyId) !== String(mpPolicyId))
+            ? ' — overriding automatic tier policy ' + tier.shippingPolicyId + ' (' + shippingPolicyName(tier.shippingPolicyId) + ')' : ''));
+    }
     shippingBlock = '<SellerProfiles>'
       + '<SellerShippingProfile><ShippingProfileID>' + xmlEscape(shipId) + '</ShippingProfileID></SellerShippingProfile>'
       + '<SellerReturnProfile><ReturnProfileID>' + xmlEscape(returnId) + '</ReturnProfileID></SellerReturnProfile>'
