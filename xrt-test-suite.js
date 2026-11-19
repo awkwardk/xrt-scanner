@@ -17,6 +17,30 @@ let passed = 0, failed = 0;
 const failures = [];
 
 function has(str){ return content.includes(str); }
+function codeOnly(src){
+  return String(src).replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+}
+function exFn(name){
+  var s2 = content.indexOf('function ' + name + '(');
+  if (s2 < 0) return '';
+  var d = 0, seen = false, e = -1;
+  for (var i = s2; i < content.length; i++) {
+    var c = content[i];
+    if (c === '{') { d++; seen = true; }
+    else if (c === '}') { d--; if (seen && d === 0) { e = i + 1; break; } }
+  }
+  return content.slice(s2, e);
+}
+function geminiPrelude(){
+  var names = ['GEMINI_MODEL_ID','GEMINI_THINKING_EXTRACT','GEMINI_THINKING_REASON','GEMINI_THINKING_ALLOWED'];
+  var lines = names.map(function(n){
+    var m = content.match(new RegExp('(?:const|var) ' + n + ' = [^;]*;'));
+    if(!m) throw new Error('missing ' + n);
+    return 'var ' + m[0].replace(/^(?:const|var) /, '');
+  });
+  var fns = ['geminiOpenRouterModel','geminiGenerateContentPath','normalizeGeminiThinking','buildOpenRouterGeminiPayload','assertFlashLiteChatBody','assertFlashLiteGenerateBody','buildScanIdentifyBody','buildScanPriceBody'];
+  return lines.join('\n') + '\n' + fns.map(exFn).join('\n\n');
+}
 function test(name, condition){
   if(condition){ console.log('  \u2713 ', name); passed++; }
   else { console.log('  \u2717 ', name); failed++; failures.push(name); }
@@ -42,7 +66,10 @@ test('LOT requires per-unit $10',  has('Per-unit value'));
 test('KEEP default no price',      has('default KEEP') || has('default to KEEP'));
 test('Vintage items protected',    has('Vintage'));
 test('Medical equipment RECYCLE',  has('Medical'));
-test('Gemini Flash used for scan', has('gemini-2.5-flash'));
+test('Gemini 3.5 Flash-Lite used for scan', has("const GEMINI_MODEL_ID = 'gemini-3.5-flash-lite'") && has('function buildScanIdentifyBody(') && has('function buildScanPriceBody(') && has("thinkingLevel: 'MINIMAL'") && has("thinkingLevel: 'LOW'"));
+test('retired gemini-2.5-flash id is not in executable code', !codeOnly(content).includes('gemini-2.5-flash'));
+test('scan requests do not set temperature', !/\btemperature\s*:/.test(codeOnly(content)));
+test('requests do not send a thinking budget', !/thinkingBudget\s*:/.test(codeOnly(content)) && !/thinking_budget\s*:/.test(codeOnly(content)));
 test('Google Search grounding',    has('google_search'));
 test('Gemini key loaded',          has('GEMINI_KEY'));
 test('callGemini function',        has('function callGemini('));
@@ -91,7 +118,7 @@ test('Power test fail UI',    has('pfFail'));
 
 section('NEW FEATURES v3.0');
 test('Identify route /api/identify-item', has('/api/identify-item'));
-test('Identifier uses Gemini Flash',      has("model: 'google/gemini-2.5-flash'"));
+test('Identifier uses Gemini Flash-Lite', exFn('callGeminiVisionParts').includes('geminiOpenRouterModel(false)') && exFn('callGeminiVisionParts').includes('GEMINI_THINKING_EXTRACT'));
 test('Vision via callGeminiVisionParts',  has('function callGeminiVisionParts('));
 test('No Anthropic dependency',           !has('api.anthropic.com') && !has('ANTHROPIC_API_KEY') && !has('claude-sonnet-4-5') && !has('function callClaude('));
 test('Web search tool enabled',           has('openrouter:web_search'));
@@ -1033,7 +1060,7 @@ test('route degrades gracefully with no OPENROUTER_KEY', has("if(!OPENROUTER_KEY
 test('route never throws — wrapped in try/catch', has("console.log('[VOICE-TRANSCRIBE] error: ' + e.message);") && has("sendJSON(res,200,{success:false, error:'Server error — type the description instead'});"));
 test('transcription failure returns 200, not an HTTP error (never blocks submission)', has("sendJSON(res,200,{success:false, error:'Transcription failed — type the description instead'});"));
 test('success response matches { success: true, transcript }', has('sendJSON(res,200,{success:true, transcript:transcript});'));
-test('transcribeVoiceAudio uses google/gemini-2.5-flash', has('function transcribeVoiceAudio(base64Audio, mimeType, callback){') && has("model: 'google/gemini-2.5-flash',"));
+test('transcribeVoiceAudio uses Gemini 3.5 Flash-Lite', exFn('transcribeVoiceAudio').includes('geminiOpenRouterModel(false)') && exFn('transcribeVoiceAudio').includes('GEMINI_THINKING_EXTRACT'));
 test('system instruction matches spec exactly', has('You are an expert audio transcriber for an electronics and merchandise reselling warehouse. Accurately transcribe the spoken audio verbatim. Pay special attention to quiet speech, alphanumeric model numbers (e.g., P4T, DSi, UTL-001), dimensions (e.g., 14x10x6), testing notes, and cosmetic flaw descriptions. Output ONLY the clean transcribed text without markdown formatting or commentary.'));
 test('audio sent as an input_audio content block', has("{ type: 'input_audio', input_audio: { data: base64Audio, format: fmt } }"));
 
@@ -1065,7 +1092,7 @@ test('audio sent as an input_audio content block', has("{ type: 'input_audio', i
   }
   try {
     var box = {};
-    var code = "var OPENROUTER_KEY = 'test-key';\n" + ex('callOpenRouter') + '\n' + ex('transcribeVoiceAudio') + '\nbox.transcribe = transcribeVoiceAudio;';
+    var code = "var OPENROUTER_KEY = 'test-key';\nvar GEMINI_KEY = 'test-key';\n" + geminiPrelude() + '\n' + ex('callOpenRouter') + '\n' + ex('transcribeVoiceAudio') + '\nbox.transcribe = transcribeVoiceAudio;';
     var _log = console.log; console.log = function(){};
     eval(code);
     console.log = _log;
@@ -1086,6 +1113,8 @@ test('audio sent as an input_audio content block', has("{ type: 'input_audio', i
       test('(transcribe) parses OpenRouter response into transcript text', !err && transcript === 'Dell Latitude E5470 laptop grade B powers on');
       test('(transcribe) mock audio buffer sent as base64 in the request body', !!sentBody && sentBody.indexOf(mockAudioB64) >= 0);
       test('(transcribe) audio/webm;codecs=opus maps to format "webm"', !!sentBody && sentBody.indexOf('"format":"webm"') >= 0);
+      var tb = JSON.parse(sentBody);
+      test('(transcribe) Flash-Lite body uses minimal thinking and omits temperature', tb.model === 'google/gemini-3.5-flash-lite' && tb.reasoning && tb.reasoning.effort === 'minimal' && tb.temperature == null && tb.top_p == null && !(tb.reasoning.max_tokens != null) && tb.messages[tb.messages.length - 1].role === 'user');
     });
 
     mockHttps(200, { choices: [ { message: { content: '```\nZebra P4T label printer\n```' } } ] });
@@ -1123,8 +1152,8 @@ section('VOICE INTAKE AI PIPELINE (fast-submit primary path)');
 test('voiceIdentifyFromPhotos helper exists',   has('function voiceIdentifyFromPhotos(transcript, photoB64Array, callback){'));
 test('generateVoiceListingAI helper exists',    has('function generateVoiceListingAI(sku, transcript, shelf, pvHints, weightLine, visionInfo, photoBlocks, callback){'));
 test('assembleVoiceRecordFromAI helper exists', has('function assembleVoiceRecordFromAI(sku, shelf, saved, transcript, pvHints, winfo, weightPhotoIndex, noScaleDetected, tier, visionInfo, aiData){'));
-test('step 1 vision uses plain gemini-2.5-flash', has("'google/gemini-2.5-flash'") && has('function voiceIdentifyFromPhotos'));
-test('step 2 pricing uses :online grounding',   has("'google/gemini-2.5-flash:online'"));
+test('step 1 vision uses plain Flash-Lite', exFn('voiceIdentifyFromPhotos').includes('callGeminiVisionParts(') && exFn('callGeminiVisionParts').includes('geminiOpenRouterModel(false)') && !exFn('callGeminiVisionParts').includes('geminiOpenRouterModel(true)'));
+test('step 2 pricing uses :online grounding',   exFn('generateVoiceListingAI').includes('geminiOpenRouterModel(true)') && exFn('generateVoiceListingAI').includes('GEMINI_THINKING_REASON'));
 test('visual label override corrects phonetics', has('VISUAL LABEL OVERRIDE:') && has('"four team"') && has('"utah zero zero one"'));
 test('strict factuality rule present',          has('RULE OF STRICT FACTUALITY:'));
 test('no unverified positive assumptions rule', has('NO UNVERIFIED POSITIVE ASSUMPTIONS:') && has('"hinge is sturdy"'));
@@ -1740,6 +1769,87 @@ section('TAXONOMY RESPONSE PARSING (real parser, stubbed HTTP)');
     });
   } catch(e){
     test('getSuggestedCategory Taxonomy parsing functional eval', false);
+    console.log('    ERROR:', e.message);
+  } finally {
+    https.request = realRequest;
+  }
+})();
+
+section('GEMINI 3.5 FLASH-LITE REQUEST BODIES');
+(function(){
+  var https = require('https');
+  var realRequest = https.request;
+  var sent = null;
+  var calls = 0;
+  https.request = function(options, cb){
+    calls++;
+    return { on: function(){}, write: function(w){ sent = w; }, end: function(){
+      var res = { statusCode: 200, on: function(evt, handler){
+        if(evt === 'data') handler(JSON.stringify({ choices: [ { message: { content: 'Cisco ABC Network Switch' } } ] }));
+        else if(evt === 'end') handler();
+      }};
+      cb(res);
+    }};
+  };
+  try {
+    var box = {};
+    var code = "var OPENROUTER_KEY = 'test-key';\nvar GEMINI_KEY = 'test-key';\n" + geminiPrelude() + '\n' + exFn('callGemini') + '\n' + exFn('callOpenRouter') + '\nbox.id = buildScanIdentifyBody;\nbox.price = buildScanPriceBody;\nbox.callGemini = callGemini;\nbox.callOpenRouter = callOpenRouter;\nbox.assertGen = assertFlashLiteGenerateBody;\nbox.path = geminiGenerateContentPath;';
+    var _log = console.log; console.log = function(){};
+    eval(code);
+    console.log = _log;
+
+    var idBody = box.id('QUJD');
+    test('scan identify generateContent body is valid for Flash-Lite', box.assertGen(idBody) === idBody);
+    test('scan identify uses MINIMAL thinking and no temperature', idBody.generationConfig.thinkingConfig.thinkingLevel === 'MINIMAL' && idBody.generationConfig.temperature == null && idBody.generationConfig.topP == null && !idBody.generationConfig.thinkingConfig.thinkingBudget);
+    test('scan identify does not end on a model turn', !(idBody.contents[idBody.contents.length - 1] && idBody.contents[idBody.contents.length - 1].role === 'model'));
+    test('native generateContent path uses gemini-3.5-flash-lite', box.path() === '/v1beta/models/gemini-3.5-flash-lite:generateContent?key=test-key');
+    box.callGemini({ path: box.path() }, JSON.stringify(idBody), function(err, resp){
+      var b = JSON.parse(sent);
+      test('scan identify OpenRouter body uses google/gemini-3.5-flash-lite', !err && b.model === 'google/gemini-3.5-flash-lite');
+      test('scan identify request omits sampling params and thinking budget', b.reasoning && b.reasoning.effort === 'minimal' && b.temperature == null && b.top_p == null && b.top_k == null && b.reasoning.max_tokens == null && b.frequency_penalty == null && b.presence_penalty == null);
+      test('scan identify last turn is the user, with the original one-line prompt', b.messages[b.messages.length - 1].role === 'user' && JSON.stringify(b.messages).indexOf('Never return just a model number alone') >= 0);
+      test('scan identify response still maps back to Gemini candidates', resp && resp.candidates[0].content.parts[0].text === 'Cisco ABC Network Switch');
+    });
+
+    var priceBody = box.price('Cisco ABC Switch', 30, 8);
+    test('scan price generateContent body is valid for Flash-Lite', box.assertGen(priceBody) === priceBody);
+    test('scan price uses LOW thinking, google_search, and no temperature', priceBody.generationConfig.thinkingConfig.thinkingLevel === 'LOW' && priceBody.tools[0].google_search && priceBody.generationConfig.temperature == null);
+    test('scan price has no function response', JSON.stringify(priceBody).indexOf('functionResponse') < 0);
+    box.callGemini({}, JSON.stringify(priceBody), function(err){
+      var b = JSON.parse(sent);
+      test('scan price OpenRouter body uses the :online slug', !err && b.model === 'google/gemini-3.5-flash-lite:online');
+      test('scan price request uses low thinking and keeps the lot rules', b.reasoning && b.reasoning.effort === 'low' && b.temperature == null && b.top_p == null && JSON.stringify(b.messages).indexOf('3 or more completed lot sales') >= 0 && b.messages[b.messages.length - 1].role === 'user');
+    });
+
+    var withTemp = box.id('x');
+    withTemp.generationConfig.temperature = 0.1;
+    var rejected = false;
+    try { box.assertGen(withTemp); } catch(e){ rejected = /temperature/.test(e.message); }
+    test('temperature on a scan body is rejected', rejected);
+
+    var withBudget = box.id('x');
+    withBudget.generationConfig.thinkingConfig.thinkingBudget = 128;
+    rejected = false;
+    try { box.assertGen(withBudget); } catch(e){ rejected = /thinking budget/.test(e.message); }
+    test('thinkingBudget on a scan body is rejected', rejected);
+
+    var callsBefore = calls;
+    box.callOpenRouter({
+      model: 'google/gemini-3.5-flash-lite',
+      thinking: 'minimal',
+      messages: [ { role:'user', content:'hi' }, { role:'assistant', content:'prefill' } ]
+    }, function(err){
+      test('prefilled assistant turn is rejected and not sent', !!err && /prefilled/.test(err.message) && calls === callsBefore);
+    });
+    box.callOpenRouter({
+      model: 'google/gemini-3.5-flash-lite',
+      thinking: 'low',
+      messages: [ { role:'tool', content:'{}' }, { role:'user', content:'continue' } ]
+    }, function(err){
+      test('function result without a call id is rejected', !!err && /missing id/.test(err.message));
+    });
+  } catch(e){
+    test('Flash-Lite request body eval', false);
     console.log('    ERROR:', e.message);
   } finally {
     https.request = realRequest;

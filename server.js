@@ -76,6 +76,157 @@ const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY || '';
 console.log('[STARTUP] Gemini key found:', GEMINI_KEY.length > 0);
 console.log('[STARTUP] OpenRouter key found:', OPENROUTER_KEY.length > 0);
 
+// The only Gemini model id in this app. Google retires gemini-2.5-flash on
+// 2026-12-01 and redirects that id to gemini-3.5-flash-lite, billed at the
+// same $0.30 / $2.50 per 1M tokens. OpenRouter still lists
+// google/gemini-2.5-flash with expiration_date null (checked 2026-11-14) and
+// does not redirect the slug; its provider is Google, so the old slug
+// inherits the December redirect. Call the supported slug directly.
+// OpenRouter chat completions still accept ":online" on any slug for web search.
+const GEMINI_MODEL_ID = 'gemini-3.5-flash-lite';
+// Flash-Lite ignores temperature, topP, and topK. thinkingLevel is the
+// supported control (OpenRouter field: reasoning.effort). Do not send a
+// numeric thinking budget. minimal is the model default and Google's setting
+// for classification and JSON extraction, which is how scan ids stay stable
+// now that temperature 0.1 has no effect. low is a little reasoning for
+// sold-comp pricing, listing copy, and search checks.
+const GEMINI_THINKING_EXTRACT = 'minimal';
+const GEMINI_THINKING_REASON = 'low';
+const GEMINI_THINKING_ALLOWED = { minimal:1, low:1, medium:1, high:1 };
+
+function geminiOpenRouterModel(online){
+  return 'google/' + GEMINI_MODEL_ID + (online ? ':online' : '');
+}
+function geminiGenerateContentPath(){
+  return '/v1beta/models/' + GEMINI_MODEL_ID + ':generateContent?key=' + GEMINI_KEY;
+}
+function normalizeGeminiThinking(level, fallback){
+  var v = String(level || '').toLowerCase();
+  if(GEMINI_THINKING_ALLOWED[v]) return v;
+  return fallback || GEMINI_THINKING_EXTRACT;
+}
+function buildOpenRouterGeminiPayload(payload){
+  payload = payload || {};
+  var body = {
+    model: payload.model || geminiOpenRouterModel(false),
+    max_tokens: payload.max_tokens || 1000,
+    messages: payload.messages || [],
+    reasoning: { effort: normalizeGeminiThinking(payload.thinking, GEMINI_THINKING_EXTRACT) }
+  };
+  if(payload.tools) body.tools = payload.tools;
+  return body;
+}
+// Rejects a chat body Flash-Lite would ignore or error on: sampling params,
+// a numeric thinking budget, a trailing assistant/model prefill, or a function
+// result that does not carry the matching call id.
+function assertFlashLiteChatBody(body){
+  if(!body || typeof body !== 'object') throw new Error('Flash-Lite request missing body');
+  if(String(body.model || '').indexOf(GEMINI_MODEL_ID) < 0) throw new Error('Flash-Lite request uses the wrong model');
+  ['temperature','top_p','top_k','frequency_penalty','presence_penalty'].forEach(function(k){
+    if(body[k] != null) throw new Error('Flash-Lite request includes unsupported ' + k);
+  });
+  if(body.reasoning && body.reasoning.max_tokens != null) throw new Error('Flash-Lite request uses thinking budget');
+  if(!GEMINI_THINKING_ALLOWED[body.reasoning && body.reasoning.effort]) throw new Error('Flash-Lite request missing thinking level');
+  var messages = Array.isArray(body.messages) ? body.messages : [];
+  if(messages.length){
+    var last = messages[messages.length - 1];
+    if(last && (last.role === 'assistant' || last.role === 'model')) throw new Error('Flash-Lite request ends on a prefilled turn');
+  }
+  messages.forEach(function(m){
+    if(m && m.role === 'tool' && !m.tool_call_id) throw new Error('Flash-Lite function result missing id');
+    var parts = (m && Array.isArray(m.content)) ? m.content : [];
+    parts.forEach(function(part){
+      if(!part) return;
+      var fr = part.functionResponse;
+      if((part.type === 'tool_result' || fr) && !(part.tool_call_id || part.id || (fr && fr.id))){
+        throw new Error('Flash-Lite function result missing id');
+      }
+    });
+  });
+  return body;
+}
+function assertFlashLiteGenerateBody(body){
+  if(!body || typeof body !== 'object') throw new Error('Flash-Lite generate body missing');
+  var cfg = body.generationConfig || {};
+  ['temperature','topP','topK','top_p','top_k','frequencyPenalty','presencePenalty','frequency_penalty','presence_penalty'].forEach(function(k){
+    if(cfg[k] != null) throw new Error('Flash-Lite generate body includes unsupported ' + k);
+  });
+  var tc = cfg.thinkingConfig || {};
+  if(tc.thinkingBudget != null || tc.thinking_budget != null) throw new Error('Flash-Lite generate body uses thinking budget');
+  var level = String(tc.thinkingLevel || tc.thinking_level || '').toUpperCase();
+  if(['MINIMAL','LOW','MEDIUM','HIGH'].indexOf(level) < 0) throw new Error('Flash-Lite generate body missing thinkingLevel');
+  var contents = Array.isArray(body.contents) ? body.contents : [];
+  if(contents.length && contents[contents.length - 1] && contents[contents.length - 1].role === 'model'){
+    throw new Error('Flash-Lite generate body ends on a model turn');
+  }
+  contents.forEach(function(turn){
+    ((turn && turn.parts) || []).forEach(function(part){
+      if(part && part.functionResponse && !part.functionResponse.id) throw new Error('Flash-Lite function response missing id');
+    });
+  });
+  return body;
+}
+// Floor scan, step 1. temperature 0.1 used to pin this one-line id. Flash-Lite
+// ignores temperature, so the supported stand-in is thinkingLevel MINIMAL plus
+// the existing one-line instruction (repeated as a system instruction).
+function buildScanIdentifyBody(image){
+  return {
+    systemInstruction: { parts: [{ text: 'Reply with one line only: brand, model number, and item type. No markdown and no second sentence.' }] },
+    contents: [{
+      parts: [
+        { inline_data: { mime_type: 'image/jpeg', data: image } },
+        { text: 'You are an electronics identification expert. Examine this image carefully. Identify the exact brand, model number, and item type. CRITICAL: Always include the item type category even if only a label is visible - use context clues like label format, visible housing, or your knowledge of the brand/model to determine device type. Never return just a model number alone. Reply with ONLY one line: brand model-number item-type-category. Examples: Cisco WS-C2960-24TT-L Network Switch | Apple A1466 MacBook Air Laptop | Tandy TRS-80 Model III Personal Computer | HP LaserJet 4250 Laser Printer' }
+      ]
+    }],
+    // OpenRouter counts thinking tokens against max_tokens. 512 leaves room
+    // for minimal thinking; the route still slices the visible line to 150 chars.
+    generationConfig: { maxOutputTokens: 512, thinkingConfig: { thinkingLevel: 'MINIMAL' } }
+  };
+}
+// Floor scan, step 2. LOW thinking is the small amount of reasoning sold-comp
+// judgment needs. The output contract stays "JSON only", and the route still
+// enforces KEEP / RECYCLE from the numeric price.
+function buildScanPriceBody(itemName, thresh, lotThresh){
+  return {
+    systemInstruction: { parts: [{ text: 'Return only the JSON object the user described. No markdown fences. Sold and completed prices only.' }] },
+    contents: [{
+      parts: [{ text: [
+        'You are an eBay resale pricing expert for an e-waste resale business.',
+        'Search for eBay completed/sold listings for: ' + itemName,
+        '',
+        'SEARCH STRATEGY:',
+        '1. Search eBay completed sold listings for the single unit price.',
+        '2. If single unit price is below $'+thresh+': search specifically for completed LOT listings (search "lot of [item] sold eBay").',
+        '3. Only assign LOT if you find real evidence of 3+ lot sales in last 90 days.',
+        '',
+        'VERDICT RULES:',
+        '- KEEP: single unit avg sold price >= $'+thresh,
+        '- LOT: ALL must be true from actual search results:',
+        '    * Single unit price between $'+lotThresh+' and $'+(thresh-1),
+        '    * 3 or more completed lot sales in last 90 days on eBay',
+        '    * Lot total sale price at least $30',
+        '    * Per-unit value within lots at least $10 per item',
+        '    * Pricing consistent - not one outlier',
+        '    * Common genuine lot items: office phones, VoIP phones, network switches, keyboards, RAM, power supplies',
+        '- RECYCLE: single unit avg sold < $'+lotThresh+', OR no meaningful eBay market, OR fewer than 3 lot sales found, OR lot per-unit under $10',
+        '- When price uncertain return KEEP',
+        '- Vintage electronics (Apple, Tandy, Commodore, Atari, IBM, HP vintage) almost always have eBay markets - search carefully before RECYCLE',
+        '- Medical or regulated equipment: always RECYCLE',
+        '',
+        'CRITICAL: Only assign LOT when search results prove it. Never assume lot demand.',
+        'CRITICAL: Return eBay SOLD/COMPLETED prices only - not current listings or retail prices.',
+        'CRITICAL: These are USED / pre-owned resale items. Base the price on USED, pre-owned, open-box, and refurbished condition sold comps. Do NOT use new/sealed sold prices as the baseline — new prices run higher and would overprice a used item.',
+        '',
+        'Return ONLY this JSON, no markdown:',
+        '{"verdict":"KEEP","item_name":"name","avg_sold_price":45,"reason":"One plain English sentence for a warehouse employee. If LOT cite evidence: how many lot sales found and typical lot price."}'
+      ].join('\n') }]
+    }],
+    tools: [{ google_search: {} }],
+    generationConfig: { maxOutputTokens: 1024, thinkingConfig: { thinkingLevel: 'LOW' } }
+  };
+}
+
+
 // ── eBay configuration (v4) ──
 const EBAY_APP_ID = process.env.EBAY_APP_ID || '';
 const EBAY_DEV_ID = process.env.EBAY_DEV_ID || '';
@@ -717,8 +868,9 @@ function generateVoiceListingAI(sku, transcript, shelf, pvHints, weightLine, vis
     var content = (photoBlocks || []).concat([{ type:'text', text: userMessage }]);
     console.log('[VOICE] SKU ' + sku + ' Step 2 — generating listing with ' + (photoBlocks || []).length + ' photos via Gemini Flash (online search)');
     callOpenRouter({
-      model: 'google/gemini-2.5-flash:online',
-      max_tokens: 2500,
+      model: geminiOpenRouterModel(true),
+      thinking: GEMINI_THINKING_REASON,
+      max_tokens: 4096,
       messages: [ { role:'system', content: systemPrompt }, { role:'user', content: content } ]
     }, function(err, text){
       if(err || !text){ console.log('[VOICE] SKU ' + sku + ' Step 2 failed: ' + (err ? err.message : 'empty response')); callback(null); return; }
@@ -730,7 +882,7 @@ function generateVoiceListingAI(sku, transcript, shelf, pvHints, weightLine, vis
 }
 
 // Voice intake audio transcription (POST /api/voice/transcribe) — replaces the old browser-native
-// webkitSpeechRecognition dictation with a server-side Gemini 2.5 Flash transcription call, so it
+// webkitSpeechRecognition dictation with a server-side Gemini 3.5 Flash-Lite transcription call, so it
 // works in any browser that supports MediaRecorder (not just Chrome) and handles quiet speech,
 // alphanumeric model numbers, and background warehouse noise far better than on-device recognition.
 // base64Audio: raw base64 audio data (no data: URL prefix). mimeType: the MediaRecorder blob's type
@@ -750,7 +902,8 @@ function transcribeVoiceAudio(base64Audio, mimeType, callback){
     var systemPrompt = 'You are an expert audio transcriber for an electronics and merchandise reselling warehouse. Accurately transcribe the spoken audio verbatim. Pay special attention to quiet speech, alphanumeric model numbers (e.g., P4T, DSi, UTL-001), dimensions (e.g., 14x10x6), testing notes, and cosmetic flaw descriptions. Output ONLY the clean transcribed text without markdown formatting or commentary.';
 
     callOpenRouter({
-      model: 'google/gemini-2.5-flash',
+      model: geminiOpenRouterModel(false),
+      thinking: GEMINI_THINKING_EXTRACT,
       max_tokens: 1500,
       messages: [
         { role: 'system', content: systemPrompt },
@@ -1176,31 +1329,41 @@ function conditionIdToEnum(id){
 }
 
 function callGemini(options, body, callback) {
-  // Route through OpenRouter to bypass Google IP restrictions
+  // Route through OpenRouter to bypass Google IP restrictions.
+  // options.path is the native generateContent URL (geminiGenerateContentPath).
+  // The request that leaves the server is the OpenRouter body below.
   var geminiBody = JSON.parse(body);
-  var messages = [];
-
-  // Convert Gemini format to OpenRouter/OpenAI format
-  var parts = geminiBody.contents[0].parts;
-  var content = [];
-  parts.forEach(function(part) {
-    if(part.text) {
-      content.push({type:'text', text:part.text});
-    } else if(part.inline_data) {
-      content.push({type:'image_url', image_url:{url:'data:'+part.inline_data.mime_type+';base64,'+part.inline_data.data}});
+  var orBody;
+  try {
+    assertFlashLiteGenerateBody(geminiBody);
+    var messages = [];
+    if(geminiBody.systemInstruction && geminiBody.systemInstruction.parts){
+      var sysText = geminiBody.systemInstruction.parts.map(function(p){ return (p && p.text) || ''; }).join('\n').trim();
+      if(sysText) messages.push({ role:'system', content: sysText });
     }
-  });
-  messages.push({role:'user', content:content});
-
-  // Determine if this is a search-enabled request
-  var useSearch = geminiBody.tools && geminiBody.tools.some(function(t){ return t.google_search !== undefined; });
-
-  var orBody = JSON.stringify({
-    model: useSearch ? 'google/gemini-2.5-flash:online' : 'google/gemini-2.5-flash',
-    messages: messages,
-    max_tokens: geminiBody.generationConfig ? geminiBody.generationConfig.maxOutputTokens : 300,
-    temperature: geminiBody.generationConfig ? geminiBody.generationConfig.temperature : 0.1
-  });
+    var parts = geminiBody.contents[0].parts;
+    var content = [];
+    parts.forEach(function(part) {
+      if(part.text) {
+        content.push({type:'text', text:part.text});
+      } else if(part.inline_data) {
+        content.push({type:'image_url', image_url:{url:'data:'+part.inline_data.mime_type+';base64,'+part.inline_data.data}});
+      }
+    });
+    messages.push({role:'user', content:content});
+    var useSearch = geminiBody.tools && geminiBody.tools.some(function(t){ return t.google_search !== undefined; });
+    var cfg = geminiBody.generationConfig || {};
+    var tc = cfg.thinkingConfig || {};
+    orBody = JSON.stringify(assertFlashLiteChatBody(buildOpenRouterGeminiPayload({
+      model: geminiOpenRouterModel(!!useSearch),
+      max_tokens: cfg.maxOutputTokens || 300,
+      messages: messages,
+      thinking: tc.thinkingLevel || tc.thinking_level || GEMINI_THINKING_EXTRACT
+    })));
+  } catch(e) {
+    callback(e);
+    return;
+  }
 
   var orOptions = {
     hostname: 'openrouter.ai',
@@ -1244,16 +1407,13 @@ function callGemini(options, body, callback) {
 }
 
 function callOpenRouter(payload, callback) {
-  var payloadObj = {
-    model: payload.model,
-    max_tokens: payload.max_tokens || 1000,
-    messages: payload.messages,
-    temperature: 0.1
-  };
-  // Additive: pass an OpenRouter web-search tool when provided (used by the Spec Verifier).
-  // Matches the buyer finder's confirmed-working format: body.tools = [{type:'openrouter:web_search',...}]
-  if(payload.tools) payloadObj.tools = payload.tools;
-  var body = JSON.stringify(payloadObj);
+  var body;
+  try {
+    body = JSON.stringify(assertFlashLiteChatBody(buildOpenRouterGeminiPayload(payload)));
+  } catch(e) {
+    callback(e);
+    return;
+  }
 
   var options = {
     hostname: 'openrouter.ai',
@@ -1287,7 +1447,7 @@ function callOpenRouter(payload, callback) {
   req.end();
 }
 
-// ── Gemini Flash vision (via OpenRouter) — the single vision path for XRT.
+// ── Gemini Flash-Lite vision (via OpenRouter) — the single vision path for XRT.
 // Accepts ordered parts: {text:'...'} and/or {b64:'<base64 jpeg>'} and/or {url:'https://...'}.
 // Sends them as OpenRouter text / image_url blocks and hands back an Anthropic-SHAPED response
 // ({content:[{type:'text',text}]}) so every existing extractText()/extractFirstJson() call site is
@@ -1299,7 +1459,8 @@ function callGeminiVisionParts(parts, maxTokens, callback){
     return { type:'text', text: String((p && p.text) || '') };
   });
   callOpenRouter({
-    model: 'google/gemini-2.5-flash',
+    model: geminiOpenRouterModel(false),
+    thinking: GEMINI_THINKING_EXTRACT,
     max_tokens: maxTokens || 1024,
     messages: [{ role:'user', content: content }]
   }, function(err, text){
@@ -1536,20 +1697,12 @@ const server = http.createServer(function(req, res) {
         return;
       }
 
-      // Step 1: Gemini Flash vision - identify item
-      var step1Body = JSON.stringify({
-        contents: [{
-          parts: [
-            {inline_data: {mime_type: 'image/jpeg', data: image}},
-            {text: 'You are an electronics identification expert. Examine this image carefully. Identify the exact brand, model number, and item type. CRITICAL: Always include the item type category even if only a label is visible - use context clues like label format, visible housing, or your knowledge of the brand/model to determine device type. Never return just a model number alone. Reply with ONLY one line: brand model-number item-type-category. Examples: Cisco WS-C2960-24TT-L Network Switch | Apple A1466 MacBook Air Laptop | Tandy TRS-80 Model III Personal Computer | HP LaserJet 4250 Laser Printer'}
-          ]
-        }],
-        generationConfig: {maxOutputTokens: 100, temperature: 0.1}
-      });
+      // Step 1: Gemini Flash-Lite vision - identify item
+      var step1Body = JSON.stringify(buildScanIdentifyBody(image));
 
       var step1Opts = {
         hostname: 'generativelanguage.googleapis.com',
-        path: '/v1beta/models/gemini-2.5-flash:generateContent?key=' + GEMINI_KEY,
+        path: geminiGenerateContentPath(),
         method: 'POST',
         headers: {'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(step1Body)}
       };
@@ -1568,47 +1721,12 @@ const server = http.createServer(function(req, res) {
         if(!itemName || itemName.length < 3) itemName = 'Unknown electronic item';
         console.log('[SCAN] Identified:', itemName);
 
-        // Step 2: Gemini Flash with Google Search grounding - pricing research
-        var step2Body = JSON.stringify({
-          contents: [{
-            parts: [{text: [
-              'You are an eBay resale pricing expert for an e-waste resale business.',
-              'Search for eBay completed/sold listings for: ' + itemName,
-              '',
-              'SEARCH STRATEGY:',
-              '1. Search eBay completed sold listings for the single unit price.',
-              '2. If single unit price is below $'+thresh+': search specifically for completed LOT listings (search "lot of [item] sold eBay").',
-              '3. Only assign LOT if you find real evidence of 3+ lot sales in last 90 days.',
-              '',
-              'VERDICT RULES:',
-              '- KEEP: single unit avg sold price >= $'+thresh,
-              '- LOT: ALL must be true from actual search results:',
-              '    * Single unit price between $'+lotThresh+' and $'+(thresh-1),
-              '    * 3 or more completed lot sales in last 90 days on eBay',
-              '    * Lot total sale price at least $30',
-              '    * Per-unit value within lots at least $10 per item',
-              '    * Pricing consistent - not one outlier',
-              '    * Common genuine lot items: office phones, VoIP phones, network switches, keyboards, RAM, power supplies',
-              '- RECYCLE: single unit avg sold < $'+lotThresh+', OR no meaningful eBay market, OR fewer than 3 lot sales found, OR lot per-unit under $10',
-              '- When price uncertain return KEEP',
-              '- Vintage electronics (Apple, Tandy, Commodore, Atari, IBM, HP vintage) almost always have eBay markets - search carefully before RECYCLE',
-              '- Medical or regulated equipment: always RECYCLE',
-              '',
-              'CRITICAL: Only assign LOT when search results prove it. Never assume lot demand.',
-              'CRITICAL: Return eBay SOLD/COMPLETED prices only - not current listings or retail prices.',
-              'CRITICAL: These are USED / pre-owned resale items. Base the price on USED, pre-owned, open-box, and refurbished condition sold comps. Do NOT use new/sealed sold prices as the baseline — new prices run higher and would overprice a used item.',
-              '',
-              'Return ONLY this JSON, no markdown:',
-              '{"verdict":"KEEP","item_name":"name","avg_sold_price":45,"reason":"One plain English sentence for a warehouse employee. If LOT cite evidence: how many lot sales found and typical lot price."}'
-            ].join('\n')}]
-          }],
-          tools: [{google_search: {}}],
-          generationConfig: {maxOutputTokens: 300, temperature: 0.1}
-        });
+        // Step 2: Gemini Flash-Lite with Google Search grounding - pricing research
+        var step2Body = JSON.stringify(buildScanPriceBody(itemName, thresh, lotThresh));
 
         var step2Opts = {
           hostname: 'generativelanguage.googleapis.com',
-          path: '/v1beta/models/gemini-2.5-flash:generateContent?key=' + GEMINI_KEY,
+          path: geminiGenerateContentPath(),
           method: 'POST',
           headers: {'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(step2Body)}
         };
@@ -1664,15 +1782,16 @@ const server = http.createServer(function(req, res) {
       if(!image){sendJSON(res,200,{code:null});return;}
 
       callOpenRouter({
-        model: 'google/gemini-2.5-flash',
-        max_tokens: 20,
+        model: geminiOpenRouterModel(false),
+        thinking: GEMINI_THINKING_EXTRACT,
+        max_tokens: 128,
         messages:[{role:'user',content:[
           {type:'image_url',image_url:{url:'data:image/jpeg;base64,'+image}},
           {type:'text',text:'You are reading a shelf location sticker in a warehouse. The sticker contains a short alphanumeric code like F4, E5, A12, B3. Read the code and return ONLY the code itself, nothing else. If you cannot read a clear code, return the word UNCLEAR.'}
         ]}]
       }, function(err, r) {
         if(err || !r){sendJSON(res,200,{code:null});return;}
-        var code = r.trim().toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,8);
+        var code = String(r).trim().toUpperCase().split(/\s+/)[0].replace(/[^A-Z0-9]/g,'').slice(0,8);
         sendJSON(res,200,{code: code.length > 0 && code !== 'UNCLEAR' ? code : null});
       });
     });
@@ -1689,7 +1808,7 @@ const server = http.createServer(function(req, res) {
     itq = String(itq || '').trim();
     if(!itq || !OPENROUTER_KEY){ sendJSON(res, 200, {description: null}); return; }
     var itPrompt = "The user is an eBay reseller processing this item:\n'" + itq + "'\nIn 2-3 sentences, confirm what this item is, what it is used for, and its key identifying features. Be specific and factual. If this appears to be a lot of multiple items, note that.\nReturn only the description, no preamble.";
-    callOpenRouter({ model:'google/gemini-2.5-flash', max_tokens:300, messages:[{role:'user', content: itPrompt}] }, function(itErr, itText){
+    callOpenRouter({ model:geminiOpenRouterModel(false), thinking:GEMINI_THINKING_EXTRACT, max_tokens:512, messages:[{role:'user', content: itPrompt}] }, function(itErr, itText){
       if(itErr || !itText || !String(itText).trim()){ console.log('[IDENTIFY] no description returned (' + (itErr ? itErr.message : 'empty response') + ')'); sendJSON(res, 200, {description: null}); return; }
       var itDesc = String(itText).trim();
       console.log('[IDENTIFY] description returned: "' + itDesc.slice(0, 50) + '"');
@@ -1698,7 +1817,7 @@ const server = http.createServer(function(req, res) {
     return;
   }
 
-  // ── PROCESSOR IDENTIFIER (FEATURE 1) — Gemini 2.5 Flash vision via OpenRouter ──
+  // ── PROCESSOR IDENTIFIER (FEATURE 1) — Gemini 3.5 Flash-Lite vision via OpenRouter ──
   if(req.method==='POST' && req.url==='/api/identify-item'){
     parseBody(req, function(err, parsed){
       if(err){ sendJSON(res,400,{error:'Bad request'}); return; }
@@ -1906,7 +2025,7 @@ const server = http.createServer(function(req, res) {
   }
 
 
-  // ── VOICE INTAKE AUDIO TRANSCRIPTION: MediaRecorder blob -> Gemini 2.5 Flash transcript ──
+  // ── VOICE INTAKE AUDIO TRANSCRIPTION: MediaRecorder blob -> Gemini 3.5 Flash-Lite transcript ──
   // Replaces webkitSpeechRecognition dictation. Body: {audio: base64 (no data: prefix), mime_type}.
   // Never blocks the intake flow: any failure (missing key, network, bad audio) returns
   // success:false with a message telling the operator to type instead — the frontend always
@@ -1998,7 +2117,7 @@ const server = http.createServer(function(req, res) {
         sendJSON(res,200,{ success:true, sku:sku, photos_saved:saved });
 
         // CRITICAL FIX: the deterministic regex parser is no longer the primary path. The standard
-        // OpenRouter Gemini 2.5 Flash pipeline now drives generation:
+        // OpenRouter Gemini 3.5 Flash-Lite pipeline now drives generation:
         //   Step 1a: detectWeightAndDims()      — scale reading (UNCHANGED, proven — last photo only)
         //   Step 1b: voiceIdentifyFromPhotos()   — confirm brand/model by reading photo labels
         //   Step 2:  generateVoiceListingAI()    — :online (Google Search grounding) pricing + listing
@@ -3498,7 +3617,7 @@ function generateRefreshItem(item, userNotes, callback){
     ].join('\n');
     var prevImp = item.improved || {};
     var refreshPhotoUrls = (prevImp.photos && prevImp.photos.length) ? prevImp.photos : (orig.photos || []);
-    // MIGRATION: refresh generation runs on Gemini 2.5 Flash via OpenRouter. Photos are already on
+    // MIGRATION: refresh generation runs on Gemini 3.5 Flash-Lite via OpenRouter. Photos are already on
     // eBay's CDN, so they are passed straight through as remote image_url blocks (max 6, same
     // selection as before: all when <=6, else the first 5 plus the last).
     var _refreshUrls = (Array.isArray(refreshPhotoUrls) ? refreshPhotoUrls : []).map(function(p){
@@ -3514,8 +3633,9 @@ function generateRefreshItem(item, userNotes, callback){
     // relist price was invented rather than comped. Same model/transport/
     // prompt/parse path as /processor now.
     callOpenRouter({
-      model: 'google/gemini-2.5-flash:online',
-      max_tokens: 2500,
+      model: geminiOpenRouterModel(true),
+      thinking: GEMINI_THINKING_REASON,
+      max_tokens: 4096,
       messages: [ { role:'system', content: sys }, { role:'user', content: _refreshBlocks.concat([{ type:'text', text: userMsg }]) } ]
     }, function(err, gText){
       if(err){ callback({ success:false, error:'AI request failed' }); return; }
@@ -4173,9 +4293,9 @@ function processBatch(pending) {
   processNext();
 }
 
-// ── LISTING GENERATION (Gemini 2.5 Flash via OpenRouter) — FIX 1 ──
-// Step 1: vision ID via Gemini 2.5 Flash (skipped if identifier screen already ran)
-// Step 2: listing write via Gemini 2.5 Flash (OpenRouter)
+// ── LISTING GENERATION (Gemini 3.5 Flash-Lite via OpenRouter) — FIX 1 ──
+// Step 1: vision ID via Gemini 3.5 Flash-Lite (skipped if identifier screen already ran)
+// Step 2: listing write via Gemini 3.5 Flash-Lite (OpenRouter)
 // ── LISTING GENERATION QUEUE ──
 // Handles 50+ items/shift without rate-limit errors: one item at a time, an
 // 8s gap between API calls, 60s pause on a 429, max 3 retries before failed.
@@ -4523,7 +4643,7 @@ function regenerateListing(sku, userNotes, callback){
 
   // CHANGE 5: regenerate uses base64 LOCAL photos when they still exist on disk (scale photo excluded).
   // FIX 1: photos are compressed for the model (async) before the call; originals on disk are untouched.
-  // MIGRATION: regenerate now uses Gemini 2.5 Flash via OpenRouter, matching the main listing pipeline
+  // MIGRATION: regenerate now uses Gemini 3.5 Flash-Lite via OpenRouter, matching the main listing pipeline
   // exactly (same model, same transport, same system+user message shape, no Anthropic web_search tool).
   var regenPhotoCount = 0;
   while(fs.existsSync(path.join(itemDir, 'photo_' + (regenPhotoCount + 1) + '.jpg'))) regenPhotoCount++;
@@ -4531,8 +4651,9 @@ function regenerateListing(sku, userNotes, callback){
   var _regenOrBlocks = toOpenRouterImageBlocks(regenPhotoBlocks);
   console.log('[REGEN] SKU ' + sku + ' regenerating with ' + _regenOrBlocks.length + ' photos (Gemini)');
   callOpenRouter({
-    model: 'google/gemini-2.5-flash',
-    max_tokens: 2500,
+    model: geminiOpenRouterModel(false),
+    thinking: GEMINI_THINKING_REASON,
+    max_tokens: 4096,
     messages: [ { role:'system', content: systemPrompt }, { role:'user', content: _regenOrBlocks.concat([{ type:'text', text: userMessage }]) } ]
   }, function(err, gText){
     var resp = { content: [ { type:'text', text: (gText || '') } ] };
@@ -4669,8 +4790,9 @@ function generateListingGemini(sku, itemData, photos, callback){
     var userMessage = buildDualUserMessage(itemData, itemData && itemData._regenNotes);
     var content = photoBlocks.concat([{ type:'text', text: userMessage }]);
     callOpenRouter({
-      model: 'google/gemini-2.5-flash',
-      max_tokens: 2500,
+      model: geminiOpenRouterModel(false),
+      thinking: GEMINI_THINKING_REASON,
+      max_tokens: 4096,
       messages: [
         { role:'system', content: systemPrompt },
         { role:'user', content: content }
@@ -5120,8 +5242,9 @@ function verifySpecs(sku, listing, pipeline, humanFacts, callback){
 
     // ── Call 1: extract + search (OpenRouter native web search, same tool as the buyer finder) ──
     callOpenRouter({
-      model: 'google/gemini-2.5-flash',
-      max_tokens: 1500,
+      model: geminiOpenRouterModel(false),
+      thinking: GEMINI_THINKING_REASON,
+      max_tokens: 2048,
       tools: [{ type: 'openrouter:web_search', parameters: { engine: 'native', max_results: 5, search_context_size: 'medium' } }],
       messages: [ { role:'system', content: sys1 }, { role:'user', content: user1 } ]
     }, function(e1, analysis){
@@ -5153,7 +5276,7 @@ function verifySpecs(sku, listing, pipeline, humanFacts, callback){
         'Return only JSON, no other text.'
       ].join('\n');
       callOpenRouter({
-        model: 'google/gemini-2.5-flash', max_tokens: 1200,
+        model: geminiOpenRouterModel(false), thinking: GEMINI_THINKING_EXTRACT, max_tokens: 1200,
         messages: [ { role:'system', content:'Extract the fact-check findings into JSON.' }, { role:'user', content: user2 } ]
       }, function(e2, jsonText){
         if(e2 || !jsonText){ console.log('[SPEC] SKU ' + sku + ' verifier failed: ' + (e2 ? e2.message : 'empty extraction')); callback(listing); return; }
@@ -5182,7 +5305,7 @@ function verifySpecs(sku, listing, pipeline, humanFacts, callback){
 // post-generation stage runs the Spec Verifier (web-search accuracy check)
 // (photo vs listing), applying corrections to record.listing in place. Legacy dual-test records
 // (record.gemini present but record.listing empty) fall back to record.gemini. Never blocks.
-// All generation here runs on Gemini 2.5 Flash via OpenRouter (the Anthropic generator was removed).
+// All generation here runs on Gemini 3.5 Flash-Lite via OpenRouter (the Anthropic generator was removed).
 function runDualPipeline(sku, callback){
   callback = typeof callback === 'function' ? callback : function(){};
   var itemDir = path.join(DATA_DIR, 'items', String(sku));
@@ -5467,7 +5590,7 @@ function processItem(item, callback) {
     var listingPrompt = promptLines.join('\n');
     // CHANGE 1 (Gemini single pipeline): new items are generated by Gemini Flash via OpenRouter.
     // MIGRATION: the Anthropic Sonnet generator has been removed entirely — every AI call in XRT now
-    // runs on Gemini 2.5 Flash via OpenRouter. Photos are still compressed via
+    // runs on Gemini 3.5 Flash-Lite via OpenRouter. Photos are still compressed via
     // buildLocalPhotoBase64Blocks, then converted to OpenRouter image_url blocks.
     buildLocalPhotoBase64Blocks(itemDir, photoCount, weightIdx, meta.testingPhotos, sku, function(listingPhotoBlocks){
     var _orBlocks = toOpenRouterImageBlocks(listingPhotoBlocks);
@@ -5476,8 +5599,9 @@ function processItem(item, callback) {
 
     // ── Step 2: listing write via Gemini Flash (photos passed as base64 image_url blocks) ──
     callOpenRouter({
-      model: 'google/gemini-2.5-flash',
-      max_tokens: 2500,
+      model: geminiOpenRouterModel(false),
+      thinking: GEMINI_THINKING_REASON,
+      max_tokens: 4096,
       messages: [ { role:'system', content: listingSystemPrompt }, { role:'user', content: _orBlocks.concat([{ type:'text', text: listingPrompt }]) } ]
     }, function(gErr, gText) {
       // Synthesize a content-block-shaped response so the assembly code below stays unchanged.
