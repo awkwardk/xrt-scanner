@@ -358,6 +358,60 @@ function calculateShippingTier(lbs, oz, sku){
   console.log('[WEIGHT] SKU ' + (sku == null ? '?' : sku) + ' raw: ' + lbs + 'lb ' + oz + 'oz | tier ' + tier + ' | packed: ' + finalLbs + 'lb ' + finalOz + 'oz | box: ' + boxSize + ' | policy: ' + result.shippingPolicyId);
   return result;
 }
+// What a record will ACTUALLY list under, honoring a manual package override.
+// The Listings cards used to print listing.shipping_policy, a string frozen at
+// record-creation time from the bare-item scale reading, so a package the
+// operator weighed at 10lb still displayed "GA 6lbs or less" while
+// buildAddItemXml correctly sent FedEx. Every surface that shows or needs the
+// effective policy goes through here instead, so the card and the payload can
+// never disagree again.
+//
+// The automatic branch deliberately returns the SAME fields the cards already
+// rendered (listing.shipping_policy, selected_box/tier box/box_dimensions) so
+// records without an override display byte-identically to before.
+function effectiveShipping(record){
+  record = record || {};
+  var listing = record.listing || {};
+  var meta = record.meta || {};
+  var tier = record.shipping_tier || meta.shipping_tier || null;
+  var autoBox = listing.selected_box || ((tier && tier.boxSize) ? tier.boxSize : (listing.box_dimensions || ''));
+  var mp = record.manual_package || null;
+  var mpLbs = mp ? (parseFloat(mp.lbs) || 0) : 0;
+  var mpOz  = mp ? (parseFloat(mp.oz)  || 0) : 0;
+  if(mpLbs > 0 || mpOz > 0){
+    var totalOz = Math.round((mpLbs * 16) + mpOz);
+    var pid = shippingPolicyIdForOz(totalOz);
+    var mpL = parseFloat(mp.length) || 0, mpW = parseFloat(mp.width) || 0, mpH = parseFloat(mp.height) || 0;
+    var hasDims = (mpL > 0 && mpW > 0 && mpH > 0);
+    return { manual: true,
+      policyId: String(pid), policyName: shippingPolicyName(pid),
+      lbs: Math.floor(totalOz / 16), oz: totalOz % 16,
+      boxSize: hasDims ? (mpL + 'x' + mpW + 'x' + mpH) : autoBox,
+      boxManual: hasDims };
+  }
+  return { manual: false,
+    policyId: (tier && tier.shippingPolicyId) ? String(tier.shippingPolicyId) : null,
+    policyName: listing.shipping_policy || '',
+    lbs: tier ? tier.finalLbs : null, oz: tier ? tier.finalOz : null,
+    boxSize: autoBox, boxManual: false };
+}
+
+// Shared markup for the "Ship:" / "Box:" cells on a listing card, so the two
+// card builders cannot drift apart.
+function shipCellHtml(eff, skuStr){
+  if(!eff.policyName) return '';
+  return '<span><b>Ship:</b> <span id="ship_' + skuStr + '">' + eff.policyName
+    + (eff.manual ? ' <span style="color:#2e7d32;font-weight:bold;">(actual pkg)</span>' : '')
+    + '</span></span>';
+}
+function pkgCellHtml(eff, skuStr){
+  if(!eff.manual) return '';
+  return '<span id="mppkg_' + skuStr + '" style="color:#2e7d32;font-weight:bold;" '
+    + 'title="Actual sealed-package weight entered by the operator. Overrides the automatic tier padding and drives the eBay shipping policy.">'
+    + '&#128230; Actual Pkg: ' + eff.lbs + ' lbs ' + eff.oz + ' oz'
+    + (eff.boxManual ? (' | ' + eff.boxSize) : '') + '</span>';
+}
+
 // Map a shipping policy id back to its human label (for legacy display fields)
 function shippingPolicyName(id){
   id = String(id);
@@ -2773,7 +2827,11 @@ const server = http.createServer(function(req, res) {
       }
       try { fs.writeFileSync(lp, JSON.stringify(record, null, 2)); }
       catch(e){ sendJSON(res,500,{success:false, error:'Write failed'}); return; }
-      sendJSON(res,200,{success:true, manual_package: record.manual_package || null});
+      var effNow = effectiveShipping(record);
+      sendJSON(res,200,{success:true, manual_package: record.manual_package || null,
+        shipping_policy: effNow.policyName, shipping_policy_id: effNow.policyId,
+        box_dimensions: effNow.boxSize, manual: effNow.manual,
+        pkg_label: effNow.manual ? (effNow.lbs + ' lbs ' + effNow.oz + ' oz' + (effNow.boxManual ? (' | ' + effNow.boxSize) : '')) : ''});
     });
     return;
   }
@@ -7225,14 +7283,16 @@ function buildDualCardHtml(r, i, colors, ebayStat){
 
   // ── shared info row (weight / category / dimensions / shipping) — item-level edit fns ──
   var wtier = r.shipping_tier || meta.shipping_tier || null;
+  var eff = effectiveShipping(r);
   var hasWeight = !!(wtier && ((wtier.rawLbs || 0) > 0 || (wtier.rawOz || 0) > 0));
   var infoRow = '<div style="background:#f5f5f5;border-bottom:1px solid #ddd;padding:8px 16px;font-size:12.5px;color:#444;display:flex;flex-wrap:wrap;gap:6px 18px;">'
     + '<span><b>Shelf:</b> ' + (meta.shelf || '&mdash;') + '</span>'
     + (wtier ? ('<span><b>Weight:</b> <span id="wt_' + skuStr + '" data-sku="' + skuStr + '" data-lbs="' + wtier.rawLbs + '" data-oz="' + wtier.rawOz + '" onclick="editWeight(this)" title="Click to edit weight" style="cursor:pointer;color:#1565c0;border-bottom:1px dashed #1565c0;">' + wtier.rawLbs + ' lbs ' + wtier.rawOz + ' oz &rarr; Tier ' + (wtier.tier != null ? wtier.tier : '?') + ' | ' + (wtier.boxSize || '') + '</span> <span id="wtmsg2_' + skuStr + '" style="font-weight:bold;"></span></span>') : ((r.weight || meta.weight) ? '<span><b>Weight:</b> ' + (r.weight || meta.weight) + '</span>' : ''))
     + '<span><b>Custom SKU:</b> ' + (listing.custom_sku || (skuStr + (meta.shelf ? '-' + meta.shelf : ''))) + '</span>'
     + '<span><b>eBay Category:</b> <span id="cat_' + skuStr + '" data-sku="' + skuStr + '" data-catid="' + (r.ebay_category_id || listing.category_id || '') + '" onclick="editCategory(this)" title="Click to edit category ID" style="cursor:pointer;color:#1565c0;border-bottom:1px dashed #1565c0;">' + ((r.ebay_category_id || listing.category_id) ? ((r.ebay_category_name ? r.ebay_category_name + ' ' : '') + '(' + (r.ebay_category_id || listing.category_id) + ')') : '(set)') + '</span> <span id="catmsg_' + skuStr + '" style="font-weight:bold;"></span></span>'
-    + (listing.shipping_policy ? '<span><b>Ship:</b> ' + listing.shipping_policy + '</span>' : '')
-    + '<span><b>Box:</b> <span id="dim_' + skuStr + '" data-sku="' + skuStr + '" onclick="editDims(this)" title="Click to edit dimensions (LxWxH inches)" style="cursor:pointer;color:#1565c0;border-bottom:1px dashed #1565c0;">' + (listing.selected_box || ((wtier && wtier.boxSize) ? wtier.boxSize : (listing.box_dimensions || '')) || '(set)') + '</span> <span id="dimmsg_' + skuStr + '" style="font-weight:bold;"></span></span>'
+    + shipCellHtml(eff, skuStr)
+    + pkgCellHtml(eff, skuStr)
+    + '<span><b>Box:</b> <span id="dim_' + skuStr + '" data-sku="' + skuStr + '" onclick="editDims(this)" title="Click to edit dimensions (LxWxH inches)" style="cursor:pointer;color:#1565c0;border-bottom:1px dashed #1565c0;">' + (eff.boxSize || '(set)') + '</span> <span id="dimmsg_' + skuStr + '" style="font-weight:bold;"></span></span>'
     + '<span style="display:inline-flex;align-items:center;gap:6px;"><label for="qty_' + skuStr + '"><b>Qty:</b></label><input id="qty_' + skuStr + '" type="number" min="1" max="99" value="' + quantity + '" style="width:56px;padding:4px 6px;border:1px solid #bbb;border-radius:4px;font-size:12.5px;"><button onclick="saveQty(\'' + skuStr + '\')" style="padding:4px 10px;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;background:#455a64;color:#fff;">Save</button><span id="qtymsg_' + skuStr + '" style="font-size:12px;"></span></span>'
     + '</div>';
   var weightEntry = !hasWeight ?
@@ -7386,6 +7446,7 @@ function generateListingsPage(listings, ebayStat){
     // BUG 2: detect listings with no recorded weight so we can offer manual entry
     // FIX 2: weight comes from the stored shipping tier (raw lbs/oz). Offer manual entry when missing.
     var wtier = r.shipping_tier || meta.shipping_tier || null;
+    var eff = effectiveShipping(r);
     var hasWeight = !!(wtier && ((wtier.rawLbs||0) > 0 || (wtier.rawOz||0) > 0));
     var weightEntry = !hasWeight ?
       '<div style="background:#fff8e1;border-bottom:1px solid #f9a825;padding:8px 16px;font-size:12.5px;color:#8d6e00;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">'
@@ -7595,9 +7656,10 @@ function generateListingsPage(listings, ebayStat){
       +((r.scale_warning||(meta&&meta.scale_warning))?'<span style="color:#e65100;font-weight:bold;">&#9888; Weight may be misread &mdash; verify before listing</span>':'')
       +'<span><b>Custom SKU:</b> '+(listing.custom_sku||(skuStr+(meta.shelf?'-'+meta.shelf:'')))+'</span>'
       +'<span><b>eBay Category:</b> <span id="cat_'+skuStr+'" data-sku="'+skuStr+'" data-catid="'+(r.ebay_category_id||listing.category_id||'')+'" onclick="editCategory(this)" title="Click to edit category ID" style="cursor:pointer;color:#1565c0;border-bottom:1px dashed #1565c0;">'+((r.ebay_category_id||listing.category_id)?((r.ebay_category_name?r.ebay_category_name+' ':'')+'('+(r.ebay_category_id||listing.category_id)+')'):'(set)')+'</span> <span id="catmsg_'+skuStr+'" style="font-weight:bold;"></span></span>'
-      +(listing.shipping_policy?'<span><b>Ship:</b> '+listing.shipping_policy+'</span>':'')
+      +shipCellHtml(eff,skuStr)
+      +pkgCellHtml(eff,skuStr)
       +(!wtier&&listing.listed_weight!=null?'<span><b>Listed Wt:</b> '+listing.listed_weight+' '+(listing.listed_weight_unit||'oz')+'</span>':'')
-      +'<span><b>Box:</b> <span id="dim_'+skuStr+'" data-sku="'+skuStr+'" onclick="editDims(this)" title="Click to edit dimensions (LxWxH inches)" style="cursor:pointer;color:#1565c0;border-bottom:1px dashed #1565c0;">'+(listing.selected_box||((wtier&&wtier.boxSize)?wtier.boxSize:(listing.box_dimensions||''))||'(set)')+'</span> <span id="dimmsg_'+skuStr+'" style="font-weight:bold;"></span></span>'
+      +'<span><b>Box:</b> <span id="dim_'+skuStr+'" data-sku="'+skuStr+'" onclick="editDims(this)" title="Click to edit dimensions (LxWxH inches)" style="cursor:pointer;color:#1565c0;border-bottom:1px dashed #1565c0;">'+(eff.boxSize||'(set)')+'</span> <span id="dimmsg_'+skuStr+'" style="font-weight:bold;"></span></span>'
       +perUnitTotal
       +(photoCount>0?'<span><b>Photos:</b> '+photoCount+'</span>':'')
       +'</div>'
@@ -7663,7 +7725,7 @@ function generateListingsPage(listings, ebayStat){
     +'function loadQueue(){fetch("/api/queue-status").then(function(r){return r.json();}).then(function(d){var banner=document.getElementById("queueBanner");if(d.pending>0||d.processing){banner.style.display="block";banner.textContent=d.pending+" listing"+(d.pending===1?"":"s")+" generating...";}else{banner.style.display="none";}var fc=document.getElementById("failedItems");fc.innerHTML="";(d.failed||[]).forEach(function(f){var row=document.createElement("div");row.style.cssText="background:#ffebee;border:1px solid #c62828;color:#b71c1c;padding:8px 14px;border-radius:6px;margin-bottom:8px;font-size:13px;display:flex;align-items:center;gap:12px;";var span=document.createElement("span");span.style.flex="1";span.textContent="SKU "+f.sku+" failed: "+(f.error||"error")+" (after "+f.attempts+" attempts)";var btn=document.createElement("button");btn.textContent="Retry";btn.style.cssText="padding:6px 14px;border:none;border-radius:4px;background:#c62828;color:#fff;font-weight:bold;cursor:pointer;";btn.onclick=function(){retryListing(f.sku);};row.appendChild(span);row.appendChild(btn);fc.appendChild(row);});}).catch(function(){});}'
     +'function retryListing(sku){fetch("/api/retry-listing",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sku:sku})}).then(function(){loadQueue();});}'
     +'function saveWeight(sku){var lb=document.getElementById("wtlb_"+sku);var oz=document.getElementById("wtoz_"+sku);var msg=document.getElementById("wtmsg_"+sku);var L=lb?parseInt(lb.value,10):0;if(isNaN(L))L=0;var O=oz?parseFloat(oz.value):0;if(isNaN(O))O=0;if(L<0||O<0||(L===0&&O===0)){if(msg){msg.style.color="#c62828";msg.textContent="Enter lb and/or oz";}return;}if(msg){msg.style.color="#8d6e00";msg.textContent="Saving...";}fetch("/api/set-weight",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sku:parseInt(sku,10),lbs:L,oz:O})}).then(function(r){return r.json();}).then(function(d){if(d.success){if(msg){msg.style.color="#2e7d32";msg.textContent="Saved \\u2713 Packed: "+d.final_lbs+"lb "+d.final_oz+"oz | Box: "+d.box_size;}setTimeout(function(){location.reload();},1200);}else{if(msg){msg.style.color="#c62828";msg.textContent=d.error||"Save failed";}}}).catch(function(){if(msg){msg.style.color="#c62828";msg.textContent="Network error";}});}'
-    +'function savePackage(sku){var g=function(id){var e=document.getElementById(id+"_"+sku);return e?e.value:"";};var msg=document.getElementById("mpmsg_"+sku);var body={sku:parseInt(sku,10),lbs:g("mplb"),oz:g("mpoz"),length:g("mpl"),width:g("mpw"),height:g("mph")};var neg=["lbs","oz","length","width","height"].some(function(k){var v=parseFloat(body[k]);return !isNaN(v)&&v<0;});if(neg){if(msg){msg.style.color="#c62828";msg.textContent="Values must be positive";}return;}if(msg){msg.style.color="#555";msg.textContent="Saving...";}fetch("/api/set-package",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(function(r){return r.json();}).then(function(d){if(d.success){if(msg){msg.style.color="#2e7d32";msg.textContent=d.manual_package?"Saved - overriding padding":"Cleared - automatic padding restored";}setTimeout(function(){location.reload();},1000);}else{if(msg){msg.style.color="#c62828";msg.textContent=d.error||"Save failed";}}}).catch(function(){if(msg){msg.style.color="#c62828";msg.textContent="Network error";}});}'
+    +'function applyPkgLabels(sku,d){var sp=document.getElementById("ship_"+sku);if(sp&&d.shipping_policy){sp.textContent=d.shipping_policy;if(d.manual){var mk=document.createElement("span");mk.style.color="#2e7d32";mk.style.fontWeight="bold";mk.textContent=" (actual pkg)";sp.appendChild(mk);}}var dm=document.getElementById("dim_"+sku);if(dm&&d.box_dimensions){dm.textContent=d.box_dimensions;}var pk=document.getElementById("mppkg_"+sku);if(pk){if(d.manual){pk.innerHTML="&#128230; Actual Pkg: "+d.pkg_label;pk.style.display="";}else{pk.style.display="none";}}}function savePackage(sku){var g=function(id){var e=document.getElementById(id+"_"+sku);return e?e.value:"";};var msg=document.getElementById("mpmsg_"+sku);var body={sku:parseInt(sku,10),lbs:g("mplb"),oz:g("mpoz"),length:g("mpl"),width:g("mpw"),height:g("mph")};var neg=["lbs","oz","length","width","height"].some(function(k){var v=parseFloat(body[k]);return !isNaN(v)&&v<0;});if(neg){if(msg){msg.style.color="#c62828";msg.textContent="Values must be positive";}return;}if(msg){msg.style.color="#555";msg.textContent="Saving...";}fetch("/api/set-package",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(function(r){return r.json();}).then(function(d){if(d.success){if(msg){msg.style.color="#2e7d32";msg.textContent=d.manual_package?"Saved - overriding padding":"Cleared - automatic padding restored";}applyPkgLabels(sku,d);setTimeout(function(){location.reload();},1000);}else{if(msg){msg.style.color="#c62828";msg.textContent=d.error||"Save failed";}}}).catch(function(){if(msg){msg.style.color="#c62828";msg.textContent="Network error";}});}'
     +'function clearPackage(sku){["mplb","mpoz","mpl","mpw","mph"].forEach(function(p){var e=document.getElementById(p+"_"+sku);if(e)e.value="";});savePackage(sku);}'
     +'function editSuggest(sku){var span=document.getElementById("sug_"+sku);if(!span||span.dataset.editing)return;span.dataset.editing="1";var cur=parseFloat(span.textContent)||0;var inp=document.createElement("input");inp.type="number";inp.min="0";inp.step="0.01";inp.value=cur;inp.style.cssText="width:80px;padding:2px 4px;border:1px solid #1565c0;border-radius:3px;font-size:12.5px;";span.textContent="";span.appendChild(inp);inp.focus();inp.select();var done=false;function save(){if(done)return;done=true;var nv=parseFloat(inp.value);var msg=document.getElementById("sugmsg_"+sku);if(isNaN(nv)||nv<=0){span.textContent=cur;span.removeAttribute("data-editing");if(msg){msg.style.color="#c62828";msg.textContent="invalid";}return;}fetch("/api/listings/"+sku,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({suggest_price:nv})}).then(function(r){return r.json();}).then(function(d){if(d.success){span.textContent=(d.suggested_price!=null?d.suggested_price:nv);if(msg){msg.style.color="#2e7d32";msg.textContent="\\u2713";setTimeout(function(){msg.textContent="";},1500);}}else{span.textContent=cur;if(msg){msg.style.color="#c62828";msg.textContent=d.error||"failed";}}span.removeAttribute("data-editing");}).catch(function(){span.textContent=cur;span.removeAttribute("data-editing");if(msg){msg.style.color="#c62828";msg.textContent="error";}});}inp.addEventListener("blur",save);inp.addEventListener("keydown",function(e){if(e.key==="Enter"){e.preventDefault();inp.blur();}else if(e.key==="Escape"){done=true;span.textContent=cur;span.removeAttribute("data-editing");}});}'
     +'function deletePhoto(sku,name,btn){if(!confirm("Delete this photo from the listing?"))return;fetch("/api/listings/"+sku+"/photo/"+encodeURIComponent(name),{method:"DELETE"}).then(function(r){return r.json();}).then(function(d){if(d.success){var t=btn.parentNode;if(t&&t.parentNode){t.parentNode.removeChild(t);}}else{alert("Delete failed: "+(d.error||"unknown"));}}).catch(function(){alert("Network error deleting photo.");});}'
