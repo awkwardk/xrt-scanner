@@ -545,7 +545,8 @@ section('HUMAN GROUND TRUTH — enforcement (functional)');
   function withLogs(fn){ var logs = []; var o = console.log; console.log = function(){ logs.push(Array.prototype.slice.call(arguments).join(' ')); }; try { fn(); } finally { console.log = o; } return logs; }
   try {
     var code = '';
-    ['_normText','splitNoteClauses','isNegationClause','isAllowlistedSpecField','isProtectedFactField','claimStatedByHuman','isDescriptionRewrite','applySurgicalCorrections','enforceQuantityGuard','resolveScalePhoto','buildHumanFacts'].forEach(function(n){ code += extractFn(n) + '\n'; });
+    code += (content.match(/var LISTING_NUMBER_WORDS = \{[\s\S]*?\};/) || [''])[0] + '\n';
+    ['expandListingNumberWords','listingCountFollowsMeasure','firstExplicitAvailableQty','parseListingCounts','_normText','splitNoteClauses','isNegationClause','isAllowlistedSpecField','isProtectedFactField','claimStatedByHuman','isDescriptionRewrite','applySurgicalCorrections','enforceQuantityGuard','resolveScalePhoto','buildHumanFacts'].forEach(function(n){ code += extractFn(n) + '\n'; });
     var fns = {};
     eval(code + '\nfns.apply=applySurgicalCorrections;fns.guard=enforceQuantityGuard;fns.scale=resolveScalePhoto;fns.hf=buildHumanFacts;');
 
@@ -797,6 +798,10 @@ test('fast-submit endpoint',           has("req.url==='/api/fast-submit'"));
 test('fast-submit writes listing.json',has("path.join(itemDir, 'listing.json')") && has('buildVoiceListingRecord('));
 test('fast-submit saves photos',       has("'photo_' + (i+1) + '.jpg'"));
 test('parseVoiceTranscript helper',    has('function parseVoiceTranscript('));
+test('listing schema asks for available quantity', has('"available_quantity":1'));
+test('prompt separates 2-pack and a couple from quantity', has('2-pack') && has('a couple') && has('I have 3 lots of 2'));
+test('lot price fields are in the JSON schema', has('"lot_comp_median":0') && has('"unit_median_price":0'));
+test('review page shows the lot price note', has('Price note:') && has('listing.price_note'));
 test('buildCassiniTitle helper',       has('function buildCassiniTitle('));
 test('voice grade->condition map',     has('var map = { A:1000, B:3000, C:5000, D:7000 };'));
 test('voice parts/repair rule',        has("if(out.grade === 'D') out.parts_repair = true;") && has("return 'For Parts or Repair';"));
@@ -818,6 +823,8 @@ test('voice never re-implements ship', has('shippingPolicyName(tier.shippingPoli
       + (content.match(/var VOICE_TYPES = \[[\s\S]*?\];/) || [''])[0] + '\n'
       + 'var MIN_THRESHOLD = 30;\n'
       + ex('shippingPolicyIdForOz') + '\n' + ex('calculateShippingTier') + '\n' + ex('shippingPolicyName') + '\n' + ex('calcShipping') + '\n'
+      + (content.match(/var LISTING_NUMBER_WORDS = \{[\s\S]*?\};/) || [''])[0] + '\n'
+      + ex('expandListingNumberWords') + '\n' + ex('listingCountFollowsMeasure') + '\n' + ex('firstExplicitAvailableQty') + '\n' + ex('parseListingCounts') + '\n'
       + ex('parseVoiceTranscript') + '\n' + ex('voiceGradeConditionId') + '\n' + ex('voiceConditionWord') + '\n'
       + ex('buildCassiniTitle') + '\n' + ex('buildVoiceListingRecord') + '\n'
       + 'box.parse = parseVoiceTranscript; box.title = buildCassiniTitle; box.cond = voiceGradeConditionId; box.rec = buildVoiceListingRecord;';
@@ -869,6 +876,29 @@ test('voice never re-implements ship', has('shippingPolicyName(tier.shippingPoli
     test('(voice) "I have N" sets real quantity',  avail3.quantity === 3 && avail3.is_lot === false);
     var availT = T({ brand:avail.brand, model:avail.model, product_type:avail.product_type, features:avail.features, includes:avail.includes, grade:avail.grade, parts_repair:avail.parts_repair, is_lot:avail.is_lot, lot_quantity:avail.lot_quantity });
     test('(voice) available quantity never says "Lot of" in title', !/Lot of/.test(availT));
+
+    var four = P('Cisco switch grade B I have four of these');
+    test('(qty) "I have four of these" -> 4', four.quantity === 4 && four.is_lot === false && four.lot_quantity === 1);
+    var avail4 = P('Cisco switch grade B I have 4 available');
+    test('(qty) "I have 4 available" -> 4', avail4.quantity === 4 && avail4.is_lot === false && avail4.lot_quantity === 1);
+    var got3 = P('got 3 of these Polycom phones grade B');
+    test('(qty) "got 3 of these" -> 3', got3.quantity === 3 && got3.is_lot === false);
+    var lotTwo = P('lot of two Polycom phones grade B');
+    test('(qty) "lot of two" -> qty 1, lot 2', lotTwo.quantity === 1 && lotTwo.is_lot === true && lotTwo.lot_quantity === 2);
+    var lotDigits = P('lot of 2 Polycom phones grade B');
+    test('(qty) "lot of 2" -> qty 1, lot 2', lotDigits.quantity === 1 && lotDigits.is_lot === true && lotDigits.lot_quantity === 2);
+    var pack = P('2-pack HDMI cables grade B');
+    test('(qty) "2-pack" -> qty 1, lot 2', pack.quantity === 1 && pack.is_lot === true && pack.lot_quantity === 2);
+    var set3 = P('set of 3 toner cartridges grade B');
+    test('(qty) "set of 3" -> qty 1, lot 3', set3.quantity === 1 && set3.is_lot === true && set3.lot_quantity === 3);
+    var both = P('I have 3 lots of 2 Polycom phones grade B');
+    test('(qty) "I have 3 lots of 2" -> qty 3, lot 2', both.quantity === 3 && both.is_lot === true && both.lot_quantity === 2);
+    var couple = P('I have a couple of these Cisco phones grade B');
+    test('(qty) "a couple" is not a count', couple.quantity === 1 && couple.is_lot === false && couple.lot_quantity === 1);
+    var none = P('Cisco switch grade B powers on');
+    test('(qty) no mention -> qty 1', none.quantity === 1 && none.is_lot === false && none.lot_quantity === 1);
+    var lotTitle = T({ brand:lotTwo.brand, model:lotTwo.model, product_type:lotTwo.product_type, features:lotTwo.features, includes:lotTwo.includes, grade:lotTwo.grade, parts_repair:lotTwo.parts_repair, is_lot:lotTwo.is_lot, lot_quantity:lotTwo.lot_quantity });
+    test('(qty) lot of two puts Lot of 2 in the title', /Lot of 2/.test(lotTitle));
 
     var loc = P('Dell laptop grade B shelf G4 powers on 4 pounds');
     test('(voice) shelf extracted',        loc.shelf === 'G4');
@@ -1412,6 +1442,9 @@ section('VOICE INTAKE -> ADDITEM BUILDER (pre-flight simulation)');
       + ex('selectBestBox') + '\n'
       + ex('lookupKnownModelSpecs') + '\n' + ex('autoFillRequiredSpecifics') + '\n'
       + ex('sanitizeSpecificValue') + '\n' + ex('stripIllegalXmlChars') + '\n' + ex('stripExternalLinks') + '\n' + ex('sanitizeListingData') + '\n'
+      + (content.match(/var LISTING_NUMBER_WORDS = \{[\s\S]*?\};/) || [''])[0] + '\n'
+      + ex('expandListingNumberWords') + '\n' + ex('listingCountFollowsMeasure') + '\n' + ex('firstExplicitAvailableQty') + '\n' + ex('parseListingCounts') + '\n'
+      + ex('resolveListingCounts') + '\n' + ex('ensureLotInTitle') + '\n' + ex('applyLotSpecific') + '\n' + ex('priceForLot') + '\n' + ex('applyLotPrice') + '\n'
       + ex('voiceGradeConditionId') + '\n' + ex('buildCassiniTitle') + '\n' + ex('assembleVoiceRecordFromAI') + '\n'
       + ex('xmlEscape') + '\n' + ex('cdataSafe') + '\n' + ex('conditionIdForCategory') + '\n'
       + ex('estimateShipCost') + '\n' + ex('buildItemSpecificsXml') + '\n' + ex('buildAddItemXml') + '\n'
@@ -1510,10 +1543,13 @@ section('CATEGORY 177 ITEM SPECIFICS AUTO-FILL + ERROR 240 SANITIZER');
       + ex('shippingPolicyIdForOz') + '\n' + ex('calculateShippingTier') + '\n' + ex('shippingPolicyName') + '\n' + ex('calcShipping') + '\n' + ex('selectBestBox') + '\n'
       + ex('lookupKnownModelSpecs') + '\n' + ex('autoFillRequiredSpecifics') + '\n'
       + ex('sanitizeSpecificValue') + '\n' + ex('stripIllegalXmlChars') + '\n' + ex('stripExternalLinks') + '\n' + ex('sanitizeListingData') + '\n'
+      + (content.match(/var LISTING_NUMBER_WORDS = \{[\s\S]*?\};/) || [''])[0] + '\n'
+      + ex('expandListingNumberWords') + '\n' + ex('listingCountFollowsMeasure') + '\n' + ex('firstExplicitAvailableQty') + '\n' + ex('parseListingCounts') + '\n'
+      + ex('resolveListingCounts') + '\n' + ex('ensureLotInTitle') + '\n' + ex('applyLotSpecific') + '\n' + ex('priceForLot') + '\n' + ex('applyLotPrice') + '\n'
       + ex('voiceGradeConditionId') + '\n' + ex('buildCassiniTitle') + '\n' + ex('assembleVoiceRecordFromAI') + '\n'
       + ex('xmlEscape') + '\n' + ex('cdataSafe') + '\n' + ex('conditionIdForCategory') + '\n'
       + ex('estimateShipCost') + '\n' + ex('buildItemSpecificsXml') + '\n' + ex('buildAddItemXml') + '\n'
-      + 'box.assemble = assembleVoiceRecordFromAI; box.buildXml = buildAddItemXml; box.tier = calculateShippingTier; box.sanitizeValue = sanitizeSpecificValue; box.stripControl = stripIllegalXmlChars; box.stripLinks = stripExternalLinks;';
+      + 'box.assemble = assembleVoiceRecordFromAI; box.buildXml = buildAddItemXml; box.tier = calculateShippingTier; box.sanitizeValue = sanitizeSpecificValue; box.stripControl = stripIllegalXmlChars; box.stripLinks = stripExternalLinks; box.priceForLot = priceForLot;';
     var _log = console.log; console.log = function(){};
     eval(code);
     console.log = _log;
@@ -1556,10 +1592,16 @@ section('CATEGORY 177 ITEM SPECIFICS AUTO-FILL + ERROR 240 SANITIZER');
     lotRecord.listing.category_id = 177; lotRecord.listing.primary_category_id = 177;
     var lotXml = box.buildXml(lotRecord, { categoryId: lotRecord.listing.category_id, pictureUrls: simulatePictureUrls(lotRecord), conditionId: null, policies: null });
 
-    test('(parts lot) quantity 3 recognized as a lot', lotRecord.quantity === 3 && lotRecord.listing.is_lot === true);
+    test('(parts lot) lot of three is one listing, eBay quantity 1', lotRecord.quantity === 1 && lotRecord.listing.is_lot === true && lotRecord.listing.lot_quantity === 3);
     test('(parts lot) Screen Size falls back to "See Description", not a single guessed size', lotRecord.listing.item_specifics['Screen Size'] === 'See Description');
     test('(parts lot) Processor falls back to "See Description" for the same reason',          lotRecord.listing.item_specifics['Processor'] === 'See Description');
-    test('(parts lot) AddItem XML Quantity reflects the lot size',      lotXml.indexOf('<Quantity>3</Quantity>') >= 0);
+    test('(parts lot) AddItem XML Quantity stays 1 for a lot',      lotXml.indexOf('<Quantity>1</Quantity>') >= 0);
+    test('(parts lot) single-unit comp is not the lot price', lotRecord.listing.suggested_price === 243 && /Per-unit median \$90/.test(lotRecord.listing.price_note));
+    var lotComp = box.priceForLot({ lotQty: 2, lotCompMedian: 100, unitMedian: 60 });
+    test('(lot price) lot comps used, a bit under the median', lotComp && lotComp.basis === 'lot_comps' && lotComp.suggested_price === 95 && lotComp.avg_sold_price === 100 && /lot comps/.test(lotComp.price_note));
+    var unitMath = box.priceForLot({ lotQty: 3, lotCompMedian: 0, unitMedian: 40 });
+    test('(lot price) otherwise per-unit median x lot size, 10% off', unitMath && unitMath.basis === 'unit_x_lot' && unitMath.suggested_price === 108 && /\$40 × 3 = \$120/.test(unitMath.price_note) && /10% bundle discount = \$108/.test(unitMath.price_note));
+    test('(lot price) a single unit is left alone', box.priceForLot({ lotQty: 1, unitMedian: 40 }) === null);
     test('(parts lot) AddItem XML never left Screen Size/Processor blank', lotXml.indexOf('<Value>See Description</Value>') >= 0);
 
     // ── Universal Value Sanitizer — SKU 2647-style "HDD (Not Included)" / "Not Included" values ──
