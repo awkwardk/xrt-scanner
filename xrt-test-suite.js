@@ -137,7 +137,7 @@ test('Below threshold flag (page)',       has('Below minimum threshold'));
 test('Below threshold flag (data)',       has('belowThreshold'));
 test('1600x1600 photo output',            has('var outSize=1600'));
 test('Tap to focus ring indicator',       has('function attachTapToFocus(') && has('focus-ring'));
-test('Manual focus override removed',      !has('applyConstraints') && !has('pointsOfInterest') && !has("focusMode:'manual'"));
+test('Manual focus is not the default; macro may use close focus', has("focusMode:'continuous'") && !has('pointsOfInterest') && has('function macroPlanFor('));
 test('Photo Download All button',         has('Download All Photos'));
 test('Per-photo download attr',           has('download='));
 test('Multi-qty lot title',               has('Lot of '));
@@ -1197,7 +1197,7 @@ test('fallback still writes a real record',    has('var fbRecord = buildVoiceLis
 test('photos saved before responding',   has("photos.forEach(function(b64, i){") && has("sendJSON(res,200,{ success:true, sku:sku"));
 test('client shows toast not alert on success', has("voiceToast('") && has('voiceResetFields();'));
 test('toast auto-hides itself',          has('voiceToastTimer=setTimeout(') && has("el.classList.remove('show');"));
-test('reset re-peeks SKU + clears fields', has('function voiceResetFields(){voicePhotos=[];') && has('voiceLoadNextSku();}'));
+test('reset re-peeks SKU + clears fields', has('function voiceResetFields(){clearVoicePackageFields();voicePhotos=[];') && has('voiceLoadNextSku();}'));
 
 // ── fix 2: photo order + reorder controls ──
 test('addVoicePhotos reads sequentially', has('function addVoicePhotos(input){') && has('function next(){') && !has('files.forEach(function(file)'));
@@ -1205,9 +1205,9 @@ test('gallery selection auto-reversed on upload', has('for(var i=0;i<files.lengt
 test('one FileReader in flight at a time', has('idx>=arr.length'));
 test('client-side compression to canvas', has('function voiceCompressImage(dataUrl,cb)') && has("canvas.toDataURL('image/jpeg',0.85)"));
 test('compression capped at 2048px',      has('voiceScaleDims(img.width,img.height,2048)'));
-test('camera button is a real <a href=intent:> link, not a JS redirect', has("<a href='intent:#Intent;action=android.media.action.STILL_IMAGE_CAMERA;category=android.intent.category.DEFAULT;end' onclick='return voiceCameraLinkClick(event)'"));
+test('camera button opens the in-app camera', has("id='vCamOpenBtn'") && has('openVoiceCamera()') && has('1. Take Photos'));
 test('native camera link falls back off-Android via preventDefault', has('function voiceCameraLinkClick(e){') && has('/android/i.test(navigator.userAgent') && has('e.preventDefault()') && has("document.getElementById('vPhotoInput');if(inp)inp.click();"));
-test('two-button Step 1 UI: camera + gallery import', has('&#128248; 1. Open Phone Camera') && has('&#128229; 2. Add Recent Photos'));
+test('two-button Step 1 UI: camera + gallery import', has('1. Take Photos') && has('&#128229; 2. Add Recent Photos'));
 test('gallery import button has no capture attribute', !/id=.vPhotoInput.[^>]*capture=/.test(content));
 test('compression failure falls back',    has('}catch(e){cb(null);}};') && has('if(!b64){var c=v.indexOf'));
 test('voiceScaleDims pure helper',        has('function voiceScaleDims(w,h,max){'));
@@ -1351,8 +1351,8 @@ test('box selection overrides tier weight and box',  has('tier.finalLbs = Math.f
 test('package_length/width/height/selected_box saved to listing.json', has('package_length: boxPick ? boxPick.length : null,') && has('package_width: boxPick ? boxPick.width : null,') && has('package_height: boxPick ? boxPick.height : null,') && has('selected_box: boxPick ? boxPick.box_name : null,'));
 test('package_length/width/height/selected_box saved to meta.json',    (content.match(/package_length: boxPick \? boxPick\.length : null,/g) || []).length === 2 && (content.match(/selected_box: boxPick \? boxPick\.box_name : null/g) || []).length === 2);
 test('shipping_weight and package_dimensions saved to listing.json',   has('shipping_weight: boxPick ? ((tier.rawLbs * 16) + tier.rawOz + boxPick.added_weight_oz) : null,') && has("package_dimensions: boxPick ? (boxPick.length + 'x' + boxPick.width + 'x' + boxPick.height) : null,"));
-test('Box: badge prefers selected_box (dual card view)',    has("(listing.selected_box || ((wtier && wtier.boxSize) ? wtier.boxSize : (listing.box_dimensions || '')) || '(set)')"));
-test('Box: badge prefers selected_box (/api/listings page)', has("(listing.selected_box||((wtier&&wtier.boxSize)?wtier.boxSize:(listing.box_dimensions||''))||'(set)')"));
+test('Box: badge prefers selected_box (dual card view)',    has('var autoBox = listing.selected_box || ((tier && tier.boxSize) ? tier.boxSize : (listing.box_dimensions || \'\'));') && has("(eff.boxSize || '(set)')"));
+test('Box: badge prefers selected_box (/api/listings page)', has('var autoBox = listing.selected_box || ((tier && tier.boxSize) ? tier.boxSize : (listing.box_dimensions || \'\'));') && has("(eff.boxSize||'(set)')"));
 
 // ── functional: selectBestBox itself, pure — no network, no eBay dependency ──
 (function(){
@@ -1967,10 +1967,58 @@ test('pricing rules have a read-only page', has("req.url.split('?')[0]==='/prici
     test('an unknown audit verdict becomes warn', box.norm({ verdict: 'maybe' }).verdict === 'warn');
     test('audit prompt covers price, lot, quantity, and missing parts', (function(){ var p = box.prompt(card); return /price versus comps/.test(p) && /priced as a lot/.test(p) && /quantity versus lot/.test(p) && /missing or not-included/.test(p); })());
     test('publish path does not read the audit verdict', ex('createEbayListing').indexOf('audit.verdict') < 0 && ex('createEbayListing').indexOf('does not block AddItem') >= 0);
+    var soldRows = [];
+    for(var s = 0; s < 5; s++) soldRows.push({ published_price: 100, sale: { sold_price: 50 }, ebay_category_name: 'soldcat', meta: { grade: 'A' }, listing: { ai_suggested_price: 100, is_lot: false, lot_quantity: 1, ai_snapshot: { avg_sold_price: 100, category_name: 'soldcat', grade: 'A' } } });
+    var soldBucket = box.rules(soldRows).buckets.filter(function(b){ return b.category === 'soldcat'; })[0];
+    test('a sold price weighs more than the publish price', soldBucket && soldBucket.n === 5 && soldBucket.median_final_over_ai === 0.5);
   } catch(e){
     test('pricing audit eval', false);
     console.log('    ERROR:', e.message);
   }
+})();
+
+section('ACCESS, BACKUP, LEARNING');
+(function(){
+  var access = require('./xrt-access');
+  var env = { XRT_ADMIN_PIN: '1111', XRT_STAFF_PIN: '2222', XRT_BACKUP_TOKEN: 'backup-token' };
+  test('login is closed until both PINs are set', access.pinsConfigured({}) === false && access.roleForPin('1111', {}) === null);
+  test('admin PIN beats staff PIN', access.roleForPin('1111', env) === 'admin' && access.roleForPin('2222', env) === 'staff' && access.roleForPin('9999', env) === null);
+  var token = access.signSession('staff', env, 1000);
+  var sess = access.readSessionToken(token, env, 1000);
+  test('session lasts and keeps the role', sess && sess.role === 'staff' && sess.exp === 1000 + access.SESSION_MS);
+  test('expired session is rejected', access.readSessionToken(token, env, sess.exp + 1) === null);
+  test('health and login stay public', access.isPublicPath('GET', '/ping') && access.isPublicPath('POST', '/api/login') && !access.isPublicPath('GET', '/api/listings'));
+  test('clear, buyer delete, and learning edits are admin only', access.isAdminOnly('POST', '/api/clear-listings') && access.isAdminOnly('DELETE', '/api/buyers/abc') && access.isAdminOnly('POST', '/api/learning/accept') && !access.isAdminOnly('POST', '/api/send-to-ebay') && !access.isAdminOnly('DELETE', '/api/listings/12/photo/photo_1'));
+  test('CORS allows only this host', access.corsAllowOrigin('https://xrt-scanner.onrender.com', 'xrt-scanner.onrender.com', 'https') === 'https://xrt-scanner.onrender.com' && access.corsAllowOrigin('https://evil.example', 'xrt-scanner.onrender.com', 'https') === '');
+  test('backup token is required', access.backupTokenOk('', {}).status === 503 && access.backupTokenOk('Bearer backup-token', env).ok === true && access.backupTokenOk('Bearer no', env).ok === false);
+  test('backup skips eBay tokens', access.backupExcluded('ebay-tokens.json') && access.backupExcluded('my-secret.txt') && !access.backupExcluded('pricing-rules.json') && !access.backupExcluded('buyers.json'));
+  test('Clear All requires the word CLEAR', access.clearConfirmed({confirm:'CLEAR'}) && !access.clearConfirmed({confirm:'clear'}));
+  var listing = { title: 'Old' };
+  access.appendFieldEdit(listing, 'title', 'Old', 'New', 'operator');
+  access.appendFieldEdit(listing, 'title', 'New', 'New', 'operator');
+  test('title edits are logged once', listing.edit_history.length === 1 && listing.edit_history[0].field === 'title' && listing.edit_history[0].to === 'New');
+  var fail = { listing: { audit: { verdict:'fail', fingerprint:'abc' } } };
+  test('a failed audit needs one acknowledgement', access.failAuditNeedsAck(fail) === true);
+  fail.listing.audit_ack = { fingerprint:'abc' };
+  test('acknowledgement is for this audit only', access.failAuditNeedsAck(fail) === false);
+  fail.listing.audit.fingerprint = 'new';
+  test('a new failure asks again', access.failAuditNeedsAck(fail) === true);
+  test('checklist allows a short override reason', access.checklistOk({ powerTest:'Pass', photo_checklist:{ override_reason:'no screen' } }).ok === true);
+  test('checklist blocks a blank submit', access.checklistOk({ powerTest:'Pass', photo_checklist:{} }).ok === false);
+  var all = { front:1, back:1, label:1, ports:1, powered:1, accessories:1, damage:1 };
+  test('a complete checklist passes', access.checklistOk({ powerTest:'Pass', photo_checklist: all }).ok === true);
+  var sale = access.saleFromItem({ listing_status:'Completed', quantity_sold:'1', current_price:'42.5', end_time:'2026-11-01T00:00:00.000Z' });
+  test('GetItem sold price is recorded', sale.sold_price === 42.5 && sale.sold_at === '2026-11-01T00:00:00.000Z');
+  test('an unsold item keeps the current price only', access.saleFromItem({ quantity_sold:0, current_price:10 }).sold_price === null);
+  var now = Date.parse('2026-11-20T00:00:00.000Z');
+  var rows = [];
+  for(var n=0;n<6;n++){
+    rows.push({ ebay_category_name:'monitors', meta:{grade:'B'}, listing:{ is_lot:false, lot_quantity:1, ai_suggested_price:100, price_history:[{ at:'2026-11-18T00:00:00.000Z', from:100, to:90, by:'operator' }] } });
+  }
+  var ideas = access.weeklySuggestions(rows, now);
+  test('weekly note suggests the repeated markdown', ideas.length === 1 && /Grade B monitors/.test(ideas[0].text) && /apply -10%/.test(ideas[0].text));
+  test('buyer PIN is not hardcoded', !has('1090') && has('XRT_ROLE'));
+  test('backup route is documented in the server', has("reqPath === '/api/backup'") && has('xrt-backup-'));
 })();
 
 section('SYNTAX CHECK');
