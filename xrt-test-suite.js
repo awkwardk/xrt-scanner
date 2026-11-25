@@ -1898,6 +1898,81 @@ section('GEMINI 3.5 FLASH-LITE REQUEST BODIES');
   }
 })();
 
+section('PRICING AUDIT');
+test('review page shows the audit badge and still lists', has('function refreshListingAudit(') && has('AUDIT PENDING') && has('Publishing is not blocked') && has('List on eBay'));
+test('pricing rules have a read-only page', has("req.url.split('?')[0]==='/pricing-rules'") && has('function pricingRulesHtml('));
+(function(){
+  function ex(n){
+    var st = content.indexOf('function ' + n + '(');
+    if(st < 0) return '';
+    var d = 0, seen = false, e = -1;
+    for(var i = st; i < content.length; i++){ var c = content[i]; if(c === '{'){ d++; seen = true; } else if(c === '}'){ d--; if(seen && d === 0){ e = i + 1; break; } } }
+    return content.slice(st, e);
+  }
+  try {
+    var code = ['moneyPrice','appendPriceHistory','includesAndMissing','captureAiPrice','pricingMedian','lotSizeKey','pricingBucketKey','plainRuleSentence','buildPricingRules','ruleForListing','applyPricingRule','auditFingerprint','auditCacheFresh','normalizeAuditResult','publishBlockedByAudit','buildAuditPrompt','escAudit','auditBadgeHtml','pricingRulesHtml'].map(ex).join('\n');
+    code += '\nvar PRICING_RULE_MIN_SAMPLES = 5;\n';
+    var box = {};
+    eval(code + '\nbox.append=appendPriceHistory;box.capture=captureAiPrice;box.median=pricingMedian;box.rules=buildPricingRules;box.ruleFor=ruleForListing;box.apply=applyPricingRule;box.fp=auditFingerprint;box.fresh=auditCacheFresh;box.norm=normalizeAuditResult;box.block=publishBlockedByAudit;box.prompt=buildAuditPrompt;box.badge=auditBadgeHtml;box.page=pricingRulesHtml;box.plain=plainRuleSentence;');
+
+    var hist = { suggested_price: 100 };
+    box.append(hist, 100, 100, 'operator');
+    test('unchanged price is not logged', !hist.price_history || hist.price_history.length === 0);
+    box.append(hist, 100, 80, 'operator');
+    test('price edit logs from, to, and by', hist.price_history && hist.price_history.length === 1 && hist.price_history[0].from === 100 && hist.price_history[0].to === 80 && hist.price_history[0].by === 'operator' && !!hist.price_history[0].at);
+
+    var rec = { listing: { suggested_price: 50, avg_sold_price: 55, price_low: 40, price_high: 70, is_lot: true, lot_quantity: 2, price_note: 'Lot of 2' }, meta: { grade: 'B', notes: 'no power cord included' }, ebay_category_name: 'PC Laptops & Netbooks' };
+    box.capture(rec, 'initial');
+    test('first AI price and comps are kept', rec.listing.ai_suggested_price === 50 && rec.listing.ai_snapshot.avg_sold_price === 55 && rec.listing.ai_snapshot.price_low === 40 && rec.listing.ai_snapshot.grade === 'B' && rec.listing.ai_snapshot.category_name === 'PC Laptops & Netbooks' && rec.listing.ai_snapshot.is_lot === true && rec.listing.ai_snapshot.missing.length === 1);
+    rec.listing.suggested_price = 60;
+    box.capture(rec, 'initial');
+    test('a later AI write does not overwrite the original price', rec.listing.ai_suggested_price === 50);
+    box.capture(rec, 'regenerate');
+    test('regenerate stores a separate price', rec.listing.ai_regenerated_price === 60 && rec.listing.ai_suggested_price === 50);
+    var old = { listing: { suggested_price: 40 }, meta: {} };
+    box.capture(old, 'regenerate');
+    test('existing listings are not backfilled', old.listing.ai_suggested_price == null && old.listing.ai_regenerated_price === 40);
+    var fallback = { listing: { suggested_price: 40, price_is_fallback: true }, meta: {} };
+    box.capture(fallback, 'initial');
+    test('placeholder fallback is not stored as the AI price', fallback.listing.ai_suggested_price == null);
+
+    function sample(finalP, ai, avg, cat, grade, lot){
+      return { published_price: finalP, ebay_category_name: cat, meta: { grade: grade }, listing: { ai_suggested_price: ai, suggested_price: ai, avg_sold_price: avg, is_lot: lot > 1, lot_quantity: lot, ai_snapshot: { avg_sold_price: avg, category_name: cat, grade: grade } } };
+    }
+    var rows = [];
+    for(var i = 0; i < 5; i++) rows.push(sample(92, 100, 100, 'laptops', 'B', 1));
+    var rules = box.rules(rows);
+    var bucket = rules.buckets.filter(function(b){ return b.category === 'laptops' && b.grade === 'B'; })[0];
+    test('five samples produce a laptop rule', bucket && bucket.n === 5 && bucket.median_final_over_ai === 0.92 && bucket.median_final_over_avg === 0.92);
+    test('rule sentence names the markdown', /Grade B laptops: Kendall prices ~8% under median sold, 5 samples/.test(bucket.plain));
+    test('even-count median averages the middle pair', box.median([0.8, 1]) === 0.9);
+    var lone = box.rules([sample(50, 100, 100, 'phones', 'C', 1)]);
+    test('fewer than 5 samples does not apply', box.ruleFor(lone, sample(50, 100, 100, 'phones', 'C', 1)) === null);
+    var fresh = sample(92, 100, 100, 'laptops', 'B', 1);
+    fresh.published_price = null;
+    fresh.listing.suggested_price = 100;
+    var applied = box.apply(fresh, rules, 'initial');
+    test('rule adjusts the AI price and says -8%', applied && fresh.listing.suggested_price === 92 && fresh.listing.price_rule.label === 'rule applied: -8%' && fresh.listing.ai_suggested_price === 100);
+    test('applying the same rule twice does not stack', box.apply(fresh, rules, 'initial') && fresh.listing.suggested_price === 92 && fresh.listing.price_history.length === 1 && fresh.listing.price_history[0].by === 'rule');
+    test('rules page is read-only wording', /Kendall prices ~8% under median sold/.test(box.page(rules)) && /Back to listings/.test(box.page(rules)));
+
+    var card = { sku: 42, quantity: 1, meta: { grade: 'B' }, listing: { suggested_price: 92, title: 'Dell Laptop', description_html: '<p>No power cord.</p>', is_lot: false, lot_quantity: 1, item_specifics: { Brand: 'Dell' }, price_rule: { label: 'rule applied: -8%', n: 5 } } };
+    test('missing audit shows pending and does not block', /AUDIT PENDING/.test(box.badge(card)) && box.block({ verdict: 'fail' }) === false);
+    card.listing.audit = { verdict: 'warn', suggested_price: 88, reasons: ['priced above the sold range'], fingerprint: box.fp(card) };
+    test('a fresh audit is reused', box.fresh(card) === true && /AUDIT WARN/.test(box.badge(card)) && /Publishing is not blocked/.test(box.badge(card)));
+    card.listing.suggested_price = 70;
+    test('a price change makes the audit stale', box.fresh(card) === false);
+    var norm = box.norm({ verdict: 'FAIL', reasons: ['lot priced as one unit'], suggested_price: 30 });
+    test('audit JSON normalizes to fail', norm.verdict === 'fail' && norm.suggested_price === 30 && norm.reasons[0] === 'lot priced as one unit');
+    test('an unknown audit verdict becomes warn', box.norm({ verdict: 'maybe' }).verdict === 'warn');
+    test('audit prompt covers price, lot, quantity, and missing parts', (function(){ var p = box.prompt(card); return /price versus comps/.test(p) && /priced as a lot/.test(p) && /quantity versus lot/.test(p) && /missing or not-included/.test(p); })());
+    test('publish path does not read the audit verdict', ex('createEbayListing').indexOf('audit.verdict') < 0 && ex('createEbayListing').indexOf('does not block AddItem') >= 0);
+  } catch(e){
+    test('pricing audit eval', false);
+    console.log('    ERROR:', e.message);
+  }
+})();
+
 section('SYNTAX CHECK');
 try {
   require('child_process').execSync('node --check ' + serverFile, {stdio:'pipe'});

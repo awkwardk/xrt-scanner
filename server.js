@@ -745,6 +745,359 @@ function countsFromItemText(meta){
   return { quantity: clientQty, is_lot: false, lot_quantity: 1 };
 }
 
+// ── Pricing audit (review page, before publish — never blocks AddItem) ──
+var PRICING_RULES_FILE = path.join(DATA_DIR, 'pricing-rules.json');
+var PRICING_RULE_MIN_SAMPLES = 5;
+
+function moneyPrice(n){
+  var x = parseFloat(n);
+  if(!(x > 0) || isNaN(x)) return null;
+  return Math.round(x * 100) / 100;
+}
+function appendPriceHistory(listing, from, to, by){
+  listing = listing || {};
+  var next = moneyPrice(to);
+  if(next == null) return listing;
+  var prev = moneyPrice(from);
+  if(prev != null && prev === next) return listing;
+  if(!Array.isArray(listing.price_history)) listing.price_history = [];
+  listing.price_history.push({ at: new Date().toISOString(), from: prev, to: next, by: by || 'operator' });
+  return listing;
+}
+function includesAndMissing(record){
+  record = record || {};
+  var listing = record.listing || {};
+  var meta = record.meta || {};
+  var spec = listing.item_specifics || {};
+  var includes = spec.Includes || spec.includes || '';
+  var notes = [meta.notes, meta.test_notes, meta.voice_transcript].filter(Boolean).join(' | ');
+  var missing = [];
+  String(notes).split(/[.;|\n]+/).forEach(function(part){
+    if(/\b(no|not|without|missing)\b/i.test(part) && part.trim().length > 2) missing.push(part.trim());
+  });
+  return { includes: includes, missing: missing.slice(0, 8) };
+}
+// First AI price is kept forever. A later regenerate writes ai_regenerated_price
+// and does not fill in a missing original (existing listings stay null).
+function captureAiPrice(record, source){
+  if(!record || !record.listing) return record;
+  var listing = record.listing;
+  var price = moneyPrice(listing.suggested_price);
+  if(price == null) return record;
+  var meta = record.meta || {};
+  var idi = meta.identified_item || {};
+  var pack = includesAndMissing(record);
+  if(source === 'regenerate'){
+    listing.price_is_fallback = false;
+    listing.ai_regenerated_price = price;
+    listing.ai_regenerated_at = new Date().toISOString();
+    return record;
+  }
+  if(listing.price_is_fallback) return record;
+  if(listing.ai_suggested_price != null && listing.ai_suggested_price !== '') return record;
+  listing.ai_suggested_price = price;
+  listing.ai_snapshot = {
+    at: new Date().toISOString(),
+    suggested_price: price,
+    avg_sold_price: moneyPrice(listing.avg_sold_price),
+    price_low: moneyPrice(listing.price_low),
+    price_high: moneyPrice(listing.price_high),
+    unit_median_price: moneyPrice(listing.unit_median_price),
+    lot_comp_median: moneyPrice(listing.lot_comp_median),
+    price_note: listing.price_note || '',
+    is_lot: !!listing.is_lot,
+    lot_quantity: parseInt(listing.lot_quantity, 10) || 1,
+    quantity: parseInt(record.quantity || meta.quantity || listing.quantity, 10) || 1,
+    grade: String(meta.grade || record.grade || '').toUpperCase(),
+    category_id: record.ebay_category_id || listing.category_id || idi.ebay_category_id || null,
+    category_name: record.ebay_category_name || meta.category_name || idi.ebay_category_name || '',
+    includes: pack.includes,
+    missing: pack.missing
+  };
+  return record;
+}
+function pricingMedian(nums){
+  var xs = (nums || []).filter(function(n){ return typeof n === 'number' && !isNaN(n) && isFinite(n); }).sort(function(a, b){ return a - b; });
+  if(!xs.length) return null;
+  var mid = Math.floor(xs.length / 2);
+  if(xs.length % 2) return xs[mid];
+  return (xs[mid - 1] + xs[mid]) / 2;
+}
+function lotSizeKey(record){
+  var listing = (record && record.listing) || {};
+  if(listing.is_lot && parseInt(listing.lot_quantity, 10) > 1) return String(parseInt(listing.lot_quantity, 10));
+  return '1';
+}
+function pricingBucketKey(record){
+  record = record || {};
+  var listing = record.listing || {};
+  var meta = record.meta || {};
+  var snap = listing.ai_snapshot || {};
+  var cat = String(record.ebay_category_name || snap.category_name || meta.category_name || 'uncategorized').trim() || 'uncategorized';
+  var grade = String(meta.grade || snap.grade || record.grade || '?').toUpperCase() || '?';
+  return { category: cat, grade: grade, lot_size: lotSizeKey(record) };
+}
+function plainRuleSentence(bucket){
+  bucket = bucket || {};
+  function phrase(ratio, baseLabel){
+    if(ratio == null || isNaN(ratio)) return '';
+    var diff = Math.round((1 - ratio) * 100);
+    if(diff === 0) return 'about the same as ' + baseLabel;
+    if(diff > 0) return '~' + diff + '% under ' + baseLabel;
+    return '~' + Math.abs(diff) + '% over ' + baseLabel;
+  }
+  var n = (bucket.n || 0) + ' sample' + (bucket.n === 1 ? '' : 's');
+  var sold = phrase(bucket.median_final_over_avg, 'median sold');
+  var ai = phrase(bucket.median_final_over_ai, 'the AI price');
+  var who;
+  if(bucket.grade === 'all') who = 'Across all listings';
+  else {
+    who = 'Grade ' + (bucket.grade || '?') + ' ' + (bucket.category || 'items');
+    if(bucket.lot_size && bucket.lot_size !== '1' && bucket.lot_size !== 'any') who += ', lot of ' + bucket.lot_size;
+  }
+  var sentence = who + ': Kendall prices ' + (sold || 'without a sold-comp ratio yet') + ', ' + n + '.';
+  if(ai) sentence += ' Versus the AI price, ' + ai + '.';
+  return sentence;
+}
+function buildPricingRules(records){
+  var globalAi = [], globalAvg = [];
+  var groups = {};
+  (records || []).forEach(function(rec){
+    var listing = (rec && rec.listing) || {};
+    var ai = moneyPrice(listing.ai_suggested_price);
+    var finalP = moneyPrice(rec && rec.published_price);
+    if(ai == null || finalP == null) return;
+    var snap = listing.ai_snapshot || {};
+    var avg = moneyPrice(snap.avg_sold_price);
+    if(avg == null) avg = moneyPrice(listing.avg_sold_price);
+    var key = pricingBucketKey(rec);
+    var id = key.category.toLowerCase() + '|' + key.grade + '|' + key.lot_size;
+    if(!groups[id]) groups[id] = { category: key.category, grade: key.grade, lot_size: key.lot_size, ai: [], avg: [] };
+    groups[id].ai.push(finalP / ai);
+    globalAi.push(finalP / ai);
+    if(avg != null){
+      groups[id].avg.push(finalP / avg);
+      globalAvg.push(finalP / avg);
+    }
+  });
+  function pack(aiArr, avgArr, extra){
+    var medAi = aiArr.length ? Math.round(pricingMedian(aiArr) * 1000) / 1000 : null;
+    var medAvg = avgArr.length ? Math.round(pricingMedian(avgArr) * 1000) / 1000 : null;
+    var o = { n: aiArr.length, median_final_over_ai: medAi, median_final_over_avg: medAvg };
+    Object.keys(extra || {}).forEach(function(k){ o[k] = extra[k]; });
+    o.plain = plainRuleSentence(o);
+    return o;
+  }
+  var buckets = Object.keys(groups).map(function(id){
+    var g = groups[id];
+    return pack(g.ai, g.avg, { category: g.category, grade: g.grade, lot_size: g.lot_size });
+  });
+  var global = pack(globalAi, globalAvg, { category: 'everything', grade: 'all', lot_size: 'any' });
+  if(!global.n) global.plain = 'No published prices with an original AI price yet.';
+  return { updated_at: new Date().toISOString(), min_samples: PRICING_RULE_MIN_SAMPLES, global: global, buckets: buckets };
+}
+function ruleForListing(rules, record){
+  rules = rules || {};
+  var key = pricingBucketKey(record);
+  var buckets = rules.buckets || [];
+  var match = null;
+  for(var i = 0; i < buckets.length; i++){
+    var b = buckets[i];
+    if(String(b.category).toLowerCase() === String(key.category).toLowerCase()
+        && String(b.grade).toUpperCase() === String(key.grade).toUpperCase()
+        && String(b.lot_size) === String(key.lot_size)
+        && b.n >= PRICING_RULE_MIN_SAMPLES && b.median_final_over_ai > 0){
+      match = b;
+      break;
+    }
+  }
+  if(!match && rules.global && rules.global.n >= PRICING_RULE_MIN_SAMPLES && rules.global.median_final_over_ai > 0) match = rules.global;
+  if(!match) return null;
+  var ratio = match.median_final_over_ai;
+  var pct = Math.round((1 - ratio) * 100);
+  var label = pct > 0 ? ('rule applied: -' + pct + '%') : (pct < 0 ? ('rule applied: +' + Math.abs(pct) + '%') : 'rule applied: no change');
+  return { ratio: ratio, n: match.n, label: label, bucket: (match.category || '') + ' / ' + (match.grade || '') + ' / lot ' + (match.lot_size || '') };
+}
+function applyPricingRule(record, rules, source){
+  if(!record || !record.listing) return null;
+  var listing = record.listing;
+  var base = (source === 'regenerate')
+    ? (moneyPrice(listing.ai_regenerated_price) || moneyPrice(listing.ai_suggested_price))
+    : moneyPrice(listing.ai_suggested_price);
+  if(base == null) return null;
+  var rule = ruleForListing(rules, record);
+  if(!rule){ listing.price_rule = null; return null; }
+  if(listing.price_rule && listing.price_rule.base === base && listing.price_rule.source === (source || 'initial')) return listing.price_rule;
+  var adjusted = Math.round(base * rule.ratio * 100) / 100;
+  var before = moneyPrice(listing.suggested_price);
+  listing.suggested_price = adjusted;
+  listing.price_rule = { label: rule.label, ratio: rule.ratio, n: rule.n, bucket: rule.bucket, base: base, source: source || 'initial', at: new Date().toISOString() };
+  if(before != null && before !== adjusted) appendPriceHistory(listing, before, adjusted, 'rule');
+  return listing.price_rule;
+}
+function readPricingRules(){
+  try {
+    if(typeof fs !== 'undefined' && fs.existsSync && fs.existsSync(PRICING_RULES_FILE)) return JSON.parse(fs.readFileSync(PRICING_RULES_FILE, 'utf8'));
+  } catch(e){}
+  return { updated_at: null, min_samples: PRICING_RULE_MIN_SAMPLES, global: { n: 0, median_final_over_ai: null, median_final_over_avg: null, plain: 'No published prices with an original AI price yet.' }, buckets: [] };
+}
+function recomputePricingRules(){
+  var records = [];
+  try {
+    var itemsDir = path.join(DATA_DIR, 'items');
+    if(typeof fs !== 'undefined' && fs.existsSync && fs.existsSync(itemsDir)){
+      fs.readdirSync(itemsDir).forEach(function(f){
+        var lp = path.join(itemsDir, f, 'listing.json');
+        if(!fs.existsSync(lp)) return;
+        try { records.push(JSON.parse(fs.readFileSync(lp, 'utf8'))); } catch(e){}
+      });
+    }
+  } catch(e){}
+  var rules = buildPricingRules(records);
+  try { if(typeof fs !== 'undefined' && fs.writeFileSync) fs.writeFileSync(PRICING_RULES_FILE, JSON.stringify(rules, null, 2)); } catch(e){}
+  return rules;
+}
+function settleNewAiPrice(record, source){
+  captureAiPrice(record, source || 'initial');
+  var rules = { buckets: [], global: { n: 0 } };
+  if(typeof fs !== 'undefined' && fs.existsSync){
+    try { rules = readPricingRules(); } catch(e){}
+  }
+  applyPricingRule(record, rules, source || 'initial');
+  return record;
+}
+function pricingRulesHtml(rules){
+  rules = rules || readPricingRules();
+  function esc(s){ return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  var rows = (rules.buckets || []).map(function(b){ return '<li>' + esc(b.plain) + '</li>'; }).join('');
+  if(!rows) rows = '<li>No category has a published price and an original AI price yet.</li>';
+  return '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Pricing rules</title></head><body style="font-family:Arial,sans-serif;max-width:760px;margin:32px auto;padding:0 16px;color:#222;">'
+    + '<p><a href="/api/listings">Back to listings</a></p>'
+    + '<h1>Pricing rules</h1>'
+    + '<p>These are read from published listings that still have the original AI price. A rule changes the suggested price only after ' + PRICING_RULE_MIN_SAMPLES + ' samples. Publishing is never blocked.</p>'
+    + '<p><strong>' + esc((rules.global && rules.global.plain) || '') + '</strong></p>'
+    + '<ul>' + rows + '</ul>'
+    + '</body></html>';
+}
+function auditFingerprint(record){
+  record = record || {};
+  var listing = record.listing || {};
+  var meta = record.meta || {};
+  var spec = listing.item_specifics || {};
+  var specStr = Object.keys(spec).sort().map(function(k){ return k + '=' + spec[k]; }).join('|');
+  var desc = String(listing.description_html || '');
+  return [
+    listing.suggested_price, listing.title, desc.length + ':' + desc.slice(0, 240),
+    meta.grade, record.quantity || meta.quantity || listing.quantity,
+    listing.is_lot ? 1 : 0, listing.lot_quantity,
+    record.ebay_category_id || listing.category_id, specStr, listing.price_note || ''
+  ].join('||');
+}
+function auditCacheFresh(record){
+  var listing = record && record.listing;
+  if(!listing || !listing.audit || !listing.audit.verdict || !listing.audit.fingerprint) return false;
+  return listing.audit.fingerprint === auditFingerprint(record);
+}
+function normalizeAuditResult(parsed){
+  parsed = parsed || {};
+  var v = String(parsed.verdict || '').toLowerCase();
+  if(v !== 'pass' && v !== 'warn' && v !== 'fail') v = 'warn';
+  var reasons = Array.isArray(parsed.reasons) ? parsed.reasons.map(function(r){ return String(r).replace(/\s+/g, ' ').trim().slice(0, 220); }).filter(Boolean).slice(0, 6) : [];
+  if(!reasons.length && parsed.reason) reasons = [String(parsed.reason).replace(/\s+/g, ' ').trim().slice(0, 220)];
+  return { verdict: v, suggested_price: moneyPrice(parsed.suggested_price), reasons: reasons };
+}
+function publishBlockedByAudit(){ return false; }
+function buildAuditPrompt(record){
+  record = record || {};
+  var listing = record.listing || {};
+  var meta = record.meta || {};
+  var snap = listing.ai_snapshot || {};
+  var pack = includesAndMissing(record);
+  return [
+    'Audit this listing before it is published. Do not refuse to list it.',
+    'Checks:',
+    '- price versus comps (avg sold, low, high, and the price note)',
+    '- condition and grade',
+    '- lot size handling: a lot must be priced as a lot, not as one unit',
+    '- quantity versus lot sanity (a lot of N is usually eBay quantity 1; "I have N" is quantity N and not a lot)',
+    '- missing or not-included parts from the seller notes must appear in the description',
+    '- obvious title or item-specific errors',
+    '',
+    'Title: ' + (listing.title || ''),
+    'Grade: ' + (meta.grade || snap.grade || ''),
+    'eBay quantity: ' + (record.quantity || meta.quantity || listing.quantity || 1),
+    'Is lot: ' + (!!listing.is_lot) + ', lot size: ' + (listing.lot_quantity || 1),
+    'Suggested price: ' + (listing.suggested_price || ''),
+    'Original AI price: ' + (listing.ai_suggested_price == null ? 'unknown' : listing.ai_suggested_price),
+    'Avg sold: ' + (snap.avg_sold_price || listing.avg_sold_price || ''),
+    'Price low/high: ' + (snap.price_low || listing.price_low || '') + ' / ' + (snap.price_high || listing.price_high || ''),
+    'Price note: ' + (listing.price_note || snap.price_note || ''),
+    'Category: ' + (record.ebay_category_name || snap.category_name || ''),
+    'Seller notes: ' + [meta.notes, meta.test_notes].filter(Boolean).join(' | '),
+    'Included: ' + (pack.includes || ''),
+    'Missing from notes: ' + (pack.missing || []).join('; '),
+    'Item specifics: ' + (function(){ try { return JSON.stringify(listing.item_specifics || {}); } catch(e){ return '{}'; } })(),
+    'Description: ' + String(listing.description_html || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 2500)
+  ].join('\n');
+}
+function escAudit(s){ return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function auditBadgeHtml(record){
+  record = record || {};
+  var sku = record.sku != null ? record.sku : '';
+  var listing = record.listing || {};
+  var rule = listing.price_rule;
+  var ruleHtml = (rule && rule.label) ? '<div style="font-size:12.5px;color:#1565c0;font-weight:bold;">' + escAudit(rule.label) + (rule.n ? ' (' + rule.n + ' samples)' : '') + '</div>' : '';
+  var fresh = auditCacheFresh(record);
+  if(!fresh){
+    return '<div id="audit_' + escAudit(sku) + '" data-audit-sku="' + escAudit(sku) + '" data-audit-fresh="0" style="flex:1 0 100%;font-size:12.5px;color:#666;">AUDIT PENDING</div>' + ruleHtml;
+  }
+  var a = listing.audit || {};
+  var colors = { pass:'#2e7d32', warn:'#e65100', fail:'#c62828' };
+  var reasons = (a.reasons || []).map(escAudit).join(' · ');
+  var sug = a.suggested_price ? (' Audit suggests $' + escAudit(a.suggested_price) + '.') : '';
+  return '<div id="audit_' + escAudit(sku) + '" data-audit-sku="' + escAudit(sku) + '" data-audit-fresh="1" style="flex:1 0 100%;font-size:12.5px;color:#333;"><span style="background:' + (colors[a.verdict] || '#666') + ';color:#fff;padding:2px 8px;border-radius:4px;font-weight:bold;margin-right:6px;">AUDIT ' + escAudit(String(a.verdict || '').toUpperCase()) + '</span>' + reasons + sug + ' Publishing is not blocked.</div>' + ruleHtml;
+}
+function runListingAudit(sku, callback){
+  callback = typeof callback === 'function' ? callback : function(){};
+  var lp = path.join(DATA_DIR, 'items', String(sku), 'listing.json');
+  var record;
+  try { record = JSON.parse(fs.readFileSync(lp, 'utf8')); }
+  catch(e){ callback({ success:false, error:'Listing not found' }); return; }
+  if(auditCacheFresh(record)){ callback({ success:true, audit: record.listing.audit, cached:true }); return; }
+  var fp = auditFingerprint(record);
+  function saveAudit(audit){
+    audit.fingerprint = fp;
+    audit.at = new Date().toISOString();
+    try {
+      var fresh = JSON.parse(fs.readFileSync(lp, 'utf8'));
+      if(auditFingerprint(fresh) !== fp){ callback({ success:true, audit: audit, cached:false, stale:true }); return; }
+      fresh.listing = fresh.listing || {};
+      fresh.listing.audit = audit;
+      fs.writeFileSync(lp, JSON.stringify(fresh, null, 2));
+    } catch(e){}
+    callback({ success:true, audit: audit, cached:false });
+  }
+  if(!OPENROUTER_KEY){
+    saveAudit({ verdict:'warn', suggested_price: moneyPrice(record.listing && record.listing.suggested_price), reasons:['Audit skipped: OpenRouter key is not set'], skipped:true });
+    return;
+  }
+  var system = 'You audit an eBay listing before publish. Publishing is not blocked. Return ONLY JSON: {"verdict":"pass|warn|fail","suggested_price":0,"reasons":["one short line"]}. pass means fine to list. warn means look at it. fail means the price, the lot, or a missing part looks wrong. suggested_price is your recommended listing price.';
+  callOpenRouter({
+    model: geminiOpenRouterModel(false),
+    thinking: GEMINI_THINKING_REASON,
+    max_tokens: 700,
+    messages: [ { role:'system', content: system }, { role:'user', content: buildAuditPrompt(record) } ]
+  }, function(err, text){
+    var parsed = normalizeAuditResult((!err && text) ? (parseGeminiJson(text) || {}) : {});
+    if(err || !text) parsed = { verdict:'warn', suggested_price: moneyPrice(record.listing && record.listing.suggested_price), reasons:['Audit could not be completed'] };
+    saveAudit(parsed);
+  });
+}
+function scheduleListingAudit(sku){
+  if(sku == null || sku === '') return;
+  setTimeout(function(){ try { runListingAudit(sku, function(){}); } catch(e){ console.log('[AUDIT] SKU ' + sku + ' ' + e.message); } }, 0);
+}
+
 // Extract structured listing inputs from a spoken transcript. Everything is optional —
 // a sparse transcript simply yields fewer fields, never an error.
 function parseVoiceTranscript(transcript){
@@ -1318,6 +1671,7 @@ function assembleVoiceRecordFromAI(sku, shelf, saved, transcript, pvHints, winfo
     lot_comp_median: num(aiData.lot_comp_median, 0) || 0
   };
   if(isLot && lotQty > 1 && !priceWasFallback) applyLotPrice(listing, lotQty);
+  if(priceWasFallback) listing.price_is_fallback = true;
 
   var meta = {
     sku: sku, grade: grade, powerTest: pvHints.power_test || (partsRepair ? 'Fail' : null), notes: transcript || '', shelf: shelf || '',
@@ -2497,8 +2851,10 @@ const server = http.createServer(function(req, res) {
 
                             function writeVoiceRecord(){
                               if(manualPackage){ record.manual_package = manualPackage; }
+                              try { settleNewAiPrice(record, 'initial'); } catch(e){ console.log('[PRICE] SKU ' + sku + ' settle error: ' + e.message); }
                               fs.writeFileSync(path.join(itemDir, 'meta.json'), JSON.stringify(record.meta, null, 2));
                               fs.writeFileSync(path.join(itemDir, 'listing.json'), JSON.stringify(record, null, 2));
+                              scheduleListingAudit(sku);
                               try { loadListings(); } catch(e){}
                               console.log('[VOICE] SKU ' + sku + ' generated — "' + record.listing.title + '" | grade ' + record.meta.grade +
                                 ' | condition ' + record.listing.condition_id + (record.listing.parts_repair ? ' | PARTS/REPAIR' : '') +
@@ -2735,7 +3091,10 @@ const server = http.createServer(function(req, res) {
         if(pPipe && pRec[pPipe]){ pRec[pPipe].suggested_price = np; }
         pRec.listing = pRec.listing || {};
         var oldp = pRec.listing.suggested_price;
-        if(!pPipe || pPipe === 'sonnet'){ pRec.listing.suggested_price = np; }
+        if(!pPipe || pPipe === 'sonnet'){
+          appendPriceHistory(pRec.listing, oldp, np, 'operator');
+          pRec.listing.suggested_price = np;
+        }
         console.log('[LISTING] SKU ' + pSku + ' price override' + (pPipe ? ' (' + pPipe + ')' : '') + ': $' + (oldp == null ? '?' : oldp) + ' → $' + np);
       }
       // CHANGE 1: editable Dimensions (box LxWxH). Stored on the listing and mirrored to the
@@ -3215,6 +3574,21 @@ const server = http.createServer(function(req, res) {
       enqueueListing(parsed.sku); // clears the failed flag and re-queues
       sendJSON(res,200,{success:true, sku: Number(parsed.sku)});
     });
+    return;
+  }
+
+  if(req.method==='POST' && /^\/api\/listings\/\d+\/audit$/.test(req.url.split('?')[0])){
+    var auditSku = req.url.split('?')[0].split('/')[3];
+    runListingAudit(auditSku, function(result){ sendJSON(res, 200, result || { success:false }); });
+    return;
+  }
+  if(req.method==='GET' && req.url.split('?')[0]==='/api/pricing-rules'){
+    sendJSON(res, 200, readPricingRules());
+    return;
+  }
+  if(req.method==='GET' && req.url.split('?')[0]==='/pricing-rules'){
+    res.writeHead(200, { 'Content-Type':'text/html' });
+    res.end(pricingRulesHtml(readPricingRules()));
     return;
   }
 
@@ -4997,7 +5371,9 @@ function regenerateListing(sku, userNotes, callback){
       record.listing.title = ensureLotInTitle(record.listing.title, true, parseInt(record.listing.lot_quantity, 10));
       applyLotPrice(record.listing, parseInt(record.listing.lot_quantity, 10));
     }
+    try { settleNewAiPrice(record, 'regenerate'); } catch(e){ console.log('[PRICE] SKU ' + sku + ' regen settle error: ' + e.message); }
     try { fs.writeFileSync(lp, JSON.stringify(record, null, 2)); } catch(e){ callback({success:false, error:'Write failed'}); return; }
+    scheduleListingAudit(sku);
     console.log('[REGEN] SKU ' + sku + ' complete: "' + record.listing.title + '"');
     callback({ success:true, title: record.listing.title, condition_box: record.listing.condition_box, description_html: record.listing.description_html, suggested_price: record.listing.suggested_price, accept_price: record.listing.accept_price, decline_price: record.listing.decline_price });
   });
@@ -6014,6 +6390,7 @@ function processItem(item, callback) {
         if(!listing.accept_price) listing.accept_price = Math.round(_mid * 0.8);
         if(!listing.decline_price) listing.decline_price = Math.round(_mid * 0.6);
         console.log('[LISTING] SKU ' + sku + ' price seed: $' + _lo + '-$' + _hi + ' (source: ' + _src + ')');
+        listing.price_is_fallback = (_src === 'manual_fallback');
       }
 
       // Mark processed
@@ -6050,8 +6427,10 @@ function processItem(item, callback) {
       };
 
       // FIX 3: persist listing.json per item so listings survive /tmp wipes
+      try { settleNewAiPrice(result, 'initial'); } catch(e){ console.log('[PRICE] SKU ' + sku + ' settle error: ' + e.message); }
       try { fs.writeFileSync(path.join(itemDir, 'listing.json'), JSON.stringify(result, null, 2)); }
       catch(e){ console.log('[LISTING] write error:', e.message); }
+      scheduleListingAudit(sku);
 
       callback(result);
     });
@@ -7215,13 +7594,17 @@ function createEbayListing(sku, callback, scheduleTime){
             });
           }
           if((ack === 'Success' || ack === 'Warning') && itemId){
+            // Pricing audit is informational. A fail verdict does not block AddItem.
             record.ebay_item_id = itemId;
             record.ebay_listing_url = 'https://www.ebay.com/itm/' + itemId;
             record.ebay_offer_status = 'ACTIVE';
             record.listed_at = new Date().toISOString();
+            record.published_price = moneyPrice(record.listing && record.listing.suggested_price);
+            record.published_at = record.listed_at;
             var wasScheduled = !!(opts.scheduleTime && !opts.reviseItemId);
             if(wasScheduled){ record.ebay_offer_status = 'SCHEDULED'; record.ebay_scheduled_time = opts.scheduleTime; }
             try { fs.writeFileSync(listingPath, JSON.stringify(record, null, 2)); } catch(_e){}
+            try { recomputePricingRules(); } catch(_re){ console.log('[PRICE] rules rebuild failed: ' + _re.message); }
             callback(null, {item_id: itemId, listing_url: record.ebay_listing_url, scheduled: wasScheduled, schedule_time: wasScheduled ? opts.scheduleTime : null});
             return;
           }
@@ -7946,6 +8329,7 @@ function generateListingsPage(listings, ebayStat){
       +'<div style="background:#f5f5f5;border-bottom:1px solid #ddd;padding:8px 16px;font-size:12.5px;color:#444;display:flex;flex-wrap:wrap;gap:6px 18px;">'
       +'<span><b>Suggest:</b> $<span id="sug_'+skuStr+'" onclick="editSuggest(\''+skuStr+'\')" style="cursor:pointer;border-bottom:1px dashed #1565c0;color:#1565c0;" title="Click to edit listing price">'+suggest+'</span> <span id="sugmsg_'+skuStr+'" style="font-weight:bold;"></span></span>'
       +(listing.price_note ? '<span style="flex:1 0 100%;color:#555;"><b>Price note:</b> '+String(listing.price_note).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')+'</span>' : '')
+      +auditBadgeHtml(r)
       +'<span><b>Accept:</b> $'+accept+'</span>'
       +'<span><b>Decline:</b> $'+decline+'</span>'
       +'<span><b>Shelf:</b> '+(meta.shelf||'&mdash;')+'</span>'
@@ -8024,7 +8408,7 @@ function generateListingsPage(listings, ebayStat){
     +'function saveWeight(sku){var lb=document.getElementById("wtlb_"+sku);var oz=document.getElementById("wtoz_"+sku);var msg=document.getElementById("wtmsg_"+sku);var L=lb?parseInt(lb.value,10):0;if(isNaN(L))L=0;var O=oz?parseFloat(oz.value):0;if(isNaN(O))O=0;if(L<0||O<0||(L===0&&O===0)){if(msg){msg.style.color="#c62828";msg.textContent="Enter lb and/or oz";}return;}if(msg){msg.style.color="#8d6e00";msg.textContent="Saving...";}fetch("/api/set-weight",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sku:parseInt(sku,10),lbs:L,oz:O})}).then(function(r){return r.json();}).then(function(d){if(d.success){if(msg){msg.style.color="#2e7d32";msg.textContent="Saved \\u2713 Packed: "+d.final_lbs+"lb "+d.final_oz+"oz | Box: "+d.box_size;}setTimeout(function(){location.reload();},1200);}else{if(msg){msg.style.color="#c62828";msg.textContent=d.error||"Save failed";}}}).catch(function(){if(msg){msg.style.color="#c62828";msg.textContent="Network error";}});}'
     +'function applyPkgLabels(sku,d){var sp=document.getElementById("ship_"+sku);if(sp&&d.shipping_policy){sp.textContent=d.shipping_policy;if(d.manual){var mk=document.createElement("span");mk.style.color="#2e7d32";mk.style.fontWeight="bold";mk.textContent=" (actual pkg)";sp.appendChild(mk);}}var dm=document.getElementById("dim_"+sku);if(dm&&d.box_dimensions){dm.textContent=d.box_dimensions;}var pk=document.getElementById("mppkg_"+sku);if(pk){if(d.manual){pk.innerHTML="&#128230; Actual Pkg: "+d.pkg_label;pk.style.display="";}else{pk.style.display="none";}}}function savePackage(sku){var g=function(id){var e=document.getElementById(id+"_"+sku);return e?e.value:"";};var msg=document.getElementById("mpmsg_"+sku);var body={sku:parseInt(sku,10),lbs:g("mplb"),oz:g("mpoz"),length:g("mpl"),width:g("mpw"),height:g("mph")};var neg=["lbs","oz","length","width","height"].some(function(k){var v=parseFloat(body[k]);return !isNaN(v)&&v<0;});if(neg){if(msg){msg.style.color="#c62828";msg.textContent="Values must be positive";}return;}if(msg){msg.style.color="#555";msg.textContent="Saving...";}fetch("/api/set-package",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(function(r){return r.json();}).then(function(d){if(d.success){if(msg){msg.style.color="#2e7d32";msg.textContent=d.manual_package?"Saved - overriding padding":"Cleared - automatic padding restored";}applyPkgLabels(sku,d);setTimeout(function(){location.reload();},1000);}else{if(msg){msg.style.color="#c62828";msg.textContent=d.error||"Save failed";}}}).catch(function(){if(msg){msg.style.color="#c62828";msg.textContent="Network error";}});}'
     +'function clearPackage(sku){["mplb","mpoz","mpl","mpw","mph"].forEach(function(p){var e=document.getElementById(p+"_"+sku);if(e)e.value="";});savePackage(sku);}'
-    +'function editSuggest(sku){var span=document.getElementById("sug_"+sku);if(!span||span.dataset.editing)return;span.dataset.editing="1";var cur=parseFloat(span.textContent)||0;var inp=document.createElement("input");inp.type="number";inp.min="0";inp.step="0.01";inp.value=cur;inp.style.cssText="width:80px;padding:2px 4px;border:1px solid #1565c0;border-radius:3px;font-size:12.5px;";span.textContent="";span.appendChild(inp);inp.focus();inp.select();var done=false;function save(){if(done)return;done=true;var nv=parseFloat(inp.value);var msg=document.getElementById("sugmsg_"+sku);if(isNaN(nv)||nv<=0){span.textContent=cur;span.removeAttribute("data-editing");if(msg){msg.style.color="#c62828";msg.textContent="invalid";}return;}fetch("/api/listings/"+sku,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({suggest_price:nv})}).then(function(r){return r.json();}).then(function(d){if(d.success){span.textContent=(d.suggested_price!=null?d.suggested_price:nv);if(msg){msg.style.color="#2e7d32";msg.textContent="\\u2713";setTimeout(function(){msg.textContent="";},1500);}}else{span.textContent=cur;if(msg){msg.style.color="#c62828";msg.textContent=d.error||"failed";}}span.removeAttribute("data-editing");}).catch(function(){span.textContent=cur;span.removeAttribute("data-editing");if(msg){msg.style.color="#c62828";msg.textContent="error";}});}inp.addEventListener("blur",save);inp.addEventListener("keydown",function(e){if(e.key==="Enter"){e.preventDefault();inp.blur();}else if(e.key==="Escape"){done=true;span.textContent=cur;span.removeAttribute("data-editing");}});}'
+    +'function editSuggest(sku){var span=document.getElementById("sug_"+sku);if(!span||span.dataset.editing)return;span.dataset.editing="1";var cur=parseFloat(span.textContent)||0;var inp=document.createElement("input");inp.type="number";inp.min="0";inp.step="0.01";inp.value=cur;inp.style.cssText="width:80px;padding:2px 4px;border:1px solid #1565c0;border-radius:3px;font-size:12.5px;";span.textContent="";span.appendChild(inp);inp.focus();inp.select();var done=false;function save(){if(done)return;done=true;var nv=parseFloat(inp.value);var msg=document.getElementById("sugmsg_"+sku);if(isNaN(nv)||nv<=0){span.textContent=cur;span.removeAttribute("data-editing");if(msg){msg.style.color="#c62828";msg.textContent="invalid";}return;}fetch("/api/listings/"+sku,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({suggest_price:nv})}).then(function(r){return r.json();}).then(function(d){if(d.success){span.textContent=(d.suggested_price!=null?d.suggested_price:nv);if(msg){msg.style.color="#2e7d32";msg.textContent="\\u2713";setTimeout(function(){msg.textContent="";},1500);}if(window.refreshListingAudit)refreshListingAudit(sku);}else{span.textContent=cur;if(msg){msg.style.color="#c62828";msg.textContent=d.error||"failed";}}span.removeAttribute("data-editing");}).catch(function(){span.textContent=cur;span.removeAttribute("data-editing");if(msg){msg.style.color="#c62828";msg.textContent="error";}});}inp.addEventListener("blur",save);inp.addEventListener("keydown",function(e){if(e.key==="Enter"){e.preventDefault();inp.blur();}else if(e.key==="Escape"){done=true;span.textContent=cur;span.removeAttribute("data-editing");}});}'
     +'function deletePhoto(sku,name,btn){if(!confirm("Delete this photo from the listing?"))return;fetch("/api/listings/"+sku+"/photo/"+encodeURIComponent(name),{method:"DELETE"}).then(function(r){return r.json();}).then(function(d){if(d.success){var t=btn.parentNode;if(t&&t.parentNode){t.parentNode.removeChild(t);}}else{alert("Delete failed: "+(d.error||"unknown"));}}).catch(function(){alert("Network error deleting photo.");});}'
     +'function saveQty(sku){var inp=document.getElementById("qty_"+sku);var msg=document.getElementById("qtymsg_"+sku);var v=inp?parseInt(inp.value,10):NaN;if(isNaN(v)||v<1||v>99){if(msg){msg.style.color="#c62828";msg.textContent="1-99 only";}return;}if(msg){msg.style.color="#8d6e00";msg.textContent="Saving...";}fetch("/api/listings/"+sku,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({quantity:v})}).then(function(r){return r.json();}).then(function(d){if(d.success){if(msg){msg.style.color="#2e7d32";msg.textContent="Saved \\u2713";}}else{if(msg){msg.style.color="#c62828";msg.textContent=d.error||"Failed";}}}).catch(function(){if(msg){msg.style.color="#c62828";msg.textContent="Network error";}});}'
     +'function deleteListing(sku){if(!confirm("Delete this listing permanently? This cannot be undone."))return;fetch("/api/listings/"+sku,{method:"DELETE"}).then(function(r){return r.json();}).then(function(d){if(d.success){var c=document.getElementById("card_"+sku);if(c&&c.parentNode){c.parentNode.removeChild(c);}}else{alert("Delete failed: "+(d.error||"unknown"));}}).catch(function(){alert("Network error deleting listing.");});}'
@@ -8071,7 +8455,8 @@ function generateListingsPage(listings, ebayStat){
     +'function doRegenPipe(sku,pl){var inp=document.getElementById("regnotes_"+pl+"_"+sku);var notes=inp?inp.value:"";var st=document.getElementById("regmsg_"+pl+"_"+sku);var btn=document.getElementById("regbtn_"+pl+"_"+sku);if(st){st.style.color="#8d6e00";st.textContent="Regenerating...";}if(btn){btn.disabled=true;btn.innerHTML="Regenerating...";}fetch("/api/regenerate-listing/"+sku,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({notes:notes,pipeline:pl})}).then(function(r){return r.json();}).then(function(d){if(btn){btn.disabled=false;btn.innerHTML="&#8634; Regenerate";}if(d&&d.success){applyRegenPipe(sku,pl,d);if(st){st.style.color="#2e7d32";st.textContent="Updated \\u2713 (reloading)";}setTimeout(function(){location.reload();},1200);}else{if(st){st.style.color="#c62828";st.textContent=(d&&d.error)||"Failed";}}}).catch(function(){if(btn){btn.disabled=false;btn.innerHTML="&#8634; Regenerate";}if(st){st.style.color="#c62828";st.textContent="Network error";}});}'
     +'function listEbayPipe(sku,pl){var b=document.getElementById("ebtn_"+pl+"_"+sku);if(b){b.textContent="Listing...";b.disabled=true;}fetch("/api/listings/supersede/"+sku+"/"+pl,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({listed_pipeline:pl})}).then(function(r){return r.json();}).then(function(sd){if(!sd||!sd.success){if(b){b.textContent="Retry";b.disabled=false;}alert("Could not set listing: "+((sd&&sd.error)||"unknown"));return;}return fetch("/api/send-to-ebay",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sku:parseInt(sku,10)})}).then(function(r){return r.json();}).then(function(d){if(d&&d.success){markListedPipe(sku,pl,d.listing_url);}else{if(b){b.textContent="Retry";b.disabled=false;}alert("eBay: "+((d&&d.error)||"failed"));}});}).catch(function(){if(b){b.textContent="Retry";b.disabled=false;}alert("Network error contacting server.");});}'
     +'function markListedPipe(sku,pl,url){var other=pl==="gemini"?"sonnet":"gemini";var b=document.getElementById("ebtn_"+pl+"_"+sku);if(b){var a=document.createElement("a");a.href=url||"#";a.target="_blank";a.textContent="Listed \\u2713";a.style.cssText="padding:8px 16px;border-radius:4px;font-size:13px;font-weight:bold;background:#2e7d32;color:#fff;text-decoration:none;";if(b.parentNode)b.parentNode.replaceChild(a,b);}var ov=document.getElementById("superseded_"+other+"_"+sku);if(ov)ov.style.display="flex";var ob=document.getElementById("ebtn_"+other+"_"+sku);if(ob){ob.disabled=true;ob.textContent="Superseded";ob.style.background="#9e9e9e";ob.style.opacity="0.6";ob.style.cursor="not-allowed";ob.onclick=null;}var cbs=document.querySelectorAll(".bulkSel[value=\\""+sku+"\\"]");Array.prototype.forEach.call(cbs,function(cb){if(cb.parentNode)cb.parentNode.removeChild(cb);});updateBulkCount();}'
-    +'setInterval(loadQueue,10000);loadQueue();updateBulkCount();initPhotoReorder();'
+    +'function paintListingAudit(sku,a){var el=document.getElementById("audit_"+sku);if(!el||!a)return;var colors={pass:"#2e7d32",warn:"#e65100",fail:"#c62828"};var reasons=(a.reasons||[]).join(" · ");var sug=a.suggested_price?(" Audit suggests $"+a.suggested_price+"."):"";el.setAttribute("data-audit-fresh","1");el.innerHTML="<span style=\\"background:"+(colors[a.verdict]||"#666")+";color:#fff;padding:2px 8px;border-radius:4px;font-weight:bold;margin-right:6px;\\">AUDIT "+String(a.verdict||"").toUpperCase()+"</span>"+reasons+sug+" Publishing is not blocked.";}function refreshListingAudit(sku){var el=document.getElementById("audit_"+sku);if(el){el.setAttribute("data-audit-fresh","0");el.textContent="AUDIT PENDING";}fetch("/api/listings/"+sku+"/audit",{method:"POST"}).then(function(r){return r.json();}).then(function(d){if(d&&d.audit)paintListingAudit(sku,d.audit);}).catch(function(){});}function refreshPendingAudits(){var nodes=document.querySelectorAll("[data-audit-fresh=\\"0\\"]");for(var i=0;i<nodes.length;i++){var sku=nodes[i].getAttribute("data-audit-sku");if(sku)refreshListingAudit(sku);}}'
+    +'setInterval(loadQueue,10000);loadQueue();updateBulkCount();initPhotoReorder();refreshPendingAudits();'
     +'<\/script>'
     +'</head><body>'
     +'<div id="lpLightbox" onclick="if(event.target===this)closeLightbox()" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.92);z-index:99999;align-items:center;justify-content:center;">'
@@ -8084,6 +8469,7 @@ function generateListingsPage(listings, ebayStat){
     +'<div class="topbar">'
     +'<div><h1>XRT eBay Listing Descriptions</h1><p class="meta">'+listings.length+' items &nbsp;&middot;&nbsp; Clovis, CA</p></div>'
     +'<div class="actions">'
+    +'<a href="/pricing-rules" style="padding:8px 16px;background:#455a64;color:#fff;border-radius:4px;text-decoration:none;font-size:13px;font-weight:bold;">Pricing rules</a>'
     +'<a href="/api/listings" style="padding:8px 16px;background:#455a64;color:#fff;border-radius:4px;text-decoration:none;font-size:13px;font-weight:bold;">Refresh</a>'
     +'<button onclick="clearAll()" style="padding:8px 16px;background:#ff1744;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:bold;">Clear All</button>'
     +'</div>'
