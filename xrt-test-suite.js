@@ -2019,6 +2019,51 @@ section('ACCESS, BACKUP, LEARNING');
   test('weekly note suggests the repeated markdown', ideas.length === 1 && /Grade B monitors/.test(ideas[0].text) && /apply -10%/.test(ideas[0].text));
   test('buyer PIN is not hardcoded', !has('1090') && has('XRT_ROLE'));
   test('backup route is documented in the server', has("reqPath === '/api/backup'") && has('xrt-backup-'));
+
+  var sampleRec = {
+    sku: 42,
+    ebay_category_name: 'monitors',
+    published_price: 80,
+    published_at: '2026-11-02T00:00:00.000Z',
+    meta: { grade: 'B' },
+    quantity: 1,
+    listing: {
+      ai_suggested_price: 100,
+      is_lot: false,
+      lot_quantity: 1,
+      avg_sold_price: 100,
+      price_low: 70,
+      price_high: 120,
+      ai_snapshot: { avg_sold_price: 100, price_low: 70, price_high: 120, category_name: 'monitors', grade: 'B' },
+      price_history: [
+        { at: '2026-11-01T00:00:00.000Z', from: 100, to: 90, by: 'kendall', reason: 'heavy wear' },
+        { at: '2026-11-01T01:00:00.000Z', from: 100, to: 95, by: 'rule' }
+      ]
+    }
+  };
+  var fromHist = access.rowsFromRecord(sampleRec);
+  test('answer key uses human price edits and skips rule moves', fromHist.length === 2 && fromHist[0].final_price === 90 && fromHist[0].reason === 'heavy wear' && fromHist[0].delta_pct === -10 && fromHist[1].who === 'publish');
+  var merged = access.mergeAnswerKey(fromHist, [sampleRec]);
+  test('backfill does not duplicate rows', merged.length === fromHist.length);
+  var freshListing = { sku: 7, ebay_category_name: 'monitors', meta: { grade: 'B' }, listing: { ai_suggested_price: 88, suggested_price: 88, is_lot: false, lot_quantity: 1 } };
+  var examples = [];
+  for(var k = 0; k < 4; k++) examples.push({ sku: k, category: 'monitors', grade: 'B', lot_size: '1', qty: 1, ai_price: 100, final_price: 90, when: '2026-11-0' + (k + 1), comps: { avg_sold_price: 100 } });
+  var near = access.gradeAiPrice(freshListing, examples);
+  test('grader passes a price inside the usual band', near.verdict === 'pass' && near.n === 4 && /usually prices similar items at \$90/.test(near.text));
+  freshListing.listing.ai_suggested_price = 140;
+  var far = access.gradeAiPrice(freshListing, examples);
+  test('grader warns without changing the price', far.verdict === 'warn' && /based on 4 examples/.test(far.text) && freshListing.listing.suggested_price === 88 && /GRADER WARN/.test(access.graderBadgeHtml(far)));
+  var coachRows = [];
+  for(var c = 0; c < 5; c++) coachRows.push({ category: 'monitors', grade: 'B', lot_size: '1', ai_price: 100, final_price: 80, when: '2026-11-0' + (c + 1) });
+  var proposal = access.proposeCoachRule(coachRows);
+  test('coach proposes one rule with a replay', proposal && proposal.closer > proposal.worse && proposal.closer + proposal.worse <= coachRows.length);
+  var replay = access.replayCoach(proposal, coachRows);
+  test('replay counts closer and worse', replay.closer === proposal.closer && replay.worse === proposal.worse);
+  var promoted = access.promoteCandidate({ overrides: [] }, proposal);
+  test('accept stores one override and does not invent a second', promoted.overrides.length === 1 && promoted.overrides[0].source === 'coach');
+  var report = access.graderReport(examples.concat([{ sku: 9, category: 'monitors', grade: 'B', lot_size: '1', ai_price: 200, final_price: 90, delta_pct: -55, when: '2026-11-20T00:00:00.000Z' }]));
+  test('answer key page counts misses', report.count === 5 && report.misses.length >= 1 && /Recent misses/.test(access.answerKeyPageHtml(report)));
+  test('answer key is on the review tools', has("'/answer-key'") && has('why? (optional)') && has('pricing-rules.candidate.json'));
 })();
 
 section('SYNTAX CHECK');

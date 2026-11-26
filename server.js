@@ -749,6 +749,8 @@ function countsFromItemText(meta){
 
 // ── Pricing audit (review page, before publish — never blocks AddItem) ──
 var PRICING_RULES_FILE = path.join(DATA_DIR, 'pricing-rules.json');
+var ANSWER_KEY_FILE = path.join(DATA_DIR, 'answer-key.jsonl');
+var COACH_CANDIDATE_FILE = path.join(DATA_DIR, 'pricing-rules.candidate.json');
 var PRICING_RULE_MIN_SAMPLES = 5;
 
 function moneyPrice(n){
@@ -1128,6 +1130,50 @@ function runListingAudit(sku, callback){
     if(err || !text) parsed = { verdict:'warn', suggested_price: moneyPrice(record.listing && record.listing.suggested_price), reasons:['Audit could not be completed'] };
     saveAudit(parsed);
   });
+}
+function readAnswerKey(){
+  try {
+    if(!fs.existsSync(ANSWER_KEY_FILE)) return [];
+    return fs.readFileSync(ANSWER_KEY_FILE, 'utf8').split('\n').filter(Boolean).map(function(line){
+      try { return JSON.parse(line); } catch(e){ return null; }
+    }).filter(Boolean);
+  } catch(e){ return []; }
+}
+function writeAnswerKey(rows){
+  var body = (rows || []).map(function(row){ return JSON.stringify(row); }).join('\n');
+  fs.writeFileSync(ANSWER_KEY_FILE, body ? body + '\n' : '');
+}
+function appendAnswerKeyRow(row){
+  if(!row) return;
+  fs.appendFileSync(ANSWER_KEY_FILE, JSON.stringify(row) + '\n');
+}
+function backfillAnswerKey(){
+  var existing = readAnswerKey();
+  var merged = access.mergeAnswerKey(existing, loadListings());
+  if(merged.length !== existing.length) writeAnswerKey(merged);
+  return merged;
+}
+function whoEdited(role){
+  if(role === 'admin') return 'kendall';
+  if(role === 'staff') return 'reese';
+  return 'operator';
+}
+function loadCoachCandidate(rows){
+  var rules = readPricingRules();
+  var skipped = rules.skipped || [];
+  var cand = null;
+  try { if(fs.existsSync(COACH_CANDIDATE_FILE)) cand = JSON.parse(fs.readFileSync(COACH_CANDIDATE_FILE, 'utf8')); } catch(e){ cand = null; }
+  var fresh = cand && cand.id && skipped.indexOf(cand.id) < 0 && (Date.now() - Date.parse(cand.created_at || 0) < 7 * 24 * 60 * 60 * 1000);
+  if(fresh) return cand;
+  var next = access.proposeCoachRule(rows);
+  if(!next || skipped.indexOf(next.id) >= 0){
+    try { if(fs.existsSync(COACH_CANDIDATE_FILE)) fs.unlinkSync(COACH_CANDIDATE_FILE); } catch(e){}
+    return null;
+  }
+  next.created_at = new Date().toISOString();
+  next.status = 'draft';
+  try { fs.writeFileSync(COACH_CANDIDATE_FILE, JSON.stringify(next, null, 2)); } catch(e){}
+  return next;
 }
 function scheduleListingAudit(sku){
   if(sku == null || sku === '') return;
@@ -3270,7 +3316,20 @@ const server = http.createServer(function(req, res) {
         pRec.listing = pRec.listing || {};
         var oldp = pRec.listing.suggested_price;
         if(!pPipe || pPipe === 'sonnet'){
-          appendPriceHistory(pRec.listing, oldp, np, 'operator');
+          var beforeCount = (pRec.listing.price_history || []).length;
+          appendPriceHistory(pRec.listing, oldp, np, whoEdited(req.xrtRole));
+          if((pRec.listing.price_history || []).length > beforeCount){
+            var reason = String(parsed.reason || '').trim().slice(0, 200);
+            if(reason) pRec.listing.price_history[pRec.listing.price_history.length - 1].reason = reason;
+            try {
+              appendAnswerKeyRow(access.answerKeyRow(pRec, {
+                final_price: np,
+                who: whoEdited(req.xrtRole),
+                reason: reason,
+                when: pRec.listing.price_history[pRec.listing.price_history.length - 1].at
+              }));
+            } catch(e){ console.log('[ANSWER] SKU ' + pSku + ' ' + e.message); }
+          }
           pRec.listing.suggested_price = np;
         }
         console.log('[LISTING] SKU ' + pSku + ' price override' + (pPipe ? ' (' + pPipe + ')' : '') + ': $' + (oldp == null ? '?' : oldp) + ' → $' + np);
@@ -3806,12 +3865,25 @@ const server = http.createServer(function(req, res) {
     return;
   }
   if(req.method==='GET' && req.url.split('?')[0]==='/pricing-rules'){
-    var week = access.weeklySuggestions(loadListings(), Date.now()).filter(function(s){
-      var skipped = (readPricingRules().skipped || []);
-      return skipped.indexOf(s.id) < 0;
-    });
+    var answerRows = [];
+    try { answerRows = backfillAnswerKey(); } catch(e){ answerRows = []; }
+    var coach = null;
+    try { coach = loadCoachCandidate(answerRows); } catch(e){ coach = null; }
+    var week = coach ? [coach] : [];
     res.writeHead(200, { 'Content-Type':'text/html; charset=utf-8' });
     res.end(pricingRulesHtml(readPricingRules(), { suggestions: week, role: req.xrtRole || '' }));
+    return;
+  }
+  if(req.method==='GET' && req.url.split('?')[0]==='/answer-key'){
+    if(req.xrtRole !== 'admin'){
+      res.writeHead(403, { 'Content-Type':'text/html; charset=utf-8' });
+      res.end('<p>Only Kendall can open the answer key.</p><p><a href="/api/listings">Back</a></p>');
+      return;
+    }
+    var keyRows = [];
+    try { keyRows = backfillAnswerKey(); } catch(e){ keyRows = []; }
+    res.writeHead(200, { 'Content-Type':'text/html; charset=utf-8' });
+    res.end(access.answerKeyPageHtml(access.graderReport(keyRows)));
     return;
   }
   if(req.method==='GET' && req.url.split('?')[0]==='/api/learning/weekly'){
@@ -3825,6 +3897,9 @@ const server = http.createServer(function(req, res) {
     parseBody(req, function(lerr, lbody){
       if(lerr || !lbody || !lbody.id){ sendJSON(res, 400, { error:'Bad request' }); return; }
       var ideas = access.weeklySuggestions(loadListings(), Date.now());
+      var coach = null;
+      try { if(fs.existsSync(COACH_CANDIDATE_FILE)) coach = JSON.parse(fs.readFileSync(COACH_CANDIDATE_FILE, 'utf8')); } catch(e){ coach = null; }
+      if(coach && coach.id === lbody.id) ideas = [coach].concat(ideas);
       var found = null;
       for(var li = 0; li < ideas.length; li++){ if(ideas[li].id === lbody.id){ found = ideas[li]; break; } }
       var rules = readPricingRules();
@@ -3832,9 +3907,10 @@ const server = http.createServer(function(req, res) {
       rules.overrides = rules.overrides || [];
       if(rules.skipped.indexOf(lbody.id) < 0) rules.skipped.push(lbody.id);
       if(learnKind === 'accept' && found){
-        rules.overrides.push({ id: found.id, category: found.category, grade: found.grade, lot_size: found.lot_size, ratio: found.ratio, label: found.label, n: 0, accepted_at: new Date().toISOString() });
+        access.promoteCandidate(rules, found);
       }
       try { fs.writeFileSync(PRICING_RULES_FILE, JSON.stringify(rules, null, 2)); } catch(e){ sendJSON(res, 500, { error:'Could not save the rule' }); return; }
+      if(coach && coach.id === lbody.id){ try { fs.unlinkSync(COACH_CANDIDATE_FILE); } catch(e){} }
       sendJSON(res, 200, { success:true });
     });
     return;
@@ -8350,6 +8426,8 @@ function buildDualCardHtml(r, i, colors, ebayStat){
 }
 
 function generateListingsPage(listings, ebayStat, role){
+  var answerRows = [];
+  try { answerRows = backfillAnswerKey(); } catch(e){ answerRows = []; }
   ebayStat = ebayStat || {connected:false};
   var colors=['#1565c0','#2e7d32','#e65100','#6a1b9a','#00838f','#c62828','#37474f','#558b2f'];
   var cards = listings.map(function(r, i) {
@@ -8580,8 +8658,10 @@ function generateListingsPage(listings, ebayStat, role){
       +renderListingBadges(skuStr, listing)
       +'<div style="background:#f5f5f5;border-bottom:1px solid #ddd;padding:8px 16px;font-size:12.5px;color:#444;display:flex;flex-wrap:wrap;gap:6px 18px;">'
       +'<span><b>Suggest:</b> $<span id="sug_'+skuStr+'" onclick="editSuggest(\''+skuStr+'\')" style="cursor:pointer;border-bottom:1px dashed #1565c0;color:#1565c0;" title="Click to edit listing price">'+suggest+'</span> <span id="sugmsg_'+skuStr+'" style="font-weight:bold;"></span></span>'
+      +'<input id="why_'+skuStr+'" placeholder="why? (optional)" style="width:150px;padding:4px 6px;border:1px solid #ccc;border-radius:4px;font-size:12px;">'
       +(listing.price_note ? '<span style="flex:1 0 100%;color:#555;"><b>Price note:</b> '+String(listing.price_note).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')+'</span>' : '')
       +auditBadgeHtml(r)
+      +access.graderBadgeHtml(access.gradeAiPrice(r, answerRows))
       +'<span><b>Accept:</b> $'+accept+'</span>'
       +'<span><b>Decline:</b> $'+decline+'</span>'
       +'<span><b>Shelf:</b> '+(meta.shelf||'&mdash;')+'</span>'
@@ -8661,7 +8741,7 @@ function generateListingsPage(listings, ebayStat, role){
     +'function saveWeight(sku){var lb=document.getElementById("wtlb_"+sku);var oz=document.getElementById("wtoz_"+sku);var msg=document.getElementById("wtmsg_"+sku);var L=lb?parseInt(lb.value,10):0;if(isNaN(L))L=0;var O=oz?parseFloat(oz.value):0;if(isNaN(O))O=0;if(L<0||O<0||(L===0&&O===0)){if(msg){msg.style.color="#c62828";msg.textContent="Enter lb and/or oz";}return;}if(msg){msg.style.color="#8d6e00";msg.textContent="Saving...";}fetch("/api/set-weight",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sku:parseInt(sku,10),lbs:L,oz:O})}).then(function(r){return r.json();}).then(function(d){if(d.success){if(msg){msg.style.color="#2e7d32";msg.textContent="Saved \\u2713 Packed: "+d.final_lbs+"lb "+d.final_oz+"oz | Box: "+d.box_size;}setTimeout(function(){location.reload();},1200);}else{if(msg){msg.style.color="#c62828";msg.textContent=d.error||"Save failed";}}}).catch(function(){if(msg){msg.style.color="#c62828";msg.textContent="Network error";}});}'
     +'function applyPkgLabels(sku,d){var sp=document.getElementById("ship_"+sku);if(sp&&d.shipping_policy){sp.textContent=d.shipping_policy;if(d.manual){var mk=document.createElement("span");mk.style.color="#2e7d32";mk.style.fontWeight="bold";mk.textContent=" (actual pkg)";sp.appendChild(mk);}}var dm=document.getElementById("dim_"+sku);if(dm&&d.box_dimensions){dm.textContent=d.box_dimensions;}var pk=document.getElementById("mppkg_"+sku);if(pk){if(d.manual){pk.innerHTML="&#128230; Actual Pkg: "+d.pkg_label;pk.style.display="";}else{pk.style.display="none";}}}function savePackage(sku){var g=function(id){var e=document.getElementById(id+"_"+sku);return e?e.value:"";};var msg=document.getElementById("mpmsg_"+sku);var body={sku:parseInt(sku,10),lbs:g("mplb"),oz:g("mpoz"),length:g("mpl"),width:g("mpw"),height:g("mph")};var neg=["lbs","oz","length","width","height"].some(function(k){var v=parseFloat(body[k]);return !isNaN(v)&&v<0;});if(neg){if(msg){msg.style.color="#c62828";msg.textContent="Values must be positive";}return;}if(msg){msg.style.color="#555";msg.textContent="Saving...";}fetch("/api/set-package",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(function(r){return r.json();}).then(function(d){if(d.success){if(msg){msg.style.color="#2e7d32";msg.textContent=d.manual_package?"Saved - overriding padding":"Cleared - automatic padding restored";}applyPkgLabels(sku,d);setTimeout(function(){location.reload();},1000);}else{if(msg){msg.style.color="#c62828";msg.textContent=d.error||"Save failed";}}}).catch(function(){if(msg){msg.style.color="#c62828";msg.textContent="Network error";}});}'
     +'function clearPackage(sku){["mplb","mpoz","mpl","mpw","mph"].forEach(function(p){var e=document.getElementById(p+"_"+sku);if(e)e.value="";});savePackage(sku);}'
-    +'function editSuggest(sku){var span=document.getElementById("sug_"+sku);if(!span||span.dataset.editing)return;span.dataset.editing="1";var cur=parseFloat(span.textContent)||0;var inp=document.createElement("input");inp.type="number";inp.min="0";inp.step="0.01";inp.value=cur;inp.style.cssText="width:80px;padding:2px 4px;border:1px solid #1565c0;border-radius:3px;font-size:12.5px;";span.textContent="";span.appendChild(inp);inp.focus();inp.select();var done=false;function save(){if(done)return;done=true;var nv=parseFloat(inp.value);var msg=document.getElementById("sugmsg_"+sku);if(isNaN(nv)||nv<=0){span.textContent=cur;span.removeAttribute("data-editing");if(msg){msg.style.color="#c62828";msg.textContent="invalid";}return;}fetch("/api/listings/"+sku,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({suggest_price:nv})}).then(function(r){return r.json();}).then(function(d){if(d.success){span.textContent=(d.suggested_price!=null?d.suggested_price:nv);if(msg){msg.style.color="#2e7d32";msg.textContent="\\u2713";setTimeout(function(){msg.textContent="";},1500);}if(window.refreshListingAudit)refreshListingAudit(sku);}else{span.textContent=cur;if(msg){msg.style.color="#c62828";msg.textContent=d.error||"failed";}}span.removeAttribute("data-editing");}).catch(function(){span.textContent=cur;span.removeAttribute("data-editing");if(msg){msg.style.color="#c62828";msg.textContent="error";}});}inp.addEventListener("blur",save);inp.addEventListener("keydown",function(e){if(e.key==="Enter"){e.preventDefault();inp.blur();}else if(e.key==="Escape"){done=true;span.textContent=cur;span.removeAttribute("data-editing");}});}'
+    +'function editSuggest(sku){var span=document.getElementById("sug_"+sku);if(!span||span.dataset.editing)return;span.dataset.editing="1";var cur=parseFloat(span.textContent)||0;var inp=document.createElement("input");inp.type="number";inp.min="0";inp.step="0.01";inp.value=cur;inp.style.cssText="width:80px;padding:2px 4px;border:1px solid #1565c0;border-radius:3px;font-size:12.5px;";span.textContent="";span.appendChild(inp);inp.focus();inp.select();var done=false;function save(){if(done)return;done=true;var nv=parseFloat(inp.value);var msg=document.getElementById("sugmsg_"+sku);if(isNaN(nv)||nv<=0){span.textContent=cur;span.removeAttribute("data-editing");if(msg){msg.style.color="#c62828";msg.textContent="invalid";}return;}fetch("/api/listings/"+sku,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({suggest_price:nv,reason:(document.getElementById("why_"+sku)||{}).value||""})}).then(function(r){return r.json();}).then(function(d){if(d.success){span.textContent=(d.suggested_price!=null?d.suggested_price:nv);if(msg){msg.style.color="#2e7d32";msg.textContent="\\u2713";setTimeout(function(){msg.textContent="";},1500);}if(window.refreshListingAudit)refreshListingAudit(sku);}else{span.textContent=cur;if(msg){msg.style.color="#c62828";msg.textContent=d.error||"failed";}}span.removeAttribute("data-editing");}).catch(function(){span.textContent=cur;span.removeAttribute("data-editing");if(msg){msg.style.color="#c62828";msg.textContent="error";}});}inp.addEventListener("blur",save);inp.addEventListener("keydown",function(e){if(e.key==="Enter"){e.preventDefault();inp.blur();}else if(e.key==="Escape"){done=true;span.textContent=cur;span.removeAttribute("data-editing");}});}'
     +'function deletePhoto(sku,name,btn){if(!confirm("Delete this photo from the listing?"))return;fetch("/api/listings/"+sku+"/photo/"+encodeURIComponent(name),{method:"DELETE"}).then(function(r){return r.json();}).then(function(d){if(d.success){var t=btn.parentNode;if(t&&t.parentNode){t.parentNode.removeChild(t);}}else{alert("Delete failed: "+(d.error||"unknown"));}}).catch(function(){alert("Network error deleting photo.");});}'
     +'function saveQty(sku){var inp=document.getElementById("qty_"+sku);var msg=document.getElementById("qtymsg_"+sku);var v=inp?parseInt(inp.value,10):NaN;if(isNaN(v)||v<1||v>99){if(msg){msg.style.color="#c62828";msg.textContent="1-99 only";}return;}if(msg){msg.style.color="#8d6e00";msg.textContent="Saving...";}fetch("/api/listings/"+sku,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({quantity:v})}).then(function(r){return r.json();}).then(function(d){if(d.success){if(msg){msg.style.color="#2e7d32";msg.textContent="Saved \\u2713";}}else{if(msg){msg.style.color="#c62828";msg.textContent=d.error||"Failed";}}}).catch(function(){if(msg){msg.style.color="#c62828";msg.textContent="Network error";}});}'
     +'function deleteListing(sku){if(!confirm("Delete this listing permanently? This cannot be undone."))return;fetch("/api/listings/"+sku,{method:"DELETE"}).then(function(r){return r.json();}).then(function(d){if(d.success){var c=document.getElementById("card_"+sku);if(c&&c.parentNode){c.parentNode.removeChild(c);}}else{alert("Delete failed: "+(d.error||"unknown"));}}).catch(function(){alert("Network error deleting listing.");});}'
@@ -8723,6 +8803,7 @@ function generateListingsPage(listings, ebayStat, role){
     +'<div><h1>XRT eBay Listing Descriptions</h1><p class="meta">'+listings.length+' items &nbsp;&middot;&nbsp; Clovis, CA</p></div>'
     +'<div class="actions">'
     +'<a href="/pricing-rules" style="padding:8px 16px;background:#455a64;color:#fff;border-radius:4px;text-decoration:none;font-size:13px;font-weight:bold;">Pricing rules</a>'
+    +(role === 'admin' ? '<a href="/answer-key" style="padding:8px 16px;background:#455a64;color:#fff;border-radius:4px;text-decoration:none;font-size:13px;font-weight:bold;">Answer key</a>' : '')
     +'<a href="/api/listings" style="padding:8px 16px;background:#455a64;color:#fff;border-radius:4px;text-decoration:none;font-size:13px;font-weight:bold;">Refresh</a>'
     +(role === 'admin' ? '<button onclick="clearAll()" style="padding:8px 16px;background:#ff1744;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:bold;">Clear All</button>' : '')
     +'</div>'
