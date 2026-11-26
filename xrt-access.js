@@ -486,6 +486,76 @@ function answerKeyPageHtml(report){
     + '<h2>Recent misses</h2><ul>' + (misses || '<li>None yet.</li>') + '</ul></body></html>';
 }
 
+// eBay OAuth. redirect_uri is the RuName when EBAY_RUNAME is set. The portal
+// "Auth accepted URL" stays the real callback, not the RuName.
+var EBAY_EXTRA_SCOPE_URLS = [
+  'https://api.ebay.com/oauth/api_scope/sell.marketing',
+  'https://api.ebay.com/oauth/api_scope/sell.analytics.readonly',
+  'https://api.ebay.com/oauth/api_scope/sell.finances',
+  'https://api.ebay.com/oauth/api_scope/commerce.notification.subscription'
+];
+function ebayExtraScopesOn(env){
+  var v = String((env || {}).EBAY_EXTRA_SCOPES || '').trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes' || v === 'on';
+}
+function ebayScopes(env, base){
+  var scopes = (base || []).slice();
+  if(!ebayExtraScopesOn(env)) return scopes;
+  EBAY_EXTRA_SCOPE_URLS.forEach(function(scope){
+    if(scopes.indexOf(scope) < 0) scopes.push(scope);
+  });
+  return scopes;
+}
+function ebayOAuthRedirectUri(env){
+  env = env || {};
+  var ru = String(env.EBAY_RUNAME || '').trim();
+  if(ru) return ru;
+  return String(env.EBAY_REDIRECT_URI || 'https://xrt-scanner.onrender.com/ebay-auth-callback').trim();
+}
+function ebayAuthAcceptedUrl(env){
+  var base = String((env || {}).PUBLIC_BASE_URL || 'https://xrt-scanner.onrender.com').replace(/\/+$/, '');
+  return base + '/ebay-auth-callback';
+}
+function safeReturnPath(raw, fallback){
+  var fb = fallback || '/api/listings';
+  var s = String(raw == null ? '' : raw).trim();
+  if(!s) return fb;
+  for(var n = 0; n < 2; n++){
+    if(s.indexOf('%') < 0) break;
+    try {
+      var next = decodeURIComponent(s);
+      if(next === s) break;
+      s = next;
+    } catch(e){ return fb; }
+  }
+  if(s.charAt(0) !== '/') return fb;
+  if(s.charAt(1) === '/' || s.charAt(1) === '\\') return fb;
+  if(/[\u0000-\u0020\\]/.test(s)) return fb;
+  if(s.indexOf('://') >= 0 || s.indexOf('..') >= 0) return fb;
+  if(s.indexOf('/ebay-auth') === 0) return fb;
+  if(s.length > 240) return fb;
+  return s;
+}
+function ebayReconnectedLocation(raw){
+  var path = safeReturnPath(raw, '/api/listings');
+  if(/[?&]ebay=reconnected(?:&|$)/.test(path)) return path;
+  return path + (path.indexOf('?') >= 0 ? '&' : '?') + 'ebay=reconnected';
+}
+function ebayAuthorizeUrl(opts){
+  opts = opts || {};
+  var url = String(opts.authBase || 'https://auth.ebay.com').replace(/\/+$/, '')
+    + '/oauth2/authorize?client_id=' + encodeURIComponent(opts.clientId || '')
+    + '&redirect_uri=' + encodeURIComponent(opts.redirectUri || '')
+    + '&response_type=code&scope=' + encodeURIComponent((opts.scopes || []).join(' '));
+  if(opts.state) url += '&state=' + encodeURIComponent(opts.state);
+  return url;
+}
+function ebayReconnectToastHtml(on){
+  if(!on) return '';
+  return '<div id="ebayToast" style="position:fixed;top:16px;left:50%;transform:translateX(-50%);background:#1b5e20;color:#fff;padding:12px 18px;border-radius:8px;font-size:14px;font-weight:bold;z-index:80;box-shadow:0 4px 16px rgba(0,0,0,.25);">eBay reconnected</div>'
+    + '<script>setTimeout(function(){var t=document.getElementById("ebayToast");if(t&&t.parentNode)t.parentNode.removeChild(t);},4000);</script>';
+}
+
 module.exports = {
   SESSION_MS: SESSION_MS,
   PHOTO_CHECKS: PHOTO_CHECKS,
@@ -519,5 +589,13 @@ module.exports = {
   proposeCoachRule: proposeCoachRule,
   promoteCandidate: promoteCandidate,
   graderReport: graderReport,
-  answerKeyPageHtml: answerKeyPageHtml
+  answerKeyPageHtml: answerKeyPageHtml,
+  ebayExtraScopesOn: ebayExtraScopesOn,
+  ebayScopes: ebayScopes,
+  ebayOAuthRedirectUri: ebayOAuthRedirectUri,
+  ebayAuthAcceptedUrl: ebayAuthAcceptedUrl,
+  safeReturnPath: safeReturnPath,
+  ebayReconnectedLocation: ebayReconnectedLocation,
+  ebayAuthorizeUrl: ebayAuthorizeUrl,
+  ebayReconnectToastHtml: ebayReconnectToastHtml
 };
