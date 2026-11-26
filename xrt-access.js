@@ -237,6 +237,254 @@ function loginPageHtml(message){
 function setupMessage(){
   return 'Set XRT_ADMIN_PIN and XRT_STAFF_PIN on Render. Login is closed until both are set.';
 }
+function priceDeltaPct(ai, finalP){
+  var a = parseFloat(ai), f = parseFloat(finalP);
+  if(!(a > 0) || !(f > 0) || isNaN(a) || isNaN(f)) return null;
+  return Math.round((f - a) / a * 1000) / 10;
+}
+function answerBucket(record){
+  var listing = (record && record.listing) || {};
+  var meta = (record && record.meta) || {};
+  var snap = listing.ai_snapshot || {};
+  var lot = (listing.is_lot && parseInt(listing.lot_quantity, 10) > 1) ? String(parseInt(listing.lot_quantity, 10)) : '1';
+  return {
+    category: String(record && (record.ebay_category_name || snap.category_name || meta.category_name) || 'uncategorized').trim() || 'uncategorized',
+    grade: String(meta.grade || snap.grade || '?').toUpperCase(),
+    lot_size: lot,
+    qty: parseInt((record && (record.quantity || meta.quantity)) || listing.quantity || snap.quantity, 10) || 1
+  };
+}
+function compsSummary(record){
+  var listing = (record && record.listing) || {};
+  var snap = listing.ai_snapshot || {};
+  function n(v){ var x = parseFloat(v); return (x > 0 && !isNaN(x)) ? Math.round(x * 100) / 100 : null; }
+  return {
+    avg_sold_price: n(snap.avg_sold_price != null ? snap.avg_sold_price : listing.avg_sold_price),
+    price_low: n(snap.price_low != null ? snap.price_low : listing.price_low),
+    price_high: n(snap.price_high != null ? snap.price_high : listing.price_high),
+    unit_median_price: n(snap.unit_median_price != null ? snap.unit_median_price : listing.unit_median_price),
+    lot_comp_median: n(snap.lot_comp_median != null ? snap.lot_comp_median : listing.lot_comp_median)
+  };
+}
+function answerKeyRow(record, opts){
+  opts = opts || {};
+  record = record || {};
+  var listing = record.listing || {};
+  var bucket = answerBucket(record);
+  var ai = parseFloat(opts.ai_price != null ? opts.ai_price : listing.ai_suggested_price);
+  var finalP = parseFloat(opts.final_price);
+  if(!(ai > 0) || !(finalP > 0)) return null;
+  return {
+    sku: record.sku,
+    category: bucket.category,
+    grade: bucket.grade,
+    lot_size: bucket.lot_size,
+    qty: bucket.qty,
+    comps: compsSummary(record),
+    ai_price: Math.round(ai * 100) / 100,
+    final_price: Math.round(finalP * 100) / 100,
+    delta_pct: priceDeltaPct(ai, finalP),
+    who: opts.who || 'operator',
+    when: opts.when || new Date().toISOString(),
+    reason: String(opts.reason || '').trim().slice(0, 200)
+  };
+}
+function rowsFromRecord(record){
+  var listing = (record && record.listing) || {};
+  var ai = parseFloat(listing.ai_suggested_price);
+  if(!(ai > 0)) return [];
+  var rows = [];
+  (listing.price_history || []).forEach(function(h){
+    if(!h || h.by === 'rule') return;
+    var to = parseFloat(h.to);
+    if(!(to > 0)) return;
+    var row = answerKeyRow(record, { ai_price: ai, final_price: to, who: h.by || 'operator', when: h.at, reason: h.reason || '' });
+    if(row) rows.push(row);
+  });
+  var pub = parseFloat(record.published_price);
+  if(pub > 0){
+    var rounded = Math.round(pub * 100) / 100;
+    var already = rows.some(function(r){ return r.final_price === rounded; });
+    if(!already && rounded !== Math.round(ai * 100) / 100){
+      var published = answerKeyRow(record, { ai_price: ai, final_price: pub, who: 'publish', when: record.published_at || record.listed_at || '' });
+      if(published) rows.push(published);
+    }
+  }
+  return rows;
+}
+function answerRowKey(row){
+  return [row.sku, row.when, row.final_price, row.ai_price].join('|');
+}
+function mergeAnswerKey(existing, records){
+  var seen = {};
+  var out = (existing || []).slice();
+  out.forEach(function(row){ if(row) seen[answerRowKey(row)] = true; });
+  (records || []).forEach(function(rec){
+    rowsFromRecord(rec).forEach(function(row){
+      var key = answerRowKey(row);
+      if(seen[key]) return;
+      seen[key] = true;
+      out.push(row);
+    });
+  });
+  return out;
+}
+function medianOf(nums){
+  var xs = (nums || []).filter(function(n){ return typeof n === 'number' && isFinite(n); }).sort(function(a, b){ return a - b; });
+  if(!xs.length) return null;
+  var mid = Math.floor(xs.length / 2);
+  if(xs.length % 2) return xs[mid];
+  return (xs[mid - 1] + xs[mid]) / 2;
+}
+function closestAnswerRows(record, rows){
+  var bucket = answerBucket(record);
+  function take(pred){ return (rows || []).filter(pred); }
+  var exact = take(function(row){
+    return String(row.category).toLowerCase() === bucket.category.toLowerCase() && String(row.grade).toUpperCase() === bucket.grade && String(row.lot_size) === bucket.lot_size;
+  });
+  if(exact.length) return exact;
+  return take(function(row){
+    return String(row.category).toLowerCase() === bucket.category.toLowerCase() && String(row.grade).toUpperCase() === bucket.grade;
+  });
+}
+function gradeAiPrice(record, rows){
+  var listing = (record && record.listing) || {};
+  var ai = parseFloat(listing.ai_suggested_price || listing.suggested_price);
+  var examples = closestAnswerRows(record, rows);
+  if(!(ai > 0) || !examples.length) return { verdict: 'none', text: '', n: 0, usual: null };
+  var usual = medianOf(examples.map(function(row){ return row.final_price; }));
+  if(usual == null || !(usual > 0)) return { verdict: 'none', text: '', n: 0, usual: null };
+  var pass = Math.abs(ai - usual) / usual <= 0.10;
+  var usualR = Math.round(usual);
+  var text = 'Kendall usually prices similar items at $' + usualR + ' (based on ' + examples.length + ' examples).';
+  return { verdict: pass ? 'pass' : 'warn', text: text, n: examples.length, usual: usualR };
+}
+function graderBadgeHtml(grade){
+  if(!grade || grade.verdict === 'none' || !grade.text) return '';
+  var bg = grade.verdict === 'pass' ? '#2e7d32' : '#e65100';
+  var label = grade.verdict === 'pass' ? 'GRADER PASS' : 'GRADER WARN';
+  var text = String(grade.text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return '<div style="flex:1 0 100%;font-size:12.5px;"><span style="background:' + bg + ';color:#fff;padding:2px 8px;border-radius:4px;font-weight:bold;margin-right:6px;">' + label + '</span>' + text + '</div>';
+}
+function replayCoach(candidate, rows){
+  var closer = 0, worse = 0, unchanged = 0;
+  (rows || []).forEach(function(row){
+    if(!candidate) return;
+    if(candidate.category && String(row.category).toLowerCase() !== String(candidate.category).toLowerCase()) return;
+    if(candidate.grade && String(row.grade).toUpperCase() !== String(candidate.grade).toUpperCase()) return;
+    if(candidate.lot_size && String(row.lot_size) !== String(candidate.lot_size)) return;
+    var ai = parseFloat(row.ai_price), finalP = parseFloat(row.final_price);
+    if(!(ai > 0) || !(finalP > 0)) return;
+    var oldErr = Math.abs(ai - finalP);
+    var newErr = Math.abs(ai * candidate.ratio - finalP);
+    if(newErr < oldErr - 0.5) closer++;
+    else if(newErr > oldErr + 0.5) worse++;
+    else unchanged++;
+  });
+  return { closer: closer, worse: worse, unchanged: unchanged };
+}
+function proposeCoachRule(rows){
+  var groups = {};
+  (rows || []).forEach(function(row){
+    if(!(row.ai_price > 0) || !(row.final_price > 0)) return;
+    var id = String(row.grade).toUpperCase() + '|' + String(row.category).toLowerCase() + '|' + row.lot_size;
+    if(!groups[id]) groups[id] = { category: row.category, grade: String(row.grade).toUpperCase(), lot_size: String(row.lot_size), ratios: [] };
+    groups[id].ratios.push(row.final_price / row.ai_price);
+  });
+  var best = null;
+  Object.keys(groups).forEach(function(id){
+    var group = groups[id];
+    if(group.ratios.length < 5) return;
+    var ratio = Math.round(medianOf(group.ratios) * 1000) / 1000;
+    if(!(ratio > 0) || Math.abs(1 - ratio) < 0.03) return;
+    var trial = { category: group.category, grade: group.grade, lot_size: group.lot_size, ratio: ratio };
+    var replay = replayCoach(trial, rows);
+    if(!(replay.closer > replay.worse)) return;
+    var score = replay.closer - replay.worse;
+    if(best && score <= best.score) return;
+    var pct = Math.round((1 - ratio) * 100);
+    best = {
+      score: score,
+      id: suggestionId(group.category + '|' + group.grade + '|' + group.lot_size + '|' + ratio),
+      category: group.category,
+      grade: group.grade,
+      lot_size: group.lot_size,
+      ratio: ratio,
+      n: group.ratios.length,
+      closer: replay.closer,
+      worse: replay.worse,
+      label: pct > 0 ? ('rule applied: -' + pct + '%') : ('rule applied: +' + Math.abs(pct) + '%'),
+      text: 'Grade ' + group.grade + ' ' + group.category + (group.lot_size !== '1' ? ' lot of ' + group.lot_size : '') + ': price about ' + Math.abs(pct) + '% ' + (pct >= 0 ? 'under' : 'over') + ' the AI price. Replay on past answers: ' + replay.closer + ' closer, ' + replay.worse + ' worse.'
+    };
+  });
+  if(!best) return null;
+  delete best.score;
+  return best;
+}
+function promoteCandidate(rules, candidate){
+  rules = rules || {};
+  rules.overrides = rules.overrides || [];
+  rules.buckets = rules.buckets || [];
+  rules.skipped = rules.skipped || [];
+  rules.overrides.push({
+    id: candidate.id,
+    category: candidate.category,
+    grade: candidate.grade,
+    lot_size: candidate.lot_size,
+    ratio: candidate.ratio,
+    label: candidate.label,
+    n: candidate.n || 0,
+    accepted_at: new Date().toISOString(),
+    source: 'coach'
+  });
+  return rules;
+}
+function graderReport(rows){
+  var sorted = (rows || []).slice().sort(function(a, b){ return String(a.when || '').localeCompare(String(b.when || '')); });
+  var hits = 0, judged = 0, misses = [];
+  var byMonth = {};
+  sorted.forEach(function(row, index){
+    var prior = sorted.slice(0, index);
+    var fake = {
+      sku: row.sku,
+      ebay_category_name: row.category,
+      meta: { grade: row.grade },
+      listing: { ai_suggested_price: row.ai_price, is_lot: String(row.lot_size) !== '1', lot_quantity: String(row.lot_size) === '1' ? 1 : parseInt(row.lot_size, 10) }
+    };
+    var grade = gradeAiPrice(fake, prior);
+    if(grade.verdict === 'none') return;
+    judged++;
+    var month = String(row.when || '').slice(0, 7) || 'unknown';
+    if(!byMonth[month]) byMonth[month] = { month: month, hits: 0, total: 0 };
+    byMonth[month].total++;
+    if(grade.verdict === 'pass'){ hits++; byMonth[month].hits++; }
+    else misses.push(row);
+  });
+  return {
+    count: sorted.length,
+    judged: judged,
+    hits: hits,
+    rate: judged ? Math.round(hits / judged * 100) : null,
+    byMonth: Object.keys(byMonth).sort().map(function(key){ return byMonth[key]; }),
+    misses: misses.slice(-8).reverse()
+  };
+}
+function answerKeyPageHtml(report){
+  report = report || { count: 0, judged: 0, hits: 0, rate: null, byMonth: [], misses: [] };
+  function esc(s){ return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+  var months = (report.byMonth || []).map(function(month){
+    var rate = month.total ? Math.round(month.hits / month.total * 100) : 0;
+    return '<li>' + esc(month.month) + ': ' + rate + '% already close (' + month.hits + ' of ' + month.total + ')</li>';
+  }).join('');
+  var misses = (report.misses || []).map(function(row){
+    return '<li>SKU ' + esc(row.sku) + ' ' + esc(row.grade) + ' ' + esc(row.category) + ': AI $' + esc(row.ai_price) + ', kept $' + esc(row.final_price) + ' (' + esc(row.delta_pct) + '%)</li>';
+  }).join('');
+  return '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Answer key</title></head><body style="font-family:Arial,sans-serif;max-width:760px;margin:32px auto;padding:0 16px;color:#222;">'
+    + '<p><a href="/api/listings">Back to listings</a></p><h1>Answer key</h1>'
+    + '<p>' + report.count + ' saved answers. Where earlier examples existed, the grader was already close ' + (report.rate == null ? 'not yet' : report.rate + '% of the time') + ' (' + report.hits + ' of ' + report.judged + ').</p>'
+    + '<h2>Is the AI getting closer?</h2><ul>' + (months || '<li>Not enough history yet.</li>') + '</ul>'
+    + '<h2>Recent misses</h2><ul>' + (misses || '<li>None yet.</li>') + '</ul></body></html>';
+}
 
 module.exports = {
   SESSION_MS: SESSION_MS,
@@ -260,5 +508,16 @@ module.exports = {
   saleFromItem: saleFromItem,
   weeklySuggestions: weeklySuggestions,
   loginPageHtml: loginPageHtml,
-  setupMessage: setupMessage
+  setupMessage: setupMessage,
+  priceDeltaPct: priceDeltaPct,
+  answerKeyRow: answerKeyRow,
+  rowsFromRecord: rowsFromRecord,
+  mergeAnswerKey: mergeAnswerKey,
+  gradeAiPrice: gradeAiPrice,
+  graderBadgeHtml: graderBadgeHtml,
+  replayCoach: replayCoach,
+  proposeCoachRule: proposeCoachRule,
+  promoteCandidate: promoteCandidate,
+  graderReport: graderReport,
+  answerKeyPageHtml: answerKeyPageHtml
 };
