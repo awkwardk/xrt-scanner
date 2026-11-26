@@ -221,6 +221,8 @@ test('eBay refresh token route',      has('/api/ebay-refresh-token'));
 test('eBay deletion notification',    has('/api/ebay-deletion-notification'));
 test('Send to eBay route',            has('/api/send-to-ebay'));
 test('OAuth stores tokens',           has('writeEbayTokens') && has('grant_type=authorization_code'));
+test('callback sends Kendall home',   has('ebayReconnectedLocation') && has('ebayReconnectToastHtml') && !has('You can close this tab'));
+test('reconnect keeps the return path', has('/ebay-auth?return=%2Fapi%2Flistings') && has('Auth accepted URL'));
 test('getEbayToken helper',           has('function getEbayToken('));
 test('ebayStatus helper',             has('function ebayStatus('));
 test('eBay status bar (page)',        has('eBay connected') && has('Connect eBay Account'));
@@ -2064,6 +2066,17 @@ section('ACCESS, BACKUP, LEARNING');
   var report = access.graderReport(examples.concat([{ sku: 9, category: 'monitors', grade: 'B', lot_size: '1', ai_price: 200, final_price: 90, delta_pct: -55, when: '2026-11-20T00:00:00.000Z' }]));
   test('answer key page counts misses', report.count === 5 && report.misses.length >= 1 && /Recent misses/.test(access.answerKeyPageHtml(report)));
   test('answer key is on the review tools', has("'/answer-key'") && has('why? (optional)') && has('pricing-rules.candidate.json'));
+
+  var baseScopes = ['https://api.ebay.com/oauth/api_scope/sell.inventory', 'https://api.ebay.com/oauth/api_scope/sell.fulfillment'];
+  test('extra eBay scopes stay off', access.ebayScopes({}, baseScopes).length === 2 && access.ebayScopes({ EBAY_EXTRA_SCOPES: '0' }, baseScopes).length === 2 && !access.ebayExtraScopesOn({ EBAY_EXTRA_SCOPES: 'false' }));
+  var widened = access.ebayScopes({ EBAY_EXTRA_SCOPES: 'on' }, baseScopes);
+  test('the flag adds the four future scopes once', widened.length === 6 && widened.indexOf('https://api.ebay.com/oauth/api_scope/sell.marketing') > 0 && widened.indexOf('https://api.ebay.com/oauth/api_scope/commerce.notification.subscription') > 0);
+  test('RuName is the OAuth redirect', access.ebayOAuthRedirectUri({ EBAY_RUNAME: 'Kendall-XRT-PRD', EBAY_REDIRECT_URI: 'https://xrt-scanner.onrender.com/ebay-auth-callback' }) === 'Kendall-XRT-PRD');
+  test('missing RuName keeps the old callback URL', access.ebayOAuthRedirectUri({ EBAY_REDIRECT_URI: '' }) === 'https://xrt-scanner.onrender.com/ebay-auth-callback' && access.ebayAuthAcceptedUrl({}) === 'https://xrt-scanner.onrender.com/ebay-auth-callback');
+  test('return path stays on this site', access.safeReturnPath('/api/listings', '/api/listings') === '/api/listings' && access.safeReturnPath('https://evil.example/steal', '/api/listings') === '/api/listings' && access.safeReturnPath('//evil.example', '/api/listings') === '/api/listings' && access.safeReturnPath('%2F%2Fevil.example', '/api/listings') === '/api/listings');
+  test('consent lands back on listings with a toast', access.ebayReconnectedLocation('/api/listings') === '/api/listings?ebay=reconnected' && access.ebayReconnectedLocation('/api/listings?ebay=reconnected') === '/api/listings?ebay=reconnected' && /eBay reconnected/.test(access.ebayReconnectToastHtml(true)) && access.ebayReconnectToastHtml(false) === '');
+  var auth = access.ebayAuthorizeUrl({ authBase: 'https://auth.ebay.com', clientId: 'app', redirectUri: 'Kendall-XRT-PRD', scopes: baseScopes, state: '/api/listings' });
+  test('authorize URL sends the RuName and the return path', auth.indexOf('redirect_uri=Kendall-XRT-PRD') > 0 && auth.indexOf('state=' + encodeURIComponent('/api/listings')) > 0);
 })();
 
 section('SYNTAX CHECK');

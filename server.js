@@ -237,18 +237,25 @@ const EBAY_USER_TOKEN = process.env.EBAY_USER_TOKEN || '';
 const EBAY_ENVIRONMENT = process.env.EBAY_ENVIRONMENT || 'production';
 const EBAY_BASE = EBAY_ENVIRONMENT === 'sandbox' ? 'https://api.sandbox.ebay.com' : 'https://api.ebay.com';
 const EBAY_AUTH_BASE = EBAY_ENVIRONMENT === 'sandbox' ? 'https://auth.sandbox.ebay.com' : 'https://auth.ebay.com';
+// OAuth redirect_uri must be the RuName (EBAY_RUNAME). The eBay developer portal
+// field "Auth accepted URL" for that RuName is the browser landing page, and it
+// must be exactly PUBLIC_BASE_URL + /ebay-auth-callback, for this app:
+//   https://xrt-scanner.onrender.com/ebay-auth-callback
+// eBay appends ?code= and &state= itself. Do not put the RuName in that field.
+// If the portal already uses that URL, leave it. No portal change is required
+// for this fix. EBAY_REDIRECT_URI is only the fallback when EBAY_RUNAME is unset.
 const EBAY_REDIRECT_URI = process.env.EBAY_REDIRECT_URI || 'https://xrt-scanner.onrender.com/ebay-auth-callback';
 const EBAY_PUBLIC_BASE = process.env.PUBLIC_BASE_URL || 'https://xrt-scanner.onrender.com';
 const EBAY_TOKENS_FILE = path.join(DATA_DIR, 'ebay-tokens.json');
 const EBAY_POLICIES_FILE = path.join(DATA_DIR, 'ebay-policies.json');
-const EBAY_SCOPES = [
+const EBAY_SCOPES = access.ebayScopes(process.env, [
   'https://api.ebay.com/oauth/api_scope',
   'https://api.ebay.com/oauth/api_scope/sell.inventory',
   'https://api.ebay.com/oauth/api_scope/sell.inventory.readonly',
   'https://api.ebay.com/oauth/api_scope/sell.account',
   'https://api.ebay.com/oauth/api_scope/sell.account.readonly',
   'https://api.ebay.com/oauth/api_scope/sell.fulfillment'
-];
+]);
 // Public base URL eBay uses to fetch our hosted photos for UploadSiteHostedPictures
 const EBAY_PHOTO_BASE = process.env.PUBLIC_BASE_URL || 'https://xrt-scanner.onrender.com';
 console.log('[STARTUP] eBay App ID found:', EBAY_APP_ID.length > 0, '| env:', EBAY_ENVIRONMENT);
@@ -3530,16 +3537,35 @@ const server = http.createServer(function(req, res) {
 
   // ── eBay OAuth (Feature 9) ──
   if(req.method==='GET' && req.url.split('?')[0]==='/ebay-auth'){
-    var authUrl = EBAY_AUTH_BASE + '/oauth2/authorize?client_id=' + encodeURIComponent(EBAY_APP_ID) +
-      '&redirect_uri=' + encodeURIComponent(EBAY_REDIRECT_URI) + '&response_type=code&scope=' + encodeURIComponent(EBAY_SCOPES.join(' '));
-    res.writeHead(302, {Location: authUrl}); res.end(); return;
+    var authQuery = require('url').parse(req.url, true).query;
+    var returnPath = authQuery.return ? access.safeReturnPath(authQuery.return, '/api/listings') : '';
+    if(!returnPath){
+      var referer = req.headers.referer || req.headers.referrer || '';
+      try {
+        var refUrl = new URL(referer);
+        if(refUrl.host === String(req.headers.host || '').split(',')[0].trim()){
+          returnPath = access.safeReturnPath(refUrl.pathname + (refUrl.search || ''), '/api/listings');
+        }
+      } catch(e){}
+    }
+    if(!returnPath) returnPath = '/api/listings';
+    var oauthRedirect = access.ebayOAuthRedirectUri(process.env);
+    var authUrl = access.ebayAuthorizeUrl({
+      authBase: EBAY_AUTH_BASE,
+      clientId: EBAY_APP_ID,
+      redirectUri: oauthRedirect,
+      scopes: EBAY_SCOPES,
+      state: returnPath
+    });
+    res.writeHead(302, { Location: authUrl, 'Cache-Control': 'no-store' }); res.end(); return;
   }
   if(req.method==='GET' && req.url.split('?')[0]==='/ebay-auth-callback'){
     var cbQuery = require('url').parse(req.url, true).query;
     var code = cbQuery.code;
     if(!code){ res.writeHead(400,{'Content-Type':'text/html'}); res.end('<h2>Missing authorization code</h2>'); return; }
     var basicCb = Buffer.from(EBAY_APP_ID + ':' + EBAY_CERT_ID).toString('base64');
-    var cbBody = 'grant_type=authorization_code&code=' + encodeURIComponent(code) + '&redirect_uri=' + encodeURIComponent(EBAY_REDIRECT_URI);
+    var oauthRedirectCb = access.ebayOAuthRedirectUri(process.env);
+    var cbBody = 'grant_type=authorization_code&code=' + encodeURIComponent(code) + '&redirect_uri=' + encodeURIComponent(oauthRedirectCb);
     var cbOpts = {hostname: EBAY_BASE.replace('https://',''), path:'/identity/v1/oauth2/token', method:'POST',
       headers:{'Content-Type':'application/x-www-form-urlencoded','Authorization':'Basic '+basicCb,'Content-Length':Buffer.byteLength(cbBody)}};
     var cbReq = https.request(cbOpts, function(cbRes){
@@ -3548,8 +3574,8 @@ const server = http.createServer(function(req, res) {
         try { var j = JSON.parse(data);
           if(j.access_token){
             writeEbayTokens({access_token:j.access_token, refresh_token:j.refresh_token||'', expires_at: Date.now()+((j.expires_in||7200)*1000), token_type:j.token_type||'Bearer'});
-            res.writeHead(200,{'Content-Type':'text/html'});
-            res.end('<html><body style="font-family:sans-serif;padding:40px;"><h2>eBay account connected successfully.</h2><p>You can close this tab.</p></body></html>');
+            res.writeHead(302, { Location: access.ebayReconnectedLocation(cbQuery.state), 'Cache-Control': 'no-store' });
+            res.end();
           } else { res.writeHead(400,{'Content-Type':'text/html'}); res.end('<h2>Token exchange failed</h2><pre>'+String(data).slice(0,400)+'</pre>'); }
         } catch(e){ res.writeHead(500,{'Content-Type':'text/html'}); res.end('<h2>Error parsing token response</h2>'); }
       });
@@ -3920,14 +3946,17 @@ const server = http.createServer(function(req, res) {
     return;
   }
 
-  if(req.method==='GET' && req.url==='/api/listings'){
+  if(req.method==='GET' && req.url.split('?')[0]==='/api/listings'){
+    var listQuery = require('url').parse(req.url, true).query;
     var listings = loadListings();
+    var reconnected = listQuery.ebay === 'reconnected';
+    var listHeaders = { 'Content-Type':'text/html' };
+    if(reconnected) listHeaders['Cache-Control'] = 'no-store';
+    res.writeHead(200, listHeaders);
     if(listings.length === 0){
-      res.writeHead(200,{'Content-Type':'text/html'});
-      res.end('<html><body><p style="font-family:sans-serif;padding:40px;color:#666;">No listings yet. Submit items via the processor app and they will appear here automatically.</p></body></html>');
+      res.end('<html><body>' + access.ebayReconnectToastHtml(reconnected) + '<p style="font-family:sans-serif;padding:40px;color:#666;">No listings yet. Submit items via the processor app and they will appear here automatically.</p></body></html>');
     } else {
-      res.writeHead(200,{'Content-Type':'text/html'});
-      res.end(generateListingsPage(listings, ebayStatus(), req.xrtRole));
+      res.end(generateListingsPage(listings, ebayStatus(), req.xrtRole, { reconnected: reconnected }));
     }
     return;
   }
@@ -8425,7 +8454,8 @@ function buildDualCardHtml(r, i, colors, ebayStat){
     + '</div>';
 }
 
-function generateListingsPage(listings, ebayStat, role){
+function generateListingsPage(listings, ebayStat, role, pageOpts){
+  pageOpts = pageOpts || {};
   var answerRows = [];
   try { answerRows = backfillAnswerKey(); } catch(e){ answerRows = []; }
   ebayStat = ebayStat || {connected:false};
@@ -8722,9 +8752,9 @@ function generateListingsPage(listings, ebayStat, role){
   if(ebayStat.connected){
     ebayBar = '<div style="background:#e8f5e9;border:1px solid #2e7d32;color:#1b5e20;padding:10px 16px;border-radius:6px;margin-bottom:18px;font-size:13px;font-weight:bold;">&#10003; eBay connected &mdash; Xtreme Electronic Recycling</div>';
   } else if(ebayStat.expired){
-    ebayBar = '<div style="background:#fff8e1;border:1px solid #f9a825;color:#8d6e00;padding:10px 16px;border-radius:6px;margin-bottom:18px;font-size:13px;font-weight:bold;">eBay token expired &mdash; <a href="/ebay-auth" style="color:#0064d2;">Reconnect</a></div>';
+    ebayBar = '<div style="background:#fff8e1;border:1px solid #f9a825;color:#8d6e00;padding:10px 16px;border-radius:6px;margin-bottom:18px;font-size:13px;font-weight:bold;">eBay token expired &mdash; <a href="/ebay-auth?return=%2Fapi%2Flistings" style="color:#0064d2;">Reconnect</a></div>';
   } else {
-    ebayBar = '<div style="background:#fff3e0;border:1px solid #e65100;color:#e65100;padding:10px 16px;border-radius:6px;margin-bottom:18px;font-size:13px;font-weight:bold;">eBay not connected &mdash; <a href="/ebay-auth" style="color:#0064d2;">Connect eBay Account</a></div>';
+    ebayBar = '<div style="background:#fff3e0;border:1px solid #e65100;color:#e65100;padding:10px 16px;border-radius:6px;margin-bottom:18px;font-size:13px;font-weight:bold;">eBay not connected &mdash; <a href="/ebay-auth?return=%2Fapi%2Flistings" style="color:#0064d2;">Connect eBay Account</a></div>';
   }
 
   return '<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>XRT eBay Listing Descriptions</title>'
@@ -8792,6 +8822,7 @@ function generateListingsPage(listings, ebayStat, role){
     +'setInterval(loadQueue,10000);loadQueue();updateBulkCount();initPhotoReorder();refreshPendingAudits();'
     +'<\/script>'
     +'</head><body>'
+    +access.ebayReconnectToastHtml(!!pageOpts.reconnected)
     +'<div id="lpLightbox" onclick="if(event.target===this)closeLightbox()" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.92);z-index:99999;align-items:center;justify-content:center;">'
     +'<div id="lpLbCounter" style="position:absolute;top:16px;right:70px;color:#fff;font-size:14px;font-weight:bold;"></div>'
     +'<button onclick="closeLightbox()" title="Close" style="position:absolute;top:10px;right:14px;width:42px;height:42px;border:none;border-radius:50%;background:rgba(255,255,255,0.15);color:#fff;font-size:26px;line-height:1;cursor:pointer;">&times;</button>'
